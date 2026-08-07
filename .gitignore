@@ -1,0 +1,27 @@
+# Generated robot data and media
+data/
+recordings/
+logs/
+outputs/
+checkpoints/
+*.mp4
+*.avi
+*.mkv
+
+# Local machine overrides
+.env
+*.local.env
+
+# Python/editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.idea/
+.vscode/
+
+# OS artifacts
+.DS_Store
+Thumbs.db

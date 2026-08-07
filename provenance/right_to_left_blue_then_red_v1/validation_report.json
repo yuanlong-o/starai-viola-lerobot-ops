@@ -1,0 +1,52 @@
+{
+  "repo_id": "bourn117/viola_cubes_right_to_left_blue_then_red_train_v1",
+  "root": "/home/yz/lerobot/data/recordings/bourn117/viola_cubes_right_to_left_blue_then_red_train_v1",
+  "episodes": 34,
+  "frames": 28306,
+  "duration_s": 943.5333333333333,
+  "numeric_sha256": {
+    "action": "e7648cabd8820ef5f6953527cf6a3cbf95cef3bcadf8c350f6c016cbae6bd98a",
+    "observation.state": "67c07f950e5e1613d1117af6b649d2fd8f070fd4702752cc4d4b0040a34ae3dc"
+  },
+  "source_output_visual_mae": {
+    "observation.images.front": {
+      "samples": 102,
+      "mean": 0.005767671190494416,
+      "max": 0.00662658317014575
+    },
+    "observation.images.up": {
+      "samples": 102,
+      "mean": 0.0055378983253795725,
+      "max": 0.006797999143600464
+    }
+  },
+  "videos": {
+    "observation.images.front": {
+      "total_frames": 28306,
+      "files": [
+        {
+          "path": "videos/observation.images.front/chunk-000/file-000.mp4",
+          "codec": "av1",
+          "decoder": "libdav1d",
+          "frames": 28306,
+          "first_timestamp_s": 0.0,
+          "last_timestamp_s": 943.5
+        }
+      ]
+    },
+    "observation.images.up": {
+      "total_frames": 28306,
+      "files": [
+        {
+          "path": "videos/observation.images.up/chunk-000/file-000.mp4",
+          "codec": "av1",
+          "decoder": "libdav1d",
+          "frames": 28306,
+          "first_timestamp_s": 0.0,
+          "last_timestamp_s": 943.5
+        }
+      ]
+    }
+  },
+  "validated_at": "2026-08-07T14:49:01.458559+08:00"
+}
