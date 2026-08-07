@@ -44,6 +44,7 @@ Then choose one documented workflow:
 | Inspect, reject, or rebuild demonstrations | [Datasets and filtering](docs/DATASETS_AND_FILTERING.md) |
 | Decide how much data to collect | [Data collection policy](docs/DATA_COLLECTION_POLICY.md) |
 | Resolve camera, Rerun, permission, or interruption errors | [Troubleshooting](docs/TROUBLESHOOTING.md) |
+| Simulate or operate the Viola with ROS 2 and MoveIt | [ROS 2 / MoveIt](docs/ROS2_MOVEIT.md) |
 | Train ACT on the A100 machine | [Training handoff](docs/TRAINING_HANDOFF.md) |
 
 Read [Safety](docs/SAFETY.md) before calibration or first use on a new machine.
@@ -69,6 +70,7 @@ docs/                        operating procedures and copy/paste commands
 provenance/                  immutable right-to-left audit records
 scripts/                     active robot, camera, and preflight tools
 scripts/filtering/           task-specific canonical dataset builder
+ros2/                        pinned rootless ROS 2/MoveIt installer and safety patch
 tests/                       no-hardware regression tests
 archive/                     disabled historical launcher; never run for recording
 ```

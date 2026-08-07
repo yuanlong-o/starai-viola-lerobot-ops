@@ -1,0 +1,2926 @@
+From 56960a8e75d5d90d82f546329ce0641c21b8d84c Mon Sep 17 00:00:00 2001
+From: yuanlong-o <53054027+yuanlong-o@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 18:57:16 +0800
+Subject: [PATCH] Harden Viola ROS 2 MoveIt startup and control
+
+---
+ .gitignore                                    |   3 +
+ src/robo_driver/package.xml                   |   5 +-
+ src/robo_driver/robo_driver/robo_driver.py    | 765 ++++++++++++---
+ src/robo_driver/setup.py                      |   4 +-
+ src/robo_driver/test/test_safe_driver.py      | 333 +++++++
+ src/robo_interfaces/CMakeLists.txt            |   2 +
+ src/robo_interfaces/srv/SetAngles.srv         |   6 +
+ src/robo_interfaces/srv/StopServos.srv        |   4 +
+ src/viola_controller/package.xml              |   5 +
+ src/viola_controller/test/test_conversions.py | 335 +++++++
+ .../viola_controller/viola_controller.py      | 887 +++++++++++++++---
+ .../config/joint_limits.yaml                  |  52 +-
+ src/viola_moveit_config/config/moveit.rviz    |   4 +-
+ .../config/sensors_3d.yaml                    |  23 -
+ .../launch/actual_robot_demo.launch.py        |  48 +-
+ .../launch/driver.launch.py                   |  88 +-
+ .../launch/move_group_rviz.launch.py          |  14 +-
+ 17 files changed, 2214 insertions(+), 364 deletions(-)
+ create mode 100644 src/robo_driver/test/test_safe_driver.py
+ create mode 100644 src/robo_interfaces/srv/SetAngles.srv
+ create mode 100644 src/robo_interfaces/srv/StopServos.srv
+ create mode 100644 src/viola_controller/test/test_conversions.py
+ delete mode 100644 src/viola_moveit_config/config/sensors_3d.yaml
+
+diff --git a/.gitignore b/.gitignore
+index 31d0318..2839129 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,6 @@ build
+ install
+ log
+ .vscode
++__pycache__/
++*.py[cod]
++.pytest_cache/
+diff --git a/src/robo_driver/package.xml b/src/robo_driver/package.xml
+index 89d9884..e76d8cd 100644
+--- a/src/robo_driver/package.xml
++++ b/src/robo_driver/package.xml
+@@ -13,8 +13,9 @@
+   <test_depend>python3-pytest</test_depend>
+   <!-- 以下为添加的依赖 -->
+   <exec_depend>rclpy</exec_depend>
+-  <exec_depend>std_msgs</exec_depend>
+-  <exec_depend>control_msgs</exec_depend>
++  <exec_depend>sensor_msgs</exec_depend>
++  <exec_depend>robo_interfaces</exec_depend>
++  <exec_depend>python3-serial</exec_depend>
+   <export>
+     <build_type>ament_python</build_type>
+   </export>
+diff --git a/src/robo_driver/robo_driver/robo_driver.py b/src/robo_driver/robo_driver/robo_driver.py
+index 35639a3..5f42531 100644
+--- a/src/robo_driver/robo_driver/robo_driver.py
++++ b/src/robo_driver/robo_driver/robo_driver.py
+@@ -1,37 +1,161 @@
+-#!/usr/bin/env python
+-# coding:utf-8
+-"""
+-机械臂驱动节点
+-Robot arm driver node
++#!/usr/bin/env python3
++"""ROS 2 driver for the StarAI follower arms.
++
++This local safety patch keeps the official topic/API surface while removing the
++stock driver's unconditional multi-turn reset and forced zero-pose movement.
+ """
++
++from __future__ import annotations
++
++import fcntl
++import math
++import struct
++import termios
++import time
++from collections.abc import Callable
++from typing import Any
++
++import fashionstar_uart_sdk as uservo
+ import rclpy
++import serial
+ from rclpy.node import Node
+-from robo_interfaces.srv import ReadData, WriteData
+ from robo_interfaces.msg import SetAngle
+-import struct
++from robo_interfaces.srv import SetAngles, StopServos
+ from sensor_msgs.msg import JointState
+-import math
+-import fashionstar_uart_sdk as uservo
+-import time
+-import serial
+ 
+-ROBO_DRIVER_NODE = "robo_driver_node"  # 驱动节点名称 / driver node name
+-ROBO_SET_ANGLE_SUBSCRIBER = "set_angle_topic"  # 设置角度话题 / topic for setting angles
+ 
+-# PORT_NAME: 设置舵机串口号，默认使用/dev/ttyUSB0，当需要在同一个设备上使用多个机械臂时，需要修改该参数
+-# Port name: Serial port for servos, default "/dev/ttyUSB0", change when using multiple arms
+-# Whether to check servo angle on power-up, default True to ensure consistent init
+-SERVO_PORT_NAME = "/dev/ttyUSB0"  # 舵机串口号 <<< 修改为实际串口号
+-                                # Servo serial port <<< modify to actual port name
+-SERVO_BAUDRATE = 1000000  # 舵机的波特率 / Servo communication baud rate
+-servo_ids = list()
++ROBO_DRIVER_NODE = "robo_driver_node"
++ROBO_SET_ANGLE_SUBSCRIBER = "set_angle_topic"
++ROBO_SET_ANGLES_SERVICE = "set_angles"
++ROBO_STOP_SERVOS_SERVICE = "stop_servos"
++
++DEFAULT_SERIAL_PORT = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0"
++DEFAULT_BAUDRATE = 1_000_000
++SERVO_IDS = list(range(7))
++STARTUP_MODES = {"hold_current", "zero", "unlocked"}
++SHUTDOWN_MODES = {"damping", "unlocked", "keep"}
++
++# Direct degree limits corresponding to the Viola URDF. The gripper command is
++# expressed in degrees by the upstream SetAngle message.
++SERVO_ANGLE_LIMITS = [
++    (-130.1, 130.1),
++    (-90.0, 90.0),
++    (-90.0, 90.0),
++    (-130.1, 130.1),
++    (-90.0, 90.0),
++    (-130.1, 130.1),
++    (6.25, 100.0),
++]
++MEASURED_ANGLE_MARGIN_DEG = 2.0
++MAX_SERVO_SPEED_DPS = [math.degrees(1.0)] * 6 + [93.75]
++COMMAND_FEEDBACK_TIMEOUT_S = 0.5
++
++
++def require_finite_parameter(name: str, value: float) -> None:
++    if not math.isfinite(value):
++        raise ValueError(f"{name} must be finite")
++
++
++def apply_kernel_exclusive(uart: Any) -> None:
++    """Prevent later opens of this Linux tty until the descriptor closes."""
++
++    fcntl.ioctl(uart.fileno(), termios.TIOCEXCL)
++
++
++def quantize_target_tenths(servo_id: int, target_angle: float) -> int:
++    """Round to the servo's 0.1° units without crossing a model limit."""
++
++    lower, upper = SERVO_ANGLE_LIMITS[servo_id]
++    rounded = int(round(target_angle * 10))
++    return min(math.floor(upper * 10), max(math.ceil(lower * 10), rounded))
++
++
++def validate_measured_angles(angles: list[float]) -> None:
++    """Reject missing, corrupt, or implausible seven-servo feedback."""
++
++    if len(angles) != len(SERVO_IDS):
++        raise ValueError(f"expected seven measured angles, received {len(angles)}")
++    for servo_id, angle in enumerate(angles):
++        if not math.isfinite(angle):
++            raise ValueError(f"servo {servo_id} measured angle is not finite")
++        lower, upper = SERVO_ANGLE_LIMITS[servo_id]
++        if not (
++            lower - MEASURED_ANGLE_MARGIN_DEG
++            <= angle
++            <= upper + MEASURED_ANGLE_MARGIN_DEG
++        ):
++            raise ValueError(
++                f"servo {servo_id} measured angle {angle:.3f}° is implausible; "
++                f"expected [{lower - MEASURED_ANGLE_MARGIN_DEG:.3f}, "
++                f"{upper + MEASURED_ANGLE_MARGIN_DEG:.3f}]°"
++            )
++
++
++def validate_command_speed(
++    servo_ids: list[int],
++    target_angles: list[float],
++    times_ms: list[int],
++    measured_angles: list[float],
++) -> None:
++    """Enforce model speed limits against fresh measured feedback."""
++
++    validate_measured_angles(measured_angles)
++    for servo_id, target_angle, duration_ms in zip(
++        servo_ids,
++        target_angles,
++        times_ms,
++        strict=True,
++    ):
++        required_speed = abs(target_angle - measured_angles[servo_id]) / (
++            duration_ms / 1000
++        )
++        max_speed = MAX_SERVO_SPEED_DPS[servo_id]
++        if required_speed > max_speed + 1e-6:
++            raise ValueError(
++                f"servo {servo_id} requires {required_speed:.3f}°/s, exceeding "
++                f"the {max_speed:.3f}°/s limit"
++            )
++
++
++def validate_angle_command(
++    servo_ids: list[int],
++    target_angles: list[float],
++    times_ms: list[int],
++) -> None:
++    """Reject malformed or out-of-range commands before writing any servo."""
++
++    if not servo_ids:
++        raise ValueError("servo_id cannot be empty")
++    if not (len(servo_ids) == len(target_angles) == len(times_ms)):
++        raise ValueError("servo_id, target_angle, and time arrays must have equal lengths")
++    if len(set(servo_ids)) != len(servo_ids):
++        raise ValueError("servo_id contains duplicates")
++
++    for servo_id, target_angle, duration_ms in zip(
++        servo_ids,
++        target_angles,
++        times_ms,
++        strict=True,
++    ):
++        if servo_id not in SERVO_IDS:
++            raise ValueError(f"invalid servo id {servo_id}; expected 0 through 6")
++        if not math.isfinite(target_angle):
++            raise ValueError(f"servo {servo_id} target is not finite")
++        lower, upper = SERVO_ANGLE_LIMITS[servo_id]
++        if not lower <= target_angle <= upper:
++            raise ValueError(
++                f"servo {servo_id} target {target_angle:.3f}° is outside "
++                f"[{lower:.3f}, {upper:.3f}]°"
++            )
++        if duration_ms < 40 or duration_ms > 120_000:
++            raise ValueError(
++                f"servo {servo_id} duration {duration_ms} ms is outside [40, 120000]"
++            )
+ 
+-"""
+-舵机转手臂控制通用类
+-Universal class for servo-to-arm control
+-"""
+ 
+ class uservo_ex:
++    """Thin adapter around the FashionStar UART SDK."""
++
+     JOINT_ = [
+         "joint1",
+         "joint2",
+@@ -41,177 +165,520 @@ class uservo_ex:
+         "joint6",
+         "joint7_left",
+     ]
+-    ROBO_TYPE_INDEX_JOINT = {
+-        value: index for index, value in enumerate(JOINT_)
+-    }
+-    SRV_NUM =7
+-
+-
+-    # 参数 / Parameters:
+-    def __init__(self,robo_type,log = None):
++    ROBO_TYPE_INDEX_JOINT = {value: index for index, value in enumerate(JOINT_)}
++    SRV_NUM = 7
++
++    def __init__(
++        self,
++        robo_type: str,
++        serial_port: str,
++        baudrate: int,
++        reset_multiturn: bool = False,
++        log: Any | None = None,
++        serial_factory: Callable[..., Any] = serial.Serial,
++        manager_factory: Callable[[Any], Any] = uservo.UartServoManager,
++        kernel_exclusive: Callable[[Any], None] = apply_kernel_exclusive,
++    ) -> None:
+         self.ROBO_TYPE = robo_type
+         self.INDEX_JOINT_ = {value: index for index, value in enumerate(self.JOINT_)}
+         self.log = log
+-        # 初始化串口 / Initialize serial port
++        self.serial_port = serial_port
++        self.baudrate = baudrate
++
+         try:
+-            self.uart = serial.Serial(port=SERVO_PORT_NAME,baudrate=SERVO_BAUDRATE,parity=serial.PARITY_NONE,stopbits=1,bytesize=8,timeout=0)
+-        except serial.SerialException as e:
+-            if self.log != None:
+-                self.log.error(f"{e}")
+-            raise ValueError(f"串口初始化失败: {e}")  # Serial port init failed
++            self.uart = serial_factory(
++                port=serial_port,
++                baudrate=baudrate,
++                parity=serial.PARITY_NONE,
++                stopbits=1,
++                bytesize=8,
++                timeout=0,
++                write_timeout=0.5,
++                exclusive=True,
++            )
++        except (OSError, TypeError, serial.SerialException) as error:
++            if self.log is not None:
++                self.log.error(f"Serial initialization failed for {serial_port}: {error}")
++            raise RuntimeError(
++                f"serial initialization failed for {serial_port}: {error}"
++            ) from error
++
+         try:
+-            self.uservo = uservo.UartServoManager(self.uart)
+-        except Exception as e:
++            kernel_exclusive(self.uart)
++        except Exception as error:
++            self.uart.close()
++            raise RuntimeError(
++                f"kernel-exclusive serial lock failed for {serial_port}: {error}"
++            ) from error
++
++        try:
++            self.uservo = manager_factory(self.uart)
++        except Exception:
++            self.uart.close()
+             raise
++        # FashionStar SDK 1.3.8 catches SerialException inside send_request(),
++        # making failed motion writes appear successful. Replace that instance
++        # method so every SDK operation checks the byte count and drains the OS
++        # transmit buffer before returning.
++        self.uservo.send_request = self._send_request_checked
+ 
+-        self.servo_ids = [0,1,2,3,4,5,6]
++        self.servo_ids = SERVO_IDS.copy()
+         self.ZERO_ANGLE = [0 for _ in range(self.SRV_NUM)]
+         self.ZERO_ANGLE[6] = 500
+-        self.reset_multi_turn_angle(0xff)
+-        time.sleep(0.1)
+ 
+-    # 将角度转为弧度 / Convert degrees to radians
+-    @classmethod
+-    def degrees_to_radians(cls, degrees):
+-        radians = degrees * (math.pi / 180)
+-        return radians
++        if reset_multiturn:
++            try:
++                self.reset_multi_turn_angle(0xFF)
++                time.sleep(0.1)
++            except Exception:
++                self.uart.close()
++                raise
+ 
+-    # 将角度转为米 / Convert degrees back to meters
+-    @classmethod
+-    def degrees_to_meters(cls, degrees):
+-        meters = (degrees / 100) * 0.032
+-        return meters
++    @staticmethod
++    def degrees_to_radians(degrees: float) -> float:
++        return degrees * (math.pi / 180)
++
++    @staticmethod
++    def degrees_to_meters(degrees: float) -> float:
++        return (degrees / 100) * 0.032
+ 
+-    # 将舵机角度转换为关节位置 / Servo angle to joint state mapping
+     @classmethod
+-    def servoangle2jointstate(cls, servo_id, servo_angle):
++    def servoangle2jointstate(cls, servo_id: int, servo_angle: float) -> float:
+         if servo_id in range(6):
+             return cls.degrees_to_radians(servo_angle)
+-        elif servo_id == 6:
+-            return cls.degrees_to_meters(servo_angle-100)
++        if servo_id == 6:
++            return cls.degrees_to_meters(servo_angle - 100)
++        raise ValueError(f"invalid servo id {servo_id}")
++
++    def _send_request_checked(self, code: int, param_bytes: bytes) -> None:
++        packet_bytes = uservo.Packet.pack(code, param_bytes)
++        if not self.uart.is_open:
++            raise RuntimeError("serial port is closed")
++        try:
++            bytes_written = self.uart.write(packet_bytes)
++            if bytes_written != len(packet_bytes):
++                raise RuntimeError(
++                    f"short serial write: {bytes_written} of {len(packet_bytes)} bytes"
++                )
++            self.uart.flush()
++        except Exception as error:
++            raise RuntimeError(f"serial command delivery failed: {error}") from error
+ 
+-    # 设置角度（指定转速） / Send angle commands with specified speed
+-    def set_angle_by_interval(self, size, command_data_list):
++    def set_angle_by_interval(self, size: int, command_data_list: list[bytes]) -> None:
+         self.uservo.send_sync_multiturnanglebyinterval(
+             self.uservo.CODE_SET_SERVO_ANGLE_MTURN_BY_INTERVAL,
+-            size, command_data_list
++            size,
++            command_data_list,
+         )
+ 
+-    # 查询角度 / Query current servo angle
+-    def query_servo_current_angle(self, servo_id):
+-        if servo_id in self.uservo.servos:
+-            return self.uservo.query_servo_angle(servo_id)
++    def read_current_angles(self, retries: int = 5) -> list[float]:
++        """Read all seven current angles, retrying only bounded transient failures."""
++
++        last_error: Exception | None = None
++        for attempt in range(1, retries + 1):
++            try:
++                # The SDK retains the previous monitor value when a servo does
++                # not answer. Clear every value so only this request can
++                # satisfy the all-seven-servos safety check.
++                for servo_id in self.servo_ids:
++                    self.uservo.servos[servo_id].angle_monitor = None
++                self.uservo.send_sync_servo_monitor(self.servo_ids)
++                missing = [
++                    servo_id
++                    for servo_id in self.servo_ids
++                    if self.uservo.servos[servo_id].angle_monitor is None
++                ]
++                if missing:
++                    raise RuntimeError(f"no fresh monitor response from servo IDs {missing}")
++                angles = [
++                    float(self.uservo.servos[servo_id].angle_monitor)
++                    for servo_id in self.servo_ids
++                ]
++                if not all(math.isfinite(angle) for angle in angles):
++                    raise RuntimeError(f"non-finite monitor response: {angles}")
++                validate_measured_angles(angles)
++                return angles
++            except Exception as error:
++                last_error = error
++                if attempt < retries:
++                    time.sleep(0.05)
++        raise RuntimeError(
++            f"failed to read all seven servo angles after {retries} attempts: {last_error}"
++        )
+ 
+-    # 失能舵机 / Disable servo torque
+-    def disable_torque(self, servo_id):
+-        self.servo_stop(servo_id)
++    def disable_torque(self, servo_id: int) -> None:
++        self.uservo.disable_torque(servo_id)
+ 
+-    # 重设指定舵机多圈圈数 / Reset multi-turn count for a single servo
+-    def reset_multi_turn_angle(self, servo_id):
++    def reset_multi_turn_angle(self, servo_id: int) -> None:
+         self.uservo.disable_torque(servo_id)
+         time.sleep(0.05)
+         self.uservo.reset_multi_turn_angle(servo_id)
+ 
+-    # 停止并释放锁力 / Stop servo and release torque lock
+-    def servo_stop(self, servo_id, mode=2, power=500):
+-        self.uservo.stop_on_control_mode(servo_id, mode, power)
+-
+-class Arm_contorl(Node):
++    def stop(self, mode: str) -> None:
++        if mode == "keep":
++            return
++        if mode == "unlocked":
++            self.uservo.disable_torque(0xFF)
++            return
++        if mode == "damping":
++            self.uservo.stop_on_control_mode(0xFF, 0x12, 500)
++            return
++        raise ValueError(f"unsupported shutdown mode {mode!r}")
+ 
+-    def __init__(self):
+-        super().__init__(ROBO_DRIVER_NODE)
+-        self.declare_parameter("robo_type", "robo")
++    def close(self) -> None:
++        if getattr(self, "uart", None) is not None and self.uart.is_open:
++            self.uart.close()
+ 
+-        self.declare_parameter('lock', 'enable')
+ 
+-        self.robo_type = (self.get_parameter("robo_type").get_parameter_value().string_value)
+-        self.lock = (self.get_parameter("lock").get_parameter_value().string_value)
++class ArmControl(Node):
++    def __init__(self) -> None:
++        super().__init__(ROBO_DRIVER_NODE)
++        self.declare_parameter("robo_type", "viola")
++        self.declare_parameter("serial_port", DEFAULT_SERIAL_PORT)
++        self.declare_parameter("baudrate", DEFAULT_BAUDRATE)
++        self.declare_parameter("startup_mode", "hold_current")
++        self.declare_parameter("reset_multiturn", False)
++        self.declare_parameter("hold_motion_time_ms", 100)
++        self.declare_parameter("home_motion_time_ms", 1500)
++        self.declare_parameter("shutdown_mode", "damping")
++        self.declare_parameter("feedback_fault_timeout_s", 0.5)
++        # Compatibility with the official teaching command. "disable" maps to
++        # unlocked; "enable" no longer opts into a zero-pose motion.
++        self.declare_parameter("lock", "safe")
++
++        self.robo_type = self.get_parameter("robo_type").value
++        self.serial_port = self.get_parameter("serial_port").value
++        self.baudrate = int(self.get_parameter("baudrate").value)
++        self.startup_mode = self.get_parameter("startup_mode").value
++        self.reset_multiturn = bool(self.get_parameter("reset_multiturn").value)
++        self.hold_motion_time_ms = int(self.get_parameter("hold_motion_time_ms").value)
++        self.home_motion_time_ms = int(self.get_parameter("home_motion_time_ms").value)
++        self.shutdown_mode = self.get_parameter("shutdown_mode").value
++        self.feedback_fault_timeout_s = float(
++            self.get_parameter("feedback_fault_timeout_s").value
++        )
++        legacy_lock = self.get_parameter("lock").value
++
++        if legacy_lock == "disable":
++            self.get_logger().warning("Legacy lock:=disable maps to startup_mode:=unlocked")
++            self.startup_mode = "unlocked"
++        elif legacy_lock == "enable":
++            self.get_logger().warning(
++                "Legacy lock:=enable no longer moves to zero; use startup_mode:=zero explicitly"
++            )
++        elif legacy_lock != "safe":
++            raise ValueError("lock must be safe, enable, or disable")
++
++        if self.startup_mode not in STARTUP_MODES:
++            raise ValueError(f"startup_mode must be one of {sorted(STARTUP_MODES)}")
++        if self.shutdown_mode not in SHUTDOWN_MODES:
++            raise ValueError(f"shutdown_mode must be one of {sorted(SHUTDOWN_MODES)}")
++        if self.reset_multiturn and self.startup_mode != "zero":
++            raise ValueError("reset_multiturn is allowed only with explicit startup_mode:=zero")
++        if self.baudrate <= 0:
++            raise ValueError("baudrate must be positive")
++        require_finite_parameter(
++            "feedback_fault_timeout_s",
++            self.feedback_fault_timeout_s,
++        )
++        if self.feedback_fault_timeout_s <= 0:
++            raise ValueError("feedback_fault_timeout_s must be positive")
++        if not (
++            40 <= self.hold_motion_time_ms <= 120_000
++            and 40 <= self.home_motion_time_ms <= 120_000
++        ):
++            raise ValueError("startup motion times must be within [40, 120000] ms")
++
++        self.Servo = uservo_ex(
++            self.robo_type,
++            serial_port=self.serial_port,
++            baudrate=self.baudrate,
++            reset_multiturn=self.reset_multiturn,
++            log=self.get_logger(),
++        )
++        self._closed = False
++        self._last_current_angle_monotonic: float | None = None
++        self._feedback_fault_latched = False
+ 
+         try:
+-            self.Servo = uservo_ex(self.robo_type,log = self.get_logger())
+-        except ValueError as e:
++            measured_angles = self.Servo.read_current_angles()
++            self.current_angle = measured_angles.copy()
++            self._last_current_angle_monotonic = time.monotonic()
++            self.target_angle = [
++                quantize_target_tenths(servo_id, angle)
++                for servo_id, angle in enumerate(measured_angles)
++            ]
++            self.interval = [self.hold_motion_time_ms for _ in range(self.Servo.SRV_NUM)]
++
++            if self.startup_mode == "hold_current":
++                self._apply_angle_command(
++                    SERVO_IDS,
++                    measured_angles,
++                    [self.hold_motion_time_ms] * self.Servo.SRV_NUM,
++                )
++                self.get_logger().info(
++                    f"Holding measured startup pose on {self.serial_port}; "
++                    "multi-turn state was not reset"
++                )
++            elif self.startup_mode == "zero":
++                home_angles = [angle / 10 for angle in self.Servo.ZERO_ANGLE]
++                self._apply_angle_command(
++                    SERVO_IDS,
++                    home_angles,
++                    [self.home_motion_time_ms] * self.Servo.SRV_NUM,
++                )
++                self.get_logger().warning("Explicit zero-pose startup command sent")
++            else:
++                self.Servo.disable_torque(0xFF)
++                self.get_logger().warning("Servos unlocked; support the arm against gravity")
++        except Exception:
++            # A partially constructed rclpy node is not returned to main(), so
++            # close the hardware here as well. Damping avoids leaving a failed
++            # startup in an actively commanded state.
++            try:
++                self.Servo.stop("damping")
++            except Exception as stop_error:
++                self.get_logger().error(
++                    f"Startup failed and damping delivery also failed: {stop_error}"
++                )
++            self.Servo.close()
+             raise
+-        self.target_angle = self.Servo.ZERO_ANGLE
+-        # self.target_angle 初始目标角度列表 / initial target angle list
+-        self.interval = [1500 for _ in range(self.Servo.SRV_NUM)]
+-        self.current_angle = [0.0 for _ in range(self.Servo.SRV_NUM)]
+-        if(self.lock == "enable"):
+-            self.arm_move_by_time()
+-        else:
+-            self.Servo.disable_torque(0xff)
+ 
+-        # 创建话题：发布joint_states / Create publisher for joint_states topic
+-        self.joint_states_publisher = self.create_publisher(
+-            JointState, "joint_states", 10
++        self.joint_states_publisher = self.create_publisher(JointState, "joint_states", 10)
++        self.angle_subscriber = self.create_subscription(
++            SetAngle,
++            ROBO_SET_ANGLE_SUBSCRIBER,
++            self.set_angle_callback,
++            10,
+         )
+-        # 创建话题：处理设置角度 / Create subscription for SetAngle commands
+-        self.angle_subscribers = self.create_subscription(
+-            SetAngle, ROBO_SET_ANGLE_SUBSCRIBER, self.set_angle_callback, 10
++        self.angle_service = self.create_service(
++            SetAngles,
++            ROBO_SET_ANGLES_SERVICE,
++            self.set_angles_callback,
+         )
+-        self.timer2 = self.create_timer(0.03, self.timer_callback)
+-        self.get_logger().info(f"初始化完成 / Initialization complete")
++        self.stop_service = self.create_service(
++            StopServos,
++            ROBO_STOP_SERVOS_SERVICE,
++            self.stop_servos_callback,
++        )
++        self.monitor_timer = self.create_timer(0.03, self.timer_callback)
++        self.get_logger().info("StarAI driver initialization complete")
+ 
+-    def node_close(self):
+-        pass
+-        # self.Servo.servo_all_stop()
+-
+-    # 新的执行命令 / Callback for new angle commands
+-    def set_angle_callback(self, msg):
+-        for i in range(len(msg.servo_id)):
+-            id = msg.servo_id[i]
+-            self.target_angle[id] = int(10*msg.target_angle[i])
+-            if int(msg.time[i]) < 40:
+-                (msg.time[i]) = 40
+-            self.interval[id] = int(msg.time[i])+400
+-
+-            self.arm_move_by_time()
+-
+-    # 定时任务 / Timer callback
+-    def timer_callback(self):
+-        self.publish_current_angle()
+-
+-    # 查询舵机角度发布 / Query servo angles and publish
+-    def publish_current_angle(self):
+-        JointState_msg = JointState()
+-        JointState_msg.header.stamp = self.get_clock().now().to_msg()
+-        JointState_msg.velocity = []
+-        JointState_msg.effort = []
+-        self.Servo.uservo.send_sync_servo_monitor(self.Servo.servo_ids)
+-
+-        for i in range(self.Servo.SRV_NUM):
+-            self.current_angle[i] = self.Servo.uservo.servos[i].angle_monitor
+-            JointState_msg.name.append(self.Servo.JOINT_[i])
+-            JointState_msg.position.append(
+-                self.Servo.servoangle2jointstate(
+-                    servo_id=i, servo_angle=self.current_angle[i]
+-                )
++    def node_close(self) -> None:
++        if getattr(self, "_closed", True):
++            return
++        self._closed = True
++        try:
++            self.Servo.stop(self.shutdown_mode)
++            self.get_logger().info(f"Applied shutdown_mode={self.shutdown_mode}")
++        except Exception as error:
++            self.get_logger().error(
++                f"Could not deliver shutdown_mode={self.shutdown_mode}: {error}"
++            )
++        finally:
++            self.Servo.close()
++
++    def set_angle_callback(self, msg: SetAngle) -> None:
++        try:
++            self._apply_angle_command(
++                [int(value) for value in msg.servo_id],
++                [float(value) for value in msg.target_angle],
++                [int(value) for value in msg.time],
++            )
++        except Exception as error:
++            self.get_logger().error(f"Rejected SetAngle command: {error}")
++
++    def set_angles_callback(
++        self,
++        request: SetAngles.Request,
++        response: SetAngles.Response,
++    ) -> SetAngles.Response:
++        try:
++            self._apply_angle_command(
++                [int(value) for value in request.servo_id],
++                [float(value) for value in request.target_angle],
++                [int(value) for value in request.time],
++            )
++        except Exception as error:
++            response.success = False
++            response.error = str(error)
++            self.get_logger().error(f"Rejected SetAngles service command: {error}")
++        else:
++            response.success = True
++            response.error = ""
++        return response
++
++    def stop_servos_callback(
++        self,
++        request: StopServos.Request,
++        response: StopServos.Response,
++    ) -> StopServos.Response:
++        if request.mode not in {"damping", "unlocked"}:
++            response.success = False
++            response.error = "stop mode must be damping or unlocked"
++            return response
++        # Latch first. Even if serial delivery fails, later commands must not
++        # be accepted as though the system were still healthy.
++        self._feedback_fault_latched = True
++        try:
++            self.Servo.stop(request.mode)
++        except Exception as error:
++            response.success = False
++            response.error = str(error)
++            self.get_logger().error(
++                f"Could not deliver requested {request.mode} stop: {error}"
++            )
++        else:
++            response.success = True
++            response.error = ""
++            self.get_logger().warning(
++                f"Applied requested {request.mode} stop; motion is latched off "
++                "until the driver restarts"
+             )
+-        self.joint_states_publisher.publish(JointState_msg)
++        return response
+ 
+-    # 默认：控制by时间 / Default control mode: time-based
+-    def arm_move_by_time(self):
+-        acc = [0.0 for _ in range(self.Servo.SRV_NUM)]
+-        for i in range(self.Servo.SRV_NUM):
+-            acc[i] = int(self.interval[i]/2)
+-        command_data_list = [struct.pack("<BlLHHH", i, self.target_angle[i], self.interval[i], acc[i], acc[i], 8000) for i in range(self.Servo.SRV_NUM)]
+-        self.Servo.set_angle_by_interval(self.Servo.SRV_NUM, command_data_list)
++    def _latch_safety_fault(self, error: Exception) -> None:
++        if self._feedback_fault_latched:
++            return
++        self._feedback_fault_latched = True
++        try:
++            self.Servo.stop("damping")
++        except Exception as stop_error:
++            self.get_logger().error(
++                "Safety fault latched, but damping delivery failed: "
++                f"fault={error}; damping={stop_error}"
++            )
++        else:
++            self.get_logger().error(
++                f"Safety fault latched and damping applied: {error}. "
++                "Restart the driver after correcting the fault."
++            )
+ 
++    def _fresh_or_read_current_angles(self) -> list[float]:
++        if (
++            self._last_current_angle_monotonic is not None
++            and time.monotonic() - self._last_current_angle_monotonic
++            <= COMMAND_FEEDBACK_TIMEOUT_S
++        ):
++            return self.current_angle.copy()
++        measured = self.Servo.read_current_angles()
++        self.current_angle = measured.copy()
++        self._last_current_angle_monotonic = time.monotonic()
++        return measured
++
++    def _apply_angle_command(
++        self,
++        servo_ids: list[int],
++        target_angles: list[float],
++        times_ms: list[int],
++    ) -> None:
++        if self._feedback_fault_latched:
++            raise RuntimeError("motion is disabled by a latched feedback/stop fault")
++        validate_angle_command(servo_ids, target_angles, times_ms)
++        try:
++            measured_angles = self._fresh_or_read_current_angles()
++        except Exception as error:
++            self._latch_safety_fault(error)
++            raise
++        validate_command_speed(servo_ids, target_angles, times_ms, measured_angles)
++        try:
++            self.arm_move_by_time(servo_ids, target_angles, times_ms)
++        except Exception as error:
++            self._latch_safety_fault(error)
++            raise
++        for servo_id, target_angle, duration_ms in zip(
++            servo_ids,
++            target_angles,
++            times_ms,
++            strict=True,
++        ):
++            self.target_angle[servo_id] = quantize_target_tenths(
++                servo_id,
++                target_angle,
++            )
++            self.interval[servo_id] = duration_ms
++
++    def timer_callback(self) -> None:
++        try:
++            self.publish_current_angle()
++        except Exception as error:
++            self.get_logger().error(f"Servo monitor read failed: {error}")
++            last_feedback = self._last_current_angle_monotonic
++            if (
++                last_feedback is None
++                or time.monotonic() - last_feedback >= self.feedback_fault_timeout_s
++            ):
++                self._latch_safety_fault(error)
++
++    def publish_current_angle(self) -> None:
++        self.current_angle = self.Servo.read_current_angles()
++        self._last_current_angle_monotonic = time.monotonic()
++        message = JointState()
++        message.header.stamp = self.get_clock().now().to_msg()
++        message.name = self.Servo.JOINT_.copy()
++        message.position = [
++            self.Servo.servoangle2jointstate(servo_id=index, servo_angle=angle)
++            for index, angle in enumerate(self.current_angle)
++        ]
++        message.velocity = []
++        message.effort = []
++        self.joint_states_publisher.publish(message)
++
++    def arm_move_by_time(
++        self,
++        servo_ids: list[int] | None = None,
++        target_angles: list[float] | None = None,
++        times_ms: list[int] | None = None,
++    ) -> None:
++        selected_ids = SERVO_IDS if servo_ids is None else servo_ids
++        command_data_list = []
++        if target_angles is not None and len(target_angles) != len(selected_ids):
++            raise ValueError("target angle count does not match selected servo count")
++        if times_ms is not None and len(times_ms) != len(selected_ids):
++            raise ValueError("duration count does not match selected servo count")
++        for selected_index, servo_id in enumerate(selected_ids):
++            target_tenths = (
++                self.target_angle[servo_id]
++                if target_angles is None
++                else quantize_target_tenths(servo_id, target_angles[selected_index])
++            )
++            duration_ms = (
++                self.interval[servo_id]
++                if times_ms is None
++                else times_ms[selected_index]
++            )
++            acceleration_time = int(duration_ms / 2)
++            command_data_list.append(
++                struct.pack(
++                    "<BlLHHH",
++                    servo_id,
++                    target_tenths,
++                    duration_ms,
++                    acceleration_time,
++                    acceleration_time,
++                    8000,
++                )
++            )
++        self.Servo.set_angle_by_interval(len(selected_ids), command_data_list)
+ 
+ 
+-def main(args=None):
++def main(args: list[str] | None = None) -> None:
+     rclpy.init(args=args)
++    node: ArmControl | None = None
+     try:
+-        robo_driver_node = Arm_contorl()
+-    except Exception as e:
+-        return
+-
+-    try:
+-        rclpy.spin(robo_driver_node)
++        node = ArmControl()
++        rclpy.spin(node)
+     except KeyboardInterrupt:
+         pass
++    except Exception as error:
++        rclpy.logging.get_logger(ROBO_DRIVER_NODE).fatal(f"Driver failed: {error}")
++        raise
+     finally:
+-        robo_driver_node.node_close()
+-        robo_driver_node.destroy_node()
++        if node is not None:
++            node.node_close()
++            node.destroy_node()
++        if rclpy.ok():
++            rclpy.shutdown()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/robo_driver/setup.py b/src/robo_driver/setup.py
+index 68b0d85..9b5026f 100644
+--- a/src/robo_driver/setup.py
++++ b/src/robo_driver/setup.py
+@@ -1,4 +1,4 @@
+-from setuptools import find_packages, setup
++from setuptools import setup
+ from glob import glob
+ 
+ package_name = "robo_driver"
+@@ -12,7 +12,7 @@ setup(
+         ("share/" + package_name, ["package.xml"]),
+         ("share/" + package_name, glob("launch/*.py")),
+     ],
+-    install_requires=["setuptools"],
++    install_requires=["setuptools", "pyserial", "fashionstar-uart-sdk"],
+     zip_safe=True,
+     maintainer="ny",
+     maintainer_email="1994524450@qq.com",
+diff --git a/src/robo_driver/test/test_safe_driver.py b/src/robo_driver/test/test_safe_driver.py
+new file mode 100644
+index 0000000..90cc5ff
+--- /dev/null
++++ b/src/robo_driver/test/test_safe_driver.py
+@@ -0,0 +1,333 @@
++import math
++import struct
++import termios
++import time
++from types import SimpleNamespace
++
++import pytest
++import serial
++
++from robo_driver.robo_driver import (
++    ArmControl,
++    apply_kernel_exclusive,
++    quantize_target_tenths,
++    require_finite_parameter,
++    uservo_ex,
++    validate_angle_command,
++    validate_command_speed,
++)
++
++
++class FakeSerial:
++    def __init__(self, **kwargs):
++        self.kwargs = kwargs
++        self.is_open = True
++        self.writes = []
++        self.flush_count = 0
++
++    def write(self, packet):
++        self.writes.append(packet)
++        return len(packet)
++
++    def flush(self):
++        self.flush_count += 1
++
++    def close(self):
++        self.is_open = False
++
++
++class FailingSerial(FakeSerial):
++    def write(self, _packet):
++        raise serial.SerialException("disconnected")
++
++
++class ShortWriteSerial(FakeSerial):
++    def write(self, packet):
++        self.writes.append(packet)
++        return len(packet) - 1
++
++
++class FakeManager:
++    CODE_SET_SERVO_ANGLE_MTURN_BY_INTERVAL = 0x01
++
++    def __init__(self, uart):
++        self.uart = uart
++        self.servos = {
++            servo_id: SimpleNamespace(angle_monitor=float(servo_id * 10))
++            for servo_id in range(7)
++        }
++        self.calls = []
++
++    def disable_torque(self, servo_id):
++        self.calls.append(("disable_torque", servo_id))
++
++    def reset_multi_turn_angle(self, servo_id):
++        self.calls.append(("reset_multi_turn_angle", servo_id))
++
++    def send_sync_servo_monitor(self, servo_ids):
++        self.calls.append(("monitor", tuple(servo_ids)))
++        for servo_id in servo_ids:
++            self.servos[servo_id].angle_monitor = float(servo_id * 10)
++
++    def send_sync_multiturnanglebyinterval(self, command_id, size, data):
++        self.calls.append(("write", command_id, size, len(data)))
++
++    def stop_on_control_mode(self, servo_id, mode, power):
++        self.calls.append(("stop", servo_id, mode, power))
++
++
++class FakeLogger:
++    def __init__(self):
++        self.messages = []
++
++    def error(self, message):
++        self.messages.append(("error", message))
++
++    def warning(self, message):
++        self.messages.append(("warning", message))
++
++
++def make_arm(reset_multiturn=False, serial_factory=FakeSerial):
++    return uservo_ex(
++        "viola",
++        serial_port="/dev/fake",
++        baudrate=1_000_000,
++        reset_multiturn=reset_multiturn,
++        serial_factory=serial_factory,
++        manager_factory=FakeManager,
++        kernel_exclusive=lambda _uart: None,
++    )
++
++
++def test_default_construction_does_not_reset_or_disable_torque():
++    arm = make_arm()
++
++    assert arm.uservo.calls == []
++    assert arm.uart.kwargs["exclusive"] is True
++    assert arm.read_current_angles() == [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
++
++
++def test_kernel_exclusive_uses_tiocexcl(monkeypatch):
++    calls = []
++    uart = SimpleNamespace(fileno=lambda: 42)
++    monkeypatch.setattr(
++        "robo_driver.robo_driver.fcntl.ioctl",
++        lambda *args: calls.append(args),
++    )
++
++    apply_kernel_exclusive(uart)
++
++    assert calls == [(42, termios.TIOCEXCL)]
++
++
++def test_construction_fails_closed_when_kernel_lock_fails():
++    uart = FakeSerial()
++
++    with pytest.raises(RuntimeError, match="kernel-exclusive"):
++        uservo_ex(
++            "viola",
++            serial_port="/dev/fake",
++            baudrate=1_000_000,
++            serial_factory=lambda **_kwargs: uart,
++            manager_factory=FakeManager,
++            kernel_exclusive=lambda _uart: (_ for _ in ()).throw(
++                OSError("TIOCEXCL failed")
++            ),
++        )
++
++    assert uart.is_open is False
++
++
++def test_monitor_read_requires_a_fresh_reply_from_every_servo():
++    arm = make_arm()
++
++    def incomplete_monitor(servo_ids):
++        arm.uservo.servos[0].angle_monitor = 12.0
++
++    arm.uservo.send_sync_servo_monitor = incomplete_monitor
++
++    with pytest.raises(RuntimeError, match=r"servo IDs \[1, 2, 3, 4, 5, 6\]"):
++        arm.read_current_angles(retries=1)
++
++
++def test_monitor_read_rejects_implausible_finite_feedback():
++    arm = make_arm()
++
++    def implausible_monitor(servo_ids):
++        for servo_id in servo_ids:
++            arm.uservo.servos[servo_id].angle_monitor = 0.0
++        arm.uservo.servos[3].angle_monitor = 999.0
++
++    arm.uservo.send_sync_servo_monitor = implausible_monitor
++
++    with pytest.raises(RuntimeError, match="implausible"):
++        arm.read_current_angles(retries=1)
++
++
++def test_checked_sdk_sender_writes_full_packet_and_flushes():
++    arm = make_arm()
++
++    arm.uservo.send_request(0x01, b"\x07")
++
++    assert len(arm.uart.writes) == 1
++    assert arm.uart.flush_count == 1
++
++
++@pytest.mark.parametrize("serial_factory", [FailingSerial, ShortWriteSerial])
++def test_checked_sdk_sender_surfaces_serial_delivery_failure(serial_factory):
++    arm = make_arm(serial_factory=serial_factory)
++
++    with pytest.raises(RuntimeError, match="serial command delivery failed"):
++        arm.uservo.send_request(0x01, b"\x07")
++
++
++def test_multiturn_reset_is_explicit():
++    arm = make_arm(reset_multiturn=True)
++
++    assert arm.uservo.calls[:2] == [
++        ("disable_torque", 0xFF),
++        ("reset_multi_turn_angle", 0xFF),
++    ]
++
++
++@pytest.mark.parametrize(
++    ("servo_ids", "targets", "times"),
++    [
++        ([], [], []),
++        ([0], [0.0, 1.0], [100]),
++        ([0, 0], [0.0, 0.0], [100, 100]),
++        ([7], [0.0], [100]),
++        ([1], [91.0], [100]),
++        ([6], [-1.0], [100]),
++        ([6], [6.24], [100]),
++        ([0], [float("nan")], [100]),
++        ([0], [0.0], [0]),
++        ([0], [0.0], [120_001]),
++    ],
++)
++def test_invalid_commands_are_rejected(servo_ids, targets, times):
++    with pytest.raises(ValueError):
++        validate_angle_command(servo_ids, targets, times)
++
++
++def test_valid_arm_and_gripper_command_is_accepted():
++    validate_angle_command([0, 2, 6], [30.0, -45.0, 6.25], [40, 500, 1000])
++
++
++def test_nonfinite_driver_parameter_is_rejected():
++    with pytest.raises(ValueError, match="must be finite"):
++        require_finite_parameter("feedback_fault_timeout_s", float("nan"))
++
++
++def test_command_speed_is_checked_against_fresh_measured_pose():
++    measured = [0.0] * 6 + [50.0]
++
++    validate_command_speed([0], [math.degrees(1.0)], [1000], measured)
++    with pytest.raises(ValueError, match="exceeding"):
++        validate_command_speed([0], [math.degrees(1.0)], [999], measured)
++
++
++def test_gripper_limit_quantization_stays_inside_model():
++    assert quantize_target_tenths(6, 6.25) == 63
++
++
++def test_partial_move_packet_contains_only_requested_servo_ids():
++    sent = []
++    node = ArmControl.__new__(ArmControl)
++    node.Servo = SimpleNamespace(
++        SRV_NUM=7,
++        set_angle_by_interval=lambda size, data: sent.append((size, data)),
++    )
++    node.target_angle = [0, 100, 200, 300, 400, 500, 600]
++    node.interval = [100] * 7
++
++    node.arm_move_by_time([2, 6])
++
++    size, packets = sent[0]
++    assert size == 2
++    assert [struct.unpack("<BlLHHH", packet)[0] for packet in packets] == [2, 6]
++
++
++def test_shutdown_modes_are_explicit():
++    arm = make_arm()
++
++    arm.stop("keep")
++    arm.stop("damping")
++    arm.stop("unlocked")
++
++    assert ("stop", 0xFF, 0x12, 500) in arm.uservo.calls
++    assert ("disable_torque", 0xFF) in arm.uservo.calls
++
++
++def test_feedback_fault_damps_once_and_latches_motion(monkeypatch):
++    stop_calls = []
++    logger = FakeLogger()
++    monkeypatch.setattr(ArmControl, "get_logger", lambda _self: logger)
++    node = ArmControl.__new__(ArmControl)
++    node._feedback_fault_latched = False
++    node.Servo = SimpleNamespace(stop=lambda mode: stop_calls.append(mode))
++
++    node._latch_safety_fault(RuntimeError("monitor lost"))
++    node._latch_safety_fault(RuntimeError("still lost"))
++
++    assert node._feedback_fault_latched is True
++    assert stop_calls == ["damping"]
++    with pytest.raises(RuntimeError, match="latched"):
++        node._apply_angle_command([0], [0.0], [100])
++
++
++def test_monitor_watchdog_latches_after_timeout(monkeypatch):
++    logger = FakeLogger()
++    latched = []
++    monkeypatch.setattr(ArmControl, "get_logger", lambda _self: logger)
++    node = ArmControl.__new__(ArmControl)
++    node.publish_current_angle = lambda: (_ for _ in ()).throw(
++        RuntimeError("monitor lost")
++    )
++    node._last_current_angle_monotonic = time.monotonic() - 1.0
++    node.feedback_fault_timeout_s = 0.5
++    node._latch_safety_fault = lambda error: latched.append(str(error))
++
++    node.timer_callback()
++
++    assert latched == ["monitor lost"]
++
++
++def test_stop_service_latches_even_when_serial_delivery_fails(monkeypatch):
++    logger = FakeLogger()
++    monkeypatch.setattr(ArmControl, "get_logger", lambda _self: logger)
++    node = ArmControl.__new__(ArmControl)
++    node._feedback_fault_latched = False
++    node.Servo = SimpleNamespace(
++        stop=lambda _mode: (_ for _ in ()).throw(RuntimeError("disconnected"))
++    )
++    request = SimpleNamespace(mode="damping")
++    response = SimpleNamespace(success=None, error="")
++
++    returned = node.stop_servos_callback(request, response)
++
++    assert returned is response
++    assert response.success is False
++    assert "disconnected" in response.error
++    assert node._feedback_fault_latched is True
++
++
++def test_motion_write_failure_damps_and_latches_future_commands(monkeypatch):
++    logger = FakeLogger()
++    stop_calls = []
++    monkeypatch.setattr(ArmControl, "get_logger", lambda _self: logger)
++    node = ArmControl.__new__(ArmControl)
++    node._feedback_fault_latched = False
++    node.Servo = SimpleNamespace(stop=lambda mode: stop_calls.append(mode))
++    node._fresh_or_read_current_angles = lambda: [0.0] * 6 + [50.0]
++    node.arm_move_by_time = lambda *_args: (_ for _ in ()).throw(
++        RuntimeError("short serial write")
++    )
++    node.target_angle = [0] * 7
++    node.interval = [100] * 7
++
++    with pytest.raises(RuntimeError, match="short serial write"):
++        node._apply_angle_command([0], [0.0], [100])
++
++    assert node._feedback_fault_latched is True
++    assert stop_calls == ["damping"]
+diff --git a/src/robo_interfaces/CMakeLists.txt b/src/robo_interfaces/CMakeLists.txt
+index 9224f3b..cb71484 100644
+--- a/src/robo_interfaces/CMakeLists.txt
++++ b/src/robo_interfaces/CMakeLists.txt
+@@ -29,6 +29,8 @@ find_package(rosidl_default_generators REQUIRED)
+ 
+ rosidl_generate_interfaces(${PROJECT_NAME}
+   "srv/ReadData.srv"
++  "srv/SetAngles.srv"
++  "srv/StopServos.srv"
+   "srv/WriteData.srv"
+   "msg/SetAngle.msg"
+   "msg/PositionOrientation.msg"
+diff --git a/src/robo_interfaces/srv/SetAngles.srv b/src/robo_interfaces/srv/SetAngles.srv
+new file mode 100644
+index 0000000..b3beba3
+--- /dev/null
++++ b/src/robo_interfaces/srv/SetAngles.srv
+@@ -0,0 +1,6 @@
++uint8[] servo_id
++float64[] target_angle
++int32[] time
++---
++bool success
++string error
+diff --git a/src/robo_interfaces/srv/StopServos.srv b/src/robo_interfaces/srv/StopServos.srv
+new file mode 100644
+index 0000000..2869e5d
+--- /dev/null
++++ b/src/robo_interfaces/srv/StopServos.srv
+@@ -0,0 +1,4 @@
++string mode
++---
++bool success
++string error
+diff --git a/src/viola_controller/package.xml b/src/viola_controller/package.xml
+index 03ba488..bb6532a 100644
+--- a/src/viola_controller/package.xml
++++ b/src/viola_controller/package.xml
+@@ -12,6 +12,11 @@
+   <test_depend>ament_pep257</test_depend>
+   <test_depend>python3-pytest</test_depend>
+ 
++  <exec_depend>rclpy</exec_depend>
++  <exec_depend>control_msgs</exec_depend>
++  <exec_depend>sensor_msgs</exec_depend>
++  <exec_depend>robo_interfaces</exec_depend>
++
+   <export>
+     <build_type>ament_python</build_type>
+   </export>
+diff --git a/src/viola_controller/test/test_conversions.py b/src/viola_controller/test/test_conversions.py
+new file mode 100644
+index 0000000..5d54edc
+--- /dev/null
++++ b/src/viola_controller/test/test_conversions.py
+@@ -0,0 +1,335 @@
++import math
++from types import SimpleNamespace
++
++import pytest
++from builtin_interfaces.msg import Duration
++from sensor_msgs.msg import JointState
++from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
++
++from viola_controller.viola_controller import (
++    ALL_JOINTS,
++    RoboActionClient,
++    complete_joint_state_to_servo_angles,
++    jointstate2servoangle,
++    require_finite_parameter,
++    servo_degrees_to_gripper_meters,
++    validate_arm_trajectory,
++    validate_gripper_speed,
++)
++
++
++def test_arm_joint_radians_convert_to_degrees():
++    assert jointstate2servoangle(0, math.pi / 2) == pytest.approx(90.0)
++
++
++def test_gripper_units_round_trip_at_urdf_limits():
++    assert jointstate2servoangle(6, 0.0) == pytest.approx(100.0)
++    assert jointstate2servoangle(6, -0.03) == pytest.approx(6.25)
++    assert servo_degrees_to_gripper_meters(100.0) == pytest.approx(0.0)
++    assert servo_degrees_to_gripper_meters(6.25) == pytest.approx(-0.03)
++
++
++def test_invalid_servo_id_is_rejected():
++    with pytest.raises(ValueError):
++        jointstate2servoangle(7, 0.0)
++
++
++def test_nonfinite_controller_parameter_is_rejected():
++    with pytest.raises(ValueError, match="must be finite"):
++        require_finite_parameter("joint_state_timeout_s", float("nan"))
++
++
++def test_complete_joint_state_is_reordered_into_servo_id_order():
++    names = list(reversed(ALL_JOINTS))
++    positions_by_name = {name: index * 0.01 for index, name in enumerate(ALL_JOINTS)}
++    positions_by_name["joint7_left"] = -0.01
++    msg = JointState(
++        name=names,
++        position=[positions_by_name[name] for name in names],
++    )
++
++    converted = complete_joint_state_to_servo_angles(msg)
++
++    assert converted[0] == pytest.approx(0.0)
++    assert converted[1] == pytest.approx(math.degrees(0.01))
++    assert converted[6] == pytest.approx(jointstate2servoangle(6, -0.01))
++
++
++@pytest.mark.parametrize(
++    "msg",
++    [
++        JointState(name=ALL_JOINTS[:-1], position=[0.0] * 6),
++        JointState(name=ALL_JOINTS, position=[0.0] * 6),
++        JointState(name=ALL_JOINTS, position=[0.0] * 6 + [float("nan")]),
++        JointState(name=ALL_JOINTS, position=[10.0] + [0.0] * 6),
++    ],
++)
++def test_incomplete_or_nonfinite_joint_state_is_rejected(msg):
++    with pytest.raises(ValueError):
++        complete_joint_state_to_servo_angles(msg)
++
++
++def make_trajectory(position: float, seconds: int = 1) -> JointTrajectory:
++    return JointTrajectory(
++        joint_names=["joint1"],
++        points=[
++            JointTrajectoryPoint(
++                positions=[position],
++                time_from_start=Duration(sec=seconds),
++            )
++        ],
++    )
++
++
++def test_valid_trajectory_is_accepted_at_model_limit():
++    validate_arm_trajectory(make_trajectory(2.27))
++
++
++def test_out_of_limit_trajectory_is_rejected_before_driver_publish():
++    with pytest.raises(ValueError, match="outside"):
++        validate_arm_trajectory(make_trajectory(2.271))
++
++
++def test_overlong_segment_is_rejected_before_uint16_pack():
++    with pytest.raises(ValueError, match="maximum"):
++        validate_arm_trajectory(make_trajectory(0.0, seconds=121))
++
++
++def test_nonincreasing_trajectory_time_is_rejected():
++    trajectory = JointTrajectory(
++        joint_names=["joint1"],
++        points=[
++            JointTrajectoryPoint(
++                positions=[0.0],
++                time_from_start=Duration(sec=1),
++            ),
++            JointTrajectoryPoint(
++                positions=[0.1],
++                time_from_start=Duration(sec=1),
++            ),
++        ],
++    )
++    with pytest.raises(ValueError, match="increase strictly"):
++        validate_arm_trajectory(trajectory)
++
++
++def test_zero_time_start_point_must_match_measured_pose():
++    trajectory = make_trajectory(0.2, seconds=0)
++
++    with pytest.raises(ValueError, match="start point differs"):
++        validate_arm_trajectory(
++            trajectory,
++            current_positions_rad={"joint1": 0.0},
++            start_tolerance_rad=0.01,
++        )
++
++
++def test_first_motion_segment_enforces_model_speed():
++    validate_arm_trajectory(
++        make_trajectory(1.0, seconds=1),
++        current_positions_rad={"joint1": 0.0},
++    )
++
++    with pytest.raises(ValueError, match="exceeding"):
++        validate_arm_trajectory(
++            make_trajectory(1.01, seconds=1),
++            current_positions_rad={"joint1": 0.0},
++        )
++
++
++def test_later_motion_segment_enforces_model_speed():
++    trajectory = JointTrajectory(
++        joint_names=["joint1"],
++        points=[
++            JointTrajectoryPoint(
++                positions=[0.0],
++                time_from_start=Duration(sec=0),
++            ),
++            JointTrajectoryPoint(
++                positions=[1.01],
++                time_from_start=Duration(sec=1),
++            ),
++        ],
++    )
++
++    with pytest.raises(ValueError, match="exceeding"):
++        validate_arm_trajectory(
++            trajectory,
++            current_positions_rad={"joint1": 0.0},
++        )
++
++
++def test_declared_velocity_must_respect_model_speed():
++    trajectory = make_trajectory(0.5)
++    trajectory.points[0].velocities = [1.01]
++
++    with pytest.raises(ValueError, match="velocity"):
++        validate_arm_trajectory(trajectory)
++
++
++def test_nonzero_trajectory_stamp_is_rejected_instead_of_running_early():
++    trajectory = make_trajectory(0.0)
++    trajectory.header.stamp.sec = 1
++
++    with pytest.raises(ValueError, match="header.stamp"):
++        validate_arm_trajectory(trajectory)
++
++
++def test_gripper_speed_limit_is_enforced():
++    validate_gripper_speed(0.0, -0.03, 1.0)
++
++    with pytest.raises(ValueError, match="exceeding"):
++        validate_gripper_speed(0.0, -0.03, 0.99)
++
++
++class ImmediateFuture:
++    def __init__(self, response):
++        self.response = response
++
++    def done(self):
++        return True
++
++    def result(self):
++        return self.response
++
++
++class FakeServiceClient:
++    def __init__(self, response):
++        self.response = response
++        self.requests = []
++
++    def wait_for_service(self, timeout_sec):
++        return timeout_sec > 0
++
++    def call_async(self, request):
++        self.requests.append(request)
++        return ImmediateFuture(self.response)
++
++
++def test_action_command_requires_positive_driver_acknowledgement():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node.command_timeout_s = 0.1
++    node.set_angles_client = FakeServiceClient(
++        SimpleNamespace(success=True, error="")
++    )
++
++    node._command_angles([0], [1.0], [100])
++
++    request = node.set_angles_client.requests[0]
++    assert list(request.servo_id) == [0]
++    assert list(request.target_angle) == [1.0]
++    assert list(request.time) == [100]
++
++
++def test_action_command_surfaces_negative_driver_acknowledgement():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node.command_timeout_s = 0.1
++    node.set_angles_client = FakeServiceClient(
++        SimpleNamespace(success=False, error="fault latched")
++    )
++
++    with pytest.raises(RuntimeError, match="fault latched"):
++        node._command_angles([0], [1.0], [100])
++
++
++def test_cancel_is_not_reported_safe_when_hold_delivery_fails():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node._fresh_angles = lambda: [0.0] * 6 + [50.0]
++    goal_handle = SimpleNamespace(is_cancel_requested=True)
++
++    status = node._wait_interruptibly(
++        goal_handle,
++        0.1,
++        hold_on_cancel=lambda: False,
++    )
++
++    assert status == "hold_failed"
++
++
++class FakeGoalHandle:
++    def __init__(self, request):
++        self.request = request
++        self.is_cancel_requested = False
++        self.status = None
++
++    def abort(self):
++        self.status = "aborted"
++
++    def canceled(self):
++        self.status = "canceled"
++
++    def succeed(self):
++        self.status = "succeeded"
++
++
++def test_arm_settle_timeout_requests_measured_hold():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node.settle_timeout_s = 0.0
++    node.goal_tolerance_deg = 0.1
++    node._fresh_angles = lambda: [10.0] * 6 + [50.0]
++    held = []
++    node._hold_measured_arm = lambda: held.append(True) or True
++    node._request_damping = lambda: False
++    trajectory = make_trajectory(0.0, seconds=0)
++    goal_handle = FakeGoalHandle(SimpleNamespace(trajectory=trajectory))
++
++    result = node._execute_arm_goal(goal_handle)
++
++    assert goal_handle.status == "aborted"
++    assert held == [True]
++    assert "measured hold" in result.error_string
++
++
++def test_arm_failed_cancel_hold_requests_damping():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node._command_angles = lambda *_args: None
++    node._wait_interruptibly = lambda *_args: "hold_failed"
++    damping = []
++    node._request_damping = lambda: damping.append(True) or True
++    goal_handle = FakeGoalHandle(
++        SimpleNamespace(trajectory=make_trajectory(0.0, seconds=1))
++    )
++
++    node._execute_arm_goal(goal_handle)
++
++    assert goal_handle.status == "aborted"
++    assert damping == [True]
++
++
++def test_gripper_settle_timeout_requests_measured_hold():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node.gripper_motion_time_s = 1.0
++    node.gripper_goal_tolerance_m = 0.0001
++    node.settle_timeout_s = 0.0
++    node._command_angles = lambda *_args: None
++    node._wait_interruptibly = lambda *_args: "done"
++    node._fresh_angles = lambda: [0.0] * 6 + [100.0]
++    held = []
++    node._hold_measured_gripper = lambda: held.append(True) or True
++    damping = []
++    node._request_damping = lambda: damping.append(True) or True
++    request = SimpleNamespace(command=SimpleNamespace(position=-0.03))
++    goal_handle = FakeGoalHandle(request)
++
++    node._execute_gripper_goal(goal_handle)
++
++    assert goal_handle.status == "aborted"
++    assert held == [True]
++    assert damping == []
++
++
++def test_gripper_failed_cancel_hold_requests_damping():
++    node = RoboActionClient.__new__(RoboActionClient)
++    node.gripper_motion_time_s = 1.0
++    node._command_angles = lambda *_args: None
++    node._wait_interruptibly = lambda *_args: "hold_failed"
++    node._fresh_angles = lambda: [0.0] * 6 + [100.0]
++    damping = []
++    node._request_damping = lambda: damping.append(True) or True
++    request = SimpleNamespace(command=SimpleNamespace(position=-0.03))
++    goal_handle = FakeGoalHandle(request)
++
++    node._execute_gripper_goal(goal_handle)
++
++    assert goal_handle.status == "aborted"
++    assert damping == [True]
+diff --git a/src/viola_controller/viola_controller/viola_controller.py b/src/viola_controller/viola_controller/viola_controller.py
+index 37c75cf..acdc8c0 100644
+--- a/src/viola_controller/viola_controller/viola_controller.py
++++ b/src/viola_controller/viola_controller/viola_controller.py
+@@ -1,160 +1,823 @@
+-import rclpy                            
+-from rclpy.action import ActionServer, CancelResponse  # 动作服务器与取消响应 / Action server & cancel response
+-from rclpy.node import Node
+-import time
+-from std_msgs.msg import Float32MultiArray
+-# from uservo.uservo_ex import uservo_ex
+-from robo_interfaces.msg import SetAngle  # 舵机角度控制消息 / Servo angle control message
+-from control_msgs.action import FollowJointTrajectory  # 机械臂轨迹动作 / Arm trajectory action
+-from control_msgs.action import GripperCommand  # 夹爪控制动作 / Gripper control action
+-from rclpy.callback_groups import ReentrantCallbackGroup  # 可重入回调组 / Reentrant callback group
+-from rclpy.executors import MultiThreadedExecutor  # 多线程执行器 / Executor for multithread
++#!/usr/bin/env python3
++"""MoveIt action bridge for the safety-patched StarAI Viola driver."""
++
++from __future__ import annotations
++
+ import math
++import threading
++import time
++from collections.abc import Callable
++
++import rclpy
++from control_msgs.action import FollowJointTrajectory, GripperCommand
++from rclpy.action import ActionServer, CancelResponse, GoalResponse
++from rclpy.callback_groups import ReentrantCallbackGroup
++from rclpy.executors import MultiThreadedExecutor
++from rclpy.node import Node
++from robo_interfaces.srv import SetAngles, StopServos
+ from sensor_msgs.msg import JointState
+-# 常量定义 / Constants
+-ROBO_ACTION_NODE = 'viola_controller_node'  # 节点名称 / Node name
+-ROBO_CURRENT_ANGLE_SUBSCRIPTION = "joint_states"  # 当前关节角度话题 / Current joint states topic
+-ROBO_SET_ANGLE_PUBLISHER = 'set_angle_topic'  # 发布舵机设定角度话题 / Publish set_angle topic
+-ROBO_ARM_ACTION_SERVER = '/arm_controller/follow_joint_trajectory'  # 机械臂动作服务器名 / Arm action server name
+-ROBO_GRIPPER_ACTION_SERVER = '/hand_controller/gripper_cmd'  # 夹爪动作服务器名 / Gripper action server name
+-
+-# 机器人关节名称与索引映射 / Joint name to index mapping
+-ROBO_TYPE_1 = "viola"
+-ROBO_TYPE_1_JOINT_ = [
+-    "joint1",
+-    "joint2",
+-    "joint3",
+-    "joint4",
+-    "joint5",
+-    "joint6",
+-    "joint7_left",
+-]
+-ROBO_TYPE_1_INDEX_JOINT_ = {name: idx for idx, name in enumerate(ROBO_TYPE_1_JOINT_)}
+-
+-
+-
+-def radians_to_degrees(radians):
+-    """弧度转角度 / convert radians to degrees"""
++
++
++ROBO_ACTION_NODE = "viola_controller_node"
++ROBO_CURRENT_ANGLE_SUBSCRIPTION = "joint_states"
++ROBO_SET_ANGLES_SERVICE = "set_angles"
++ROBO_STOP_SERVOS_SERVICE = "stop_servos"
++ROBO_ARM_ACTION_SERVER = "/arm_controller/follow_joint_trajectory"
++ROBO_GRIPPER_ACTION_SERVER = "/hand_controller/gripper_cmd"
++
++ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
++ALL_JOINTS = [*ARM_JOINTS, "joint7_left"]
++JOINT_INDEX = {name: index for index, name in enumerate(ALL_JOINTS)}
++ARM_LIMITS_RAD = {
++    "joint1": (-2.27, 2.27),
++    "joint2": (-1.57, 1.57),
++    "joint3": (-1.57, 1.57),
++    "joint4": (-2.27, 2.27),
++    "joint5": (-1.57, 1.57),
++    "joint6": (-2.27, 2.27),
++}
++GRIPPER_LIMIT_M = (-0.03, 0.0)
++MAX_SEGMENT_TIME_S = 120.0
++MAX_ARM_SPEED_RAD_S = 1.0
++MAX_GRIPPER_SPEED_M_S = 0.03
++MEASURED_ARM_MARGIN_RAD = math.radians(2.0)
++MEASURED_GRIPPER_MARGIN_M = (2.0 / 100) * 0.032
++
++
++def require_finite_parameter(name: str, value: float) -> None:
++    if not math.isfinite(value):
++        raise ValueError(f"{name} must be finite")
++
++
++def radians_to_degrees(radians: float) -> float:
+     return radians * (180 / math.pi)
+ 
+-def meters_to_degrees(meters):
+-    """长度(米)转角度（基于臂长0.032m）/ convert meters to degrees"""
++
++def meters_to_degrees(meters: float) -> float:
+     return (meters / 0.032) * 100
+ 
+-def jointstate2servoangle(servo_id, joint_state):
+-    """关节状态转舵机命令角度 / joint state to servo angle"""
++
++def servo_degrees_to_gripper_meters(degrees: float) -> float:
++    return ((degrees - 100) / 100) * 0.032
++
++
++def jointstate2servoangle(servo_id: int, joint_state: float) -> float:
+     if servo_id < 6:
+         return radians_to_degrees(joint_state)
+-    elif servo_id == 6:
++    if servo_id == 6:
+         return meters_to_degrees(joint_state) + 100
++    raise ValueError(f"invalid servo id {servo_id}")
++
++
++def complete_joint_state_to_servo_angles(msg: JointState) -> list[float]:
++    """Convert one complete, finite seven-joint sample to servo units."""
++
++    names = list(msg.name)
++    positions = list(msg.position)
++    if len(names) != len(positions):
++        raise ValueError("name/position lengths differ")
++    if len(names) != len(ALL_JOINTS) or len(set(names)) != len(names):
++        raise ValueError("expected exactly seven unique joint names")
++    if set(names) != set(ALL_JOINTS):
++        raise ValueError(f"expected joints {ALL_JOINTS}, received {names}")
++    if not all(math.isfinite(position) for position in positions):
++        raise ValueError("joint positions must all be finite")
++
++    converted = [0.0] * len(ALL_JOINTS)
++    for name, position in zip(names, positions, strict=True):
++        index = JOINT_INDEX[name]
++        if name in ARM_LIMITS_RAD:
++            lower, upper = ARM_LIMITS_RAD[name]
++            margin = MEASURED_ARM_MARGIN_RAD
++        else:
++            lower, upper = GRIPPER_LIMIT_M
++            margin = MEASURED_GRIPPER_MARGIN_M
++        if not lower - margin <= position <= upper + margin:
++            raise ValueError(
++                f"{name}={position:.6f} is outside the plausible measured range "
++                f"[{lower - margin:.6f}, {upper + margin:.6f}]"
++            )
++        converted[index] = jointstate2servoangle(index, position)
++    return converted
++
++
++def validate_arm_trajectory(
++    trajectory: object,
++    current_positions_rad: dict[str, float] | None = None,
++    start_tolerance_rad: float = math.radians(2.0),
++) -> None:
++    """Validate model limits, start state, timing, and implied joint speed."""
++
++    names = list(trajectory.joint_names)
++    if not names or len(names) != len(set(names)):
++        raise ValueError("joint_names must contain unique arm joints")
++    if any(name not in ARM_JOINTS for name in names):
++        raise ValueError(f"invalid arm joint names: {names}")
++    if not trajectory.points:
++        raise ValueError("trajectory is empty")
++    if trajectory.header.stamp.sec != 0 or trajectory.header.stamp.nanosec != 0:
++        raise ValueError("non-zero trajectory header.stamp is not supported")
++
++    if current_positions_rad is not None:
++        missing = [name for name in names if name not in current_positions_rad]
++        if missing:
++            raise ValueError(f"current state is missing joints {missing}")
++        if not all(math.isfinite(current_positions_rad[name]) for name in names):
++            raise ValueError("current joint state contains a non-finite position")
++
++    last_time = 0.0
++    previous_positions = (
++        {name: current_positions_rad[name] for name in names}
++        if current_positions_rad is not None
++        else None
++    )
++    for point_index, point in enumerate(trajectory.points):
++        positions = list(point.positions)
++        if len(positions) != len(names):
++            raise ValueError(f"point {point_index} has the wrong number of positions")
++        if not all(math.isfinite(value) for value in positions):
++            raise ValueError(f"point {point_index} contains a non-finite position")
++        for name, position in zip(names, positions, strict=True):
++            lower, upper = ARM_LIMITS_RAD[name]
++            if not lower <= position <= upper:
++                raise ValueError(
++                    f"point {point_index} {name}={position:.6f} rad is outside "
++                    f"[{lower:.6f}, {upper:.6f}]"
++                )
++
++        velocities = list(point.velocities)
++        if velocities:
++            if len(velocities) != len(names):
++                raise ValueError(f"point {point_index} has the wrong number of velocities")
++            if not all(math.isfinite(value) for value in velocities):
++                raise ValueError(f"point {point_index} contains a non-finite velocity")
++            for name, velocity in zip(names, velocities, strict=True):
++                if abs(velocity) > MAX_ARM_SPEED_RAD_S + 1e-9:
++                    raise ValueError(
++                        f"point {point_index} {name} velocity {velocity:.6f} rad/s "
++                        f"exceeds {MAX_ARM_SPEED_RAD_S:.6f} rad/s"
++                    )
++
++        point_time = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
++        if point_time < 0:
++            raise ValueError(f"point {point_index} has a negative time_from_start")
++        if point_index and point_time <= last_time:
++            raise ValueError("time_from_start must increase strictly")
++        segment_time = point_time - last_time
++        if segment_time > MAX_SEGMENT_TIME_S:
++            raise ValueError(
++                f"point {point_index} segment is {segment_time:.3f} s; maximum is "
++                f"{MAX_SEGMENT_TIME_S:.0f} s"
++            )
++
++        point_positions = dict(zip(names, positions, strict=True))
++        if point_index == 0 and point_time == 0.0:
++            if previous_positions is not None:
++                for name in names:
++                    start_error = abs(point_positions[name] - previous_positions[name])
++                    if start_error > start_tolerance_rad:
++                        raise ValueError(
++                            f"zero-time start point differs from measured {name} by "
++                            f"{start_error:.6f} rad; tolerance is "
++                            f"{start_tolerance_rad:.6f} rad"
++                        )
++        elif previous_positions is not None:
++            if segment_time <= 0:
++                raise ValueError("a moving trajectory segment must have positive duration")
++            for name in names:
++                required_speed = (
++                    abs(point_positions[name] - previous_positions[name]) / segment_time
++                )
++                if required_speed > MAX_ARM_SPEED_RAD_S + 1e-9:
++                    raise ValueError(
++                        f"point {point_index} {name} requires "
++                        f"{required_speed:.6f} rad/s, exceeding "
++                        f"{MAX_ARM_SPEED_RAD_S:.6f} rad/s"
++                    )
++
++        previous_positions = point_positions
++        last_time = point_time
++
++
++def validate_gripper_speed(
++    current_position_m: float,
++    target_position_m: float,
++    duration_s: float,
++) -> None:
++    """Reject a gripper request whose implied speed exceeds the model limit."""
++
++    required_speed = abs(target_position_m - current_position_m) / duration_s
++    if required_speed > MAX_GRIPPER_SPEED_M_S + 1e-9:
++        raise ValueError(
++            f"gripper requires {required_speed:.6f} m/s, exceeding "
++            f"{MAX_GRIPPER_SPEED_M_S:.6f} m/s"
++        )
+ 
+ 
+ class RoboActionClient(Node):
+-    """机械臂与夹爪动作服务器节点 / Action server node for arm & gripper"""
+-    def __init__(self):
++    def __init__(self) -> None:
+         super().__init__(ROBO_ACTION_NODE)
+-        # 使用可重入回调组支持并发 / Use reentrant callback group for concurrency
++        self.declare_parameter("goal_tolerance_deg", 5.0)
++        self.declare_parameter("start_tolerance_deg", 2.0)
++        self.declare_parameter("gripper_goal_tolerance_m", 0.002)
++        self.declare_parameter("settle_timeout_s", 1.0)
++        self.declare_parameter("joint_state_timeout_s", 0.5)
++        self.declare_parameter("gripper_motion_time_s", 1.0)
++        self.declare_parameter("command_timeout_s", 1.0)
++
++        self.goal_tolerance_deg = float(self.get_parameter("goal_tolerance_deg").value)
++        self.start_tolerance_deg = float(
++            self.get_parameter("start_tolerance_deg").value
++        )
++        self.gripper_goal_tolerance_m = float(
++            self.get_parameter("gripper_goal_tolerance_m").value
++        )
++        self.settle_timeout_s = float(self.get_parameter("settle_timeout_s").value)
++        self.joint_state_timeout_s = float(
++            self.get_parameter("joint_state_timeout_s").value
++        )
++        self.gripper_motion_time_s = float(
++            self.get_parameter("gripper_motion_time_s").value
++        )
++        self.command_timeout_s = float(self.get_parameter("command_timeout_s").value)
++        for parameter_name, parameter_value in {
++            "goal_tolerance_deg": self.goal_tolerance_deg,
++            "start_tolerance_deg": self.start_tolerance_deg,
++            "gripper_goal_tolerance_m": self.gripper_goal_tolerance_m,
++            "settle_timeout_s": self.settle_timeout_s,
++            "joint_state_timeout_s": self.joint_state_timeout_s,
++            "gripper_motion_time_s": self.gripper_motion_time_s,
++            "command_timeout_s": self.command_timeout_s,
++        }.items():
++            require_finite_parameter(parameter_name, parameter_value)
++        if self.goal_tolerance_deg <= 0:
++            raise ValueError("goal_tolerance_deg must be positive")
++        if self.start_tolerance_deg <= 0:
++            raise ValueError("start_tolerance_deg must be positive")
++        if self.gripper_goal_tolerance_m <= 0:
++            raise ValueError("gripper_goal_tolerance_m must be positive")
++        if self.settle_timeout_s < 0:
++            raise ValueError("settle_timeout_s cannot be negative")
++        if self.joint_state_timeout_s <= 0:
++            raise ValueError("joint_state_timeout_s must be positive")
++        if not 0.04 <= self.gripper_motion_time_s <= MAX_SEGMENT_TIME_S:
++            raise ValueError("gripper_motion_time_s must be within [0.04, 120] seconds")
++        if self.command_timeout_s <= 0:
++            raise ValueError("command_timeout_s must be positive")
++
+         self.callback_group = ReentrantCallbackGroup()
+-        # 创建机械臂轨迹跟踪动作服务器 / Arm trajectory action server
++        self._state_lock = threading.Lock()
++        self._goal_lock = threading.Lock()
++        self.current_angle = [0.0] * len(ALL_JOINTS)
++        self.have_joint_state = False
++        self._last_joint_state_monotonic: float | None = None
++        self._arm_goal_active = False
++        self._gripper_goal_active = False
++
++        self.set_angles_client = self.create_client(
++            SetAngles,
++            ROBO_SET_ANGLES_SERVICE,
++            callback_group=self.callback_group,
++        )
++        self.stop_servos_client = self.create_client(
++            StopServos,
++            ROBO_STOP_SERVOS_SERVICE,
++            callback_group=self.callback_group,
++        )
++
+         self.arm_action_server = ActionServer(
+             self,
+             FollowJointTrajectory,
+             ROBO_ARM_ACTION_SERVER,
++            goal_callback=self.arm_goal_callback,
+             execute_callback=self.arm_execute_callback,
+             cancel_callback=self.arm_cancel_callback,
+             callback_group=self.callback_group,
+         )
+-        # 创建夹爪控制动作服务器 / Gripper control action server
+         self.gripper_action_server = ActionServer(
+             self,
+             GripperCommand,
+             ROBO_GRIPPER_ACTION_SERVER,
++            goal_callback=self.gripper_goal_callback,
+             execute_callback=self.gripper_execute_callback,
+             cancel_callback=self.gripper_cancel_callback,
+             callback_group=self.callback_group,
+         )
+-        # 订阅当前关节状态话题 / Subscribe current joint states
+         self.current_angle_subscription = self.create_subscription(
+             JointState,
+             ROBO_CURRENT_ANGLE_SUBSCRIPTION,
+             self.current_angle_callback,
+-            1,
++            10,
+             callback_group=self.callback_group,
+         )
+-        # 发布舵机角度设定话题 / Publisher for SetAngle messages
+-        self.set_angle_publisher = self.create_publisher(
+-            SetAngle, ROBO_SET_ANGLE_PUBLISHER, 1
+-        )
+-        self.get_logger().info(f"{ROBO_ACTION_NODE} is ready.")  # 节点就绪日志 / ready log
+-        self.current_angle = [0.0] * 7  # 当前舵机角度缓存 / current servo angles
+-        self.last_time = 0  # 上一次时间戳 / last trajectory time index
++        self.get_logger().info(f"{ROBO_ACTION_NODE} is ready")
++
++    def current_angle_callback(self, msg: JointState) -> None:
++        try:
++            converted = complete_joint_state_to_servo_angles(msg)
++        except ValueError as error:
++            self.get_logger().error(f"Ignoring malformed JointState: {error}")
++            return
++        with self._state_lock:
++            self.current_angle = converted
++            self.have_joint_state = True
++            self._last_joint_state_monotonic = time.monotonic()
++
++    def _fresh_angles(self) -> list[float] | None:
++        now = time.monotonic()
++        with self._state_lock:
++            if not self.have_joint_state or self._last_joint_state_monotonic is None:
++                return None
++            if now - self._last_joint_state_monotonic > self.joint_state_timeout_s:
++                return None
++            return self.current_angle.copy()
++
++    def arm_goal_callback(self, goal_request: FollowJointTrajectory.Goal) -> GoalResponse:
++        angles = self._fresh_angles()
++        if angles is None:
++            self.get_logger().error(
++                "Rejecting trajectory because joint feedback is missing or stale"
++            )
++            return GoalResponse.REJECT
++        try:
++            current_positions_rad = {
++                name: math.radians(angles[JOINT_INDEX[name]]) for name in ARM_JOINTS
++            }
++            validate_arm_trajectory(
++                goal_request.trajectory,
++                current_positions_rad=current_positions_rad,
++                start_tolerance_rad=math.radians(self.start_tolerance_deg),
++            )
++        except ValueError as error:
++            self.get_logger().error(f"Rejecting trajectory: {error}")
++            return GoalResponse.REJECT
++        if not self.set_angles_client.service_is_ready():
++            self.get_logger().error(
++                "Rejecting trajectory because the driver service is unavailable"
++            )
++            return GoalResponse.REJECT
++        with self._goal_lock:
++            if self._arm_goal_active:
++                self.get_logger().error("Rejecting trajectory because another arm goal is active")
++                return GoalResponse.REJECT
++            self._arm_goal_active = True
++        return GoalResponse.ACCEPT
+ 
+-    def arm_cancel_callback(self, cancel_request):
+-        """处理机械臂动作取消请求 / handle cancel request"""
+-        self.get_logger().info('Received arm cancel request')
++    def arm_cancel_callback(self, _cancel_request: object) -> CancelResponse:
++        self.get_logger().warning("Received arm cancel request")
+         return CancelResponse.ACCEPT
+ 
+-    def current_angle_callback(self, msg):
+-        """接收并转换 JointState 到舵机角度 / receive joint states"""
+-        for name, pos in zip(msg.name, msg.position):
+-            idx = ROBO_TYPE_1_INDEX_JOINT_[name]
+-            self.current_angle[idx] = jointstate2servoangle(idx, pos)
++    def gripper_goal_callback(self, goal_request: GripperCommand.Goal) -> GoalResponse:
++        angles = self._fresh_angles()
++        if angles is None:
++            self.get_logger().error(
++                "Rejecting gripper goal because joint feedback is missing or stale"
++            )
++            return GoalResponse.REJECT
++        position = float(goal_request.command.position)
++        max_effort = float(goal_request.command.max_effort)
++        if not math.isfinite(position) or not GRIPPER_LIMIT_M[0] <= position <= GRIPPER_LIMIT_M[1]:
++            self.get_logger().error(
++                f"Rejecting gripper position {position}; expected {GRIPPER_LIMIT_M} m"
++            )
++            return GoalResponse.REJECT
++        if not math.isfinite(max_effort) or max_effort != 0.0:
++            self.get_logger().error(
++                "Rejecting gripper goal: max_effort is unsupported and must be zero"
++            )
++            return GoalResponse.REJECT
++        try:
++            validate_gripper_speed(
++                servo_degrees_to_gripper_meters(angles[6]),
++                position,
++                self.gripper_motion_time_s,
++            )
++        except ValueError as error:
++            self.get_logger().error(f"Rejecting gripper goal: {error}")
++            return GoalResponse.REJECT
++        if not self.set_angles_client.service_is_ready():
++            self.get_logger().error(
++                "Rejecting gripper goal because the driver service is unavailable"
++            )
++            return GoalResponse.REJECT
++        with self._goal_lock:
++            if self._gripper_goal_active:
++                self.get_logger().error(
++                    "Rejecting gripper goal because another gripper goal is active"
++                )
++                return GoalResponse.REJECT
++            self._gripper_goal_active = True
++        return GoalResponse.ACCEPT
+ 
+-    def arm_execute_callback(self, goal_handle):
+-        """执行轨迹点 / execute trajectory points"""
+-        trajectory = goal_handle.request.trajectory
+-        # self.get_logger().info(
+-        #     f'Receiving trajectory with {len(trajectory.points)} points.')
+-        self.last_time = 0
+-        # 遍历轨迹点 / iterate through trajectory
+-        for pt in trajectory.points:
+-            # 计算每段运行时间 / compute run duration
+-            tfs = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+-            duration = max(tfs - self.last_time, 0.1)
+-            self.last_time = tfs
+-            # 构造 SetAngle 消息 / build SetAngle msg
+-            msg = SetAngle(
+-                servo_id=list(range(6)),
+-                target_angle=[0]*6,
+-                time=[int(duration*1000)]*6,
+-            )
+-            # 填充目标角度 / fill target angles
+-            for name, angle in zip(trajectory.joint_names, pt.positions):
+-                idx = ROBO_TYPE_1_INDEX_JOINT_[name]
+-                msg.target_angle[idx] = jointstate2servoangle(idx, angle)
+-            self.set_angle_publisher.publish(msg)  # 发布命令 / publish command
+-            time.sleep(duration)  # 等待完成 / wait
+-        # 完成后返回成功 / succeed goal
+-        goal_handle.succeed()
+-        return FollowJointTrajectory.Result()
+-
+-    def gripper_cancel_callback(self, cancel_request):
+-        """处理夹爪取消请求 / handle gripper cancel"""
+-        self.get_logger().info('Received gripper cancel request')
++    def gripper_cancel_callback(self, _cancel_request: object) -> CancelResponse:
++        self.get_logger().warning("Received gripper cancel request")
+         return CancelResponse.ACCEPT
+ 
+-    def gripper_execute_callback(self, goal_handle):
+-        """执行夹爪命令 / execute gripper command"""
+-        pos = goal_handle.request.command.position
+-        # 构造单舵机 SetAngle / build single servo command
+-        msg = SetAngle(
+-            servo_id=[6],
+-            target_angle=[jointstate2servoangle(6, pos)],
+-            time=[1000],
++    def _command_angles(
++        self,
++        servo_ids: list[int],
++        target_angles: list[float],
++        times_ms: list[int],
++    ) -> None:
++        if not self.set_angles_client.wait_for_service(timeout_sec=self.command_timeout_s):
++            raise RuntimeError("driver SetAngles service is unavailable")
++        request = SetAngles.Request()
++        request.servo_id = servo_ids
++        request.target_angle = target_angles
++        request.time = times_ms
++        future = self.set_angles_client.call_async(request)
++        deadline = time.monotonic() + self.command_timeout_s
++        while not future.done() and time.monotonic() < deadline:
++            time.sleep(0.005)
++        if not future.done():
++            future.cancel()
++            raise RuntimeError("driver SetAngles service timed out")
++        response = future.result()
++        if response is None:
++            raise RuntimeError("driver SetAngles service returned no response")
++        if not response.success:
++            raise RuntimeError(f"driver rejected command: {response.error}")
++
++    def _request_damping(self) -> bool:
++        if not self.stop_servos_client.wait_for_service(
++            timeout_sec=self.command_timeout_s
++        ):
++            self.get_logger().error("Driver StopServos service is unavailable")
++            return False
++        request = StopServos.Request()
++        request.mode = "damping"
++        future = self.stop_servos_client.call_async(request)
++        deadline = time.monotonic() + self.command_timeout_s
++        while not future.done() and time.monotonic() < deadline:
++            time.sleep(0.005)
++        if not future.done():
++            future.cancel()
++            self.get_logger().error("Driver StopServos service timed out")
++            return False
++        try:
++            response = future.result()
++        except Exception as error:
++            self.get_logger().error(f"Driver StopServos service failed: {error}")
++            return False
++        if response is None or not response.success:
++            reason = response.error if response is not None else "no response"
++            self.get_logger().error(f"Driver rejected damping request: {reason}")
++            return False
++        return True
++
++    def _hold_measured_arm(self) -> bool:
++        angles = self._fresh_angles()
++        if angles is None:
++            return False
++        try:
++            self._command_angles(list(range(6)), angles[:6], [100] * 6)
++        except Exception as error:
++            self.get_logger().error(f"Could not deliver measured arm hold: {error}")
++            return False
++        return True
++
++    def _hold_measured_gripper(self) -> bool:
++        angles = self._fresh_angles()
++        if angles is None:
++            return False
++        try:
++            self._command_angles([6], [angles[6]], [100])
++        except Exception as error:
++            self.get_logger().error(f"Could not deliver measured gripper hold: {error}")
++            return False
++        return True
++
++    def _wait_interruptibly(
++        self,
++        goal_handle: object,
++        duration: float,
++        hold_on_cancel: Callable[[], bool],
++    ) -> str:
++        deadline = time.monotonic() + max(0.0, duration)
++        while time.monotonic() < deadline:
++            if goal_handle.is_cancel_requested:
++                return "canceled" if hold_on_cancel() else "hold_failed"
++            if self._fresh_angles() is None:
++                return "stale"
++            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
++        return "done"
++
++    @staticmethod
++    def _arm_result(error_code: int, error_string: str = "") -> FollowJointTrajectory.Result:
++        result = FollowJointTrajectory.Result()
++        result.error_code = error_code
++        result.error_string = error_string
++        return result
++
++    def arm_execute_callback(self, goal_handle: object) -> FollowJointTrajectory.Result:
++        try:
++            return self._execute_arm_goal(goal_handle)
++        except Exception as error:
++            self.get_logger().error(f"Arm goal failed unexpectedly: {error}")
++            if not self._hold_measured_arm():
++                self._request_damping()
++            goal_handle.abort()
++            return self._arm_result(
++                FollowJointTrajectory.Result.INVALID_GOAL,
++                f"controller exception: {error}",
++            )
++        finally:
++            with self._goal_lock:
++                self._arm_goal_active = False
++
++    def _execute_arm_goal(self, goal_handle: object) -> FollowJointTrajectory.Result:
++        trajectory = goal_handle.request.trajectory
++        servo_ids = [JOINT_INDEX[name] for name in trajectory.joint_names]
++        last_time = 0.0
++        final_targets: dict[int, float] = {}
++
++        for point_index, point in enumerate(trajectory.points):
++            if goal_handle.is_cancel_requested:
++                if self._hold_measured_arm():
++                    goal_handle.canceled()
++                    return self._arm_result(
++                        FollowJointTrajectory.Result.INVALID_GOAL,
++                        "trajectory canceled before the next segment; "
++                        "measured arm pose held",
++                    )
++                damping_applied = self._request_damping()
++                goal_handle.abort()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
++                    "trajectory cancel requested before the next segment; "
++                    + (
++                        "driver damping was acknowledged"
++                        if damping_applied
++                        else "neither hold nor damping delivery could be confirmed"
++                    ),
++                )
++            time_from_start = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
++            if point_index == 0 and time_from_start == 0.0:
++                final_targets.update(
++                    {
++                        servo_id: jointstate2servoangle(servo_id, position)
++                        for servo_id, position in zip(
++                            servo_ids,
++                            point.positions,
++                            strict=True,
++                        )
++                    }
++                )
++                continue
++            duration = max(time_from_start - last_time, 0.04)
++            last_time = time_from_start
++            target_angles = [
++                jointstate2servoangle(JOINT_INDEX[name], position)
++                for name, position in zip(
++                    trajectory.joint_names,
++                    point.positions,
++                    strict=True,
++                )
++            ]
++            final_targets.update(zip(servo_ids, target_angles, strict=True))
++            self._command_angles(
++                servo_ids,
++                target_angles,
++                [max(40, int(round(duration * 1000)))] * len(servo_ids),
++            )
++            wait_status = self._wait_interruptibly(
++                goal_handle,
++                duration,
++                self._hold_measured_arm,
++            )
++            if wait_status == "canceled":
++                goal_handle.canceled()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.INVALID_GOAL,
++                    "trajectory canceled; measured arm pose held",
++                )
++            if wait_status == "stale":
++                damping_applied = self._request_damping()
++                goal_handle.abort()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
++                    "joint feedback became stale during trajectory; "
++                    + (
++                        "driver damping was acknowledged"
++                        if damping_applied
++                        else "driver damping could not be confirmed"
++                    ),
++                )
++            if wait_status == "hold_failed":
++                self._request_damping()
++                goal_handle.abort()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
++                    "trajectory cancel requested, but measured hold delivery failed",
++                )
++
++        settle_deadline = time.monotonic() + self.settle_timeout_s
++        while True:
++            measured = self._fresh_angles()
++            if measured is None:
++                damping_applied = self._request_damping()
++                goal_handle.abort()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
++                    "joint feedback became stale while settling; "
++                    + (
++                        "driver damping was acknowledged"
++                        if damping_applied
++                        else "driver damping could not be confirmed"
++                    ),
++                )
++            largest_error = max(
++                abs(measured[servo_id] - target)
++                for servo_id, target in final_targets.items()
++            )
++            if largest_error <= self.goal_tolerance_deg:
++                goal_handle.succeed()
++                return self._arm_result(FollowJointTrajectory.Result.SUCCESSFUL)
++            if goal_handle.is_cancel_requested:
++                if self._hold_measured_arm():
++                    goal_handle.canceled()
++                    return self._arm_result(
++                        FollowJointTrajectory.Result.INVALID_GOAL,
++                        "trajectory canceled while settling; measured arm pose held",
++                    )
++                self._request_damping()
++                goal_handle.abort()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
++                    "trajectory cancel requested, but measured hold delivery failed",
++                )
++            if time.monotonic() >= settle_deadline:
++                hold_delivered = self._hold_measured_arm()
++                if not hold_delivered:
++                    self._request_damping()
++                goal_handle.abort()
++                return self._arm_result(
++                    FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
++                    f"largest measured joint error remained {largest_error:.3f} "
++                    "degrees; "
++                    + (
++                        "measured hold was acknowledged"
++                        if hold_delivered
++                        else "damping was requested because hold delivery failed"
++                    ),
++                )
++            time.sleep(0.02)
++
++    @staticmethod
++    def _gripper_result(
++        position: float,
++        *,
++        reached_goal: bool,
++        stalled: bool,
++    ) -> GripperCommand.Result:
++        result = GripperCommand.Result()
++        result.position = position
++        result.effort = 0.0
++        result.reached_goal = reached_goal
++        result.stalled = stalled
++        return result
++
++    def gripper_execute_callback(self, goal_handle: object) -> GripperCommand.Result:
++        try:
++            return self._execute_gripper_goal(goal_handle)
++        except Exception as error:
++            self.get_logger().error(f"Gripper goal failed unexpectedly: {error}")
++            if not self._hold_measured_gripper():
++                self._request_damping()
++            goal_handle.abort()
++            measured = self._fresh_angles()
++            actual = (
++                servo_degrees_to_gripper_meters(measured[6])
++                if measured is not None
++                else 0.0
++            )
++            return self._gripper_result(actual, reached_goal=False, stalled=False)
++        finally:
++            with self._goal_lock:
++                self._gripper_goal_active = False
++
++    def _execute_gripper_goal(self, goal_handle: object) -> GripperCommand.Result:
++        target_position = float(goal_handle.request.command.position)
++        if goal_handle.is_cancel_requested:
++            measured = self._fresh_angles()
++            actual_position = (
++                servo_degrees_to_gripper_meters(measured[6])
++                if measured is not None
++                else 0.0
++            )
++            if self._hold_measured_gripper():
++                goal_handle.canceled()
++            else:
++                self._request_damping()
++                goal_handle.abort()
++            return self._gripper_result(
++                actual_position,
++                reached_goal=False,
++                stalled=False,
++            )
++        self._command_angles(
++            [6],
++            [jointstate2servoangle(6, target_position)],
++            [int(round(self.gripper_motion_time_s * 1000))],
++        )
++        wait_status = self._wait_interruptibly(
++            goal_handle,
++            self.gripper_motion_time_s,
++            self._hold_measured_gripper,
+         )
+-        self.set_angle_publisher.publish(msg)
+-        goal_handle.succeed()
+-        return GripperCommand.Result()
++        measured = self._fresh_angles()
++        actual_position = (
++            servo_degrees_to_gripper_meters(measured[6]) if measured is not None else 0.0
++        )
++        if wait_status == "canceled":
++            goal_handle.canceled()
++            return self._gripper_result(
++                actual_position,
++                reached_goal=False,
++                stalled=False,
++            )
++        if wait_status == "stale":
++            self._request_damping()
++            goal_handle.abort()
++            return self._gripper_result(
++                actual_position,
++                reached_goal=False,
++                stalled=False,
++            )
++        if wait_status == "hold_failed":
++            self._request_damping()
++            goal_handle.abort()
++            return self._gripper_result(
++                actual_position,
++                reached_goal=False,
++                stalled=False,
++            )
++
++        settle_deadline = time.monotonic() + self.settle_timeout_s
++        while True:
++            measured = self._fresh_angles()
++            if measured is None:
++                self._request_damping()
++                goal_handle.abort()
++                return self._gripper_result(
++                    actual_position,
++                    reached_goal=False,
++                    stalled=False,
++                )
++            actual_position = servo_degrees_to_gripper_meters(measured[6])
++            if abs(actual_position - target_position) <= self.gripper_goal_tolerance_m:
++                goal_handle.succeed()
++                return self._gripper_result(
++                    actual_position,
++                    reached_goal=True,
++                    stalled=False,
++                )
++            if goal_handle.is_cancel_requested:
++                if self._hold_measured_gripper():
++                    goal_handle.canceled()
++                    return self._gripper_result(
++                        actual_position,
++                        reached_goal=False,
++                        stalled=False,
++                    )
++                self._request_damping()
++                goal_handle.abort()
++                return self._gripper_result(
++                    actual_position,
++                    reached_goal=False,
++                    stalled=False,
++                )
++            if time.monotonic() >= settle_deadline:
++                if not self._hold_measured_gripper():
++                    self._request_damping()
++                goal_handle.abort()
++                return self._gripper_result(
++                    actual_position,
++                    reached_goal=False,
++                    stalled=True,
++                )
++            time.sleep(0.02)
+ 
+ 
+-def main(args=None):
+-    rclpy.init(args=args)  # 初始化 ROS 客户端 / init ROS
+-    node = RoboActionClient()
+-    executor = MultiThreadedExecutor()
+-    executor.add_node(node)  # 添加节点到执行器 / add node
+-    executor.spin()  # 运行执行器 / spin executor
+-    rclpy.shutdown()  # 退出 ROS / shutdown
++def main(args: list[str] | None = None) -> None:
++    rclpy.init(args=args)
++    node: RoboActionClient | None = None
++    executor: MultiThreadedExecutor | None = None
++    try:
++        node = RoboActionClient()
++        executor = MultiThreadedExecutor()
++        executor.add_node(node)
++        executor.spin()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        if executor is not None:
++            executor.shutdown()
++        if node is not None:
++            node.destroy_node()
++        if rclpy.ok():
++            rclpy.shutdown()
+ 
+ 
+-if __name__ == '__main__':
++if __name__ == "__main__":
+     main()
+diff --git a/src/viola_moveit_config/config/joint_limits.yaml b/src/viola_moveit_config/config/joint_limits.yaml
+index f24e6df..6258925 100644
+--- a/src/viola_moveit_config/config/joint_limits.yaml
++++ b/src/viola_moveit_config/config/joint_limits.yaml
+@@ -2,49 +2,49 @@
+ 
+ # For beginners, we downscale velocity and acceleration limits.
+ # You can always specify higher scaling factors (<= 1.0) in your motion requests.  # Increase the values below to 1.0 to always move at maximum speed.
+-default_velocity_scaling_factor: 0.1
+-default_acceleration_scaling_factor: 0.1
++default_velocity_scaling_factor: 0.05
++default_acceleration_scaling_factor: 0.05
+ 
+ # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
+ # Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
+ joint_limits:
+   joint1:
+     has_velocity_limits: true
+-    max_velocity: 3.14
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 1.0
++    has_acceleration_limits: true
++    max_acceleration: 1.0
+   joint2:
+     has_velocity_limits: true
+-    max_velocity: 3.14
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 1.0
++    has_acceleration_limits: true
++    max_acceleration: 1.0
+   joint3:
+     has_velocity_limits: true
+-    max_velocity: 3.14
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 1.0
++    has_acceleration_limits: true
++    max_acceleration: 1.0
+   joint4:
+     has_velocity_limits: true
+-    max_velocity: 3.14
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 1.0
++    has_acceleration_limits: true
++    max_acceleration: 1.0
+   joint5:
+     has_velocity_limits: true
+-    max_velocity: 3.14
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 1.0
++    has_acceleration_limits: true
++    max_acceleration: 1.0
+   joint6:
+     has_velocity_limits: true
+-    max_velocity: 13.14
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 1.0
++    has_acceleration_limits: true
++    max_acceleration: 1.0
+   joint7_left:
+     has_velocity_limits: true
+-    max_velocity: 3.1400000000000001
+-    has_acceleration_limits: false
+-    max_acceleration: 0
++    max_velocity: 0.03
++    has_acceleration_limits: true
++    max_acceleration: 0.1
+   joint7_right:
+     has_velocity_limits: true
+-    max_velocity: 3.1400000000000001
+-    has_acceleration_limits: false
+-    max_acceleration: 0
+\ No newline at end of file
++    max_velocity: 0.03
++    has_acceleration_limits: true
++    max_acceleration: 0.1
+diff --git a/src/viola_moveit_config/config/moveit.rviz b/src/viola_moveit_config/config/moveit.rviz
+index 4ed4c6d..72023d3 100644
+--- a/src/viola_moveit_config/config/moveit.rviz
++++ b/src/viola_moveit_config/config/moveit.rviz
+@@ -36,7 +36,7 @@ Visualization Manager:
+       Plane Cell Count: 10
+       Reference Frame: <Fixed Frame>
+       Value: true
+-    - Acceleration_Scaling_Factor: 0
++    - Acceleration_Scaling_Factor: 0.05
+       Class: moveit_rviz_plugin/MotionPlanning
+       Enabled: true
+       Move Group Namespace: ""
+@@ -215,7 +215,7 @@ Visualization Manager:
+         Show Robot Collision: false
+         Show Robot Visual: true
+       Value: true
+-      Velocity_Scaling_Factor: 1
++      Velocity_Scaling_Factor: 0.05
+   Enabled: true
+   Global Options:
+     Background Color: 48; 48; 48
+diff --git a/src/viola_moveit_config/config/sensors_3d.yaml b/src/viola_moveit_config/config/sensors_3d.yaml
+deleted file mode 100644
+index 5d90e51..0000000
+--- a/src/viola_moveit_config/config/sensors_3d.yaml
++++ /dev/null
+@@ -1,23 +0,0 @@
+-sensors:
+-  - kinect_pointcloud
+-  - kinect_depthimage
+-kinect_pointcloud:
+-  filtered_cloud_topic: filtered_cloud
+-  max_range: 5.0
+-  max_update_rate: 1.0
+-  padding_offset: 0.1
+-  padding_scale: 1.0
+-  point_cloud_topic: /head_mount_kinect/depth_registered/points
+-  point_subsample: 1
+-  sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+-kinect_depthimage:
+-  far_clipping_plane_distance: 5.0
+-  filtered_cloud_topic: filtered_cloud
+-  image_topic: /head_mount_kinect/depth_registered/image_raw
+-  max_update_rate: 1.0
+-  near_clipping_plane_distance: 0.3
+-  padding_offset: 0.03
+-  padding_scale: 4.0
+-  queue_size: 5
+-  sensor_plugin: occupancy_map_monitor/DepthImageOctomapUpdater
+-  shadow_threshold: 0.2
+\ No newline at end of file
+diff --git a/src/viola_moveit_config/launch/actual_robot_demo.launch.py b/src/viola_moveit_config/launch/actual_robot_demo.launch.py
+index fbef337..b49f591 100644
+--- a/src/viola_moveit_config/launch/actual_robot_demo.launch.py
++++ b/src/viola_moveit_config/launch/actual_robot_demo.launch.py
+@@ -1,22 +1,40 @@
+-from launch import LaunchDescription
+-from launch.actions import IncludeLaunchDescription
+ import os
++
+ from ament_index_python.packages import get_package_share_directory
++from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+ from launch.launch_description_sources import PythonLaunchDescriptionSource
++from launch.substitutions import LaunchConfiguration
+ 
+-def generate_launch_description():
+-    
+-
+-    robo_state_publisher_launch = os.path.join(get_package_share_directory('viola_description'),'launch')
+-    robo_state_publisher_node = IncludeLaunchDescription(PythonLaunchDescriptionSource([robo_state_publisher_launch,'/robo_state_publisher.launch.py']))
+-
+-
+-    robo_moveit_rviz_launch = os.path.join(get_package_share_directory('viola_moveit_config'),'launch')
+-    robo_moveit_rviz_node = IncludeLaunchDescription(PythonLaunchDescriptionSource([robo_moveit_rviz_launch,'/move_group_rviz.launch.py']))
+ 
++def generate_launch_description() -> LaunchDescription:
++    """Start real-robot state publishing and MoveIt in planning-only mode."""
+ 
+-    return LaunchDescription([
+-        robo_state_publisher_node,
+-        robo_moveit_rviz_node
+-    ])
++    state_publisher_launch = os.path.join(
++        get_package_share_directory("viola_description"),
++        "launch",
++        "robo_state_publisher.launch.py",
++    )
++    moveit_launch = os.path.join(
++        get_package_share_directory("viola_moveit_config"),
++        "launch",
++        "move_group_rviz.launch.py",
++    )
++    allow_execution = LaunchConfiguration("allow_trajectory_execution")
+ 
++    return LaunchDescription(
++        [
++            DeclareLaunchArgument(
++                "allow_trajectory_execution",
++                default_value="false",
++                description="Enable only after the RViz pose matches the physical arm.",
++            ),
++            IncludeLaunchDescription(PythonLaunchDescriptionSource(state_publisher_launch)),
++            IncludeLaunchDescription(
++                PythonLaunchDescriptionSource(moveit_launch),
++                launch_arguments={
++                    "allow_trajectory_execution": allow_execution,
++                }.items(),
++            ),
++        ]
++    )
+diff --git a/src/viola_moveit_config/launch/driver.launch.py b/src/viola_moveit_config/launch/driver.launch.py
+index 4ecf7f5..62b7983 100644
+--- a/src/viola_moveit_config/launch/driver.launch.py
++++ b/src/viola_moveit_config/launch/driver.launch.py
+@@ -1,29 +1,63 @@
++"""Launch the safety-patched Viola hardware driver and trajectory bridge."""
++
+ from launch import LaunchDescription
+-from launch_ros.actions import Node
+-from moveit_configs_utils import MoveItConfigsBuilder
+-from launch.substitutions import LaunchConfiguration
+ from launch.actions import DeclareLaunchArgument
+-import os
+-from ament_index_python.packages import get_package_share_directory
+-
+-
+-def generate_launch_description():
+-
+-
+-    # Create and return the launch description
+-    return LaunchDescription(
+-        [
+-            Node(
+-                package="robo_driver",
+-                executable="driver",
+-                name="viola_driver",
+-                output="screen",
+-            ),
+-            Node(
+-                package="viola_controller",
+-                executable="controller",
+-                name="viola_controller",
+-                output="screen",
+-            )        
+-        ]
+-    )
+\ No newline at end of file
++from launch.substitutions import LaunchConfiguration
++from launch_ros.actions import Node
++from launch_ros.parameter_descriptions import ParameterValue
++
++
++DEFAULT_SERIAL_PORT = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0"
++
++
++def generate_launch_description() -> LaunchDescription:
++    arguments = [
++        DeclareLaunchArgument("serial_port", default_value=DEFAULT_SERIAL_PORT),
++        DeclareLaunchArgument("baudrate", default_value="1000000"),
++        DeclareLaunchArgument("startup_mode", default_value="hold_current"),
++        DeclareLaunchArgument("reset_multiturn", default_value="false"),
++        DeclareLaunchArgument("hold_motion_time_ms", default_value="100"),
++        DeclareLaunchArgument("home_motion_time_ms", default_value="1500"),
++        DeclareLaunchArgument("shutdown_mode", default_value="damping"),
++        DeclareLaunchArgument("feedback_fault_timeout_s", default_value="0.5"),
++    ]
++
++    driver = Node(
++        package="robo_driver",
++        executable="driver",
++        name="viola_driver",
++        output="screen",
++        emulate_tty=True,
++        parameters=[
++            {
++                "robo_type": "viola",
++                "serial_port": LaunchConfiguration("serial_port"),
++                "baudrate": ParameterValue(LaunchConfiguration("baudrate"), value_type=int),
++                "startup_mode": LaunchConfiguration("startup_mode"),
++                "reset_multiturn": ParameterValue(
++                    LaunchConfiguration("reset_multiturn"), value_type=bool
++                ),
++                "hold_motion_time_ms": ParameterValue(
++                    LaunchConfiguration("hold_motion_time_ms"), value_type=int
++                ),
++                "home_motion_time_ms": ParameterValue(
++                    LaunchConfiguration("home_motion_time_ms"), value_type=int
++                ),
++                "shutdown_mode": LaunchConfiguration("shutdown_mode"),
++                "feedback_fault_timeout_s": ParameterValue(
++                    LaunchConfiguration("feedback_fault_timeout_s"),
++                    value_type=float,
++                ),
++            }
++        ],
++    )
++
++    controller = Node(
++        package="viola_controller",
++        executable="controller",
++        name="viola_controller",
++        output="screen",
++        emulate_tty=True,
++    )
++
++    return LaunchDescription([*arguments, driver, controller])
+diff --git a/src/viola_moveit_config/launch/move_group_rviz.launch.py b/src/viola_moveit_config/launch/move_group_rviz.launch.py
+index bbec4dd..3b539fa 100644
+--- a/src/viola_moveit_config/launch/move_group_rviz.launch.py
++++ b/src/viola_moveit_config/launch/move_group_rviz.launch.py
+@@ -1,5 +1,4 @@
+ from moveit_configs_utils import MoveItConfigsBuilder
+-from moveit_configs_utils.launches import generate_moveit_rviz_launch
+ 
+ from launch import LaunchDescription
+ from launch.actions import (
+@@ -12,8 +11,12 @@ from moveit_configs_utils.launch_utils import (
+ from launch.substitutions import LaunchConfiguration
+ from launch_ros.parameter_descriptions import ParameterValue
+ 
++
+ def generate_launch_description():
+-    moveit_config = MoveItConfigsBuilder("viola_description", package_name="viola_moveit_config").to_moveit_configs()
++    moveit_config = MoveItConfigsBuilder(
++        "viola_description",
++        package_name="viola_moveit_config",
++    ).to_moveit_configs()
+ 
+     ld = LaunchDescription()
+ 
+@@ -26,7 +29,7 @@ def generate_move_group_launch(ld, moveit_config):
+ 
+     ld.add_action(DeclareBooleanLaunchArg("debug", default_value=False))
+     ld.add_action(
+-        DeclareBooleanLaunchArg("allow_trajectory_execution", default_value=True)
++        DeclareBooleanLaunchArg("allow_trajectory_execution", default_value=False)
+     )
+     ld.add_action(
+         DeclareBooleanLaunchArg("publish_monitored_planning_scene", default_value=True)
+@@ -79,10 +82,10 @@ def generate_move_group_launch(ld, moveit_config):
+     )
+     return ld
+ 
++
+ def generate_moveit_rviz_launch(ld, moveit_config):
+-    """Launch file for rviz"""
++    """Add the RViz process to the launch description."""
+ 
+-    ld.add_action(DeclareBooleanLaunchArg("debug", default_value=False))
+     ld.add_action(
+         DeclareLaunchArgument(
+             "rviz_config",
+@@ -106,4 +109,3 @@ def generate_moveit_rviz_launch(ld, moveit_config):
+     )
+ 
+     return ld
+-
+-- 
+2.34.1
+

@@ -79,6 +79,50 @@ cd /home/yz/lerobot/starai-viola-lerobot-ops
   --check
 ```
 
+## ROS 2 / MoveIt for the Viola follower
+
+One-time installation or a pinned-core rebuild (does not open serial):
+
+```bash
+cd /home/yz/lerobot/starai-viola-lerobot-ops
+./ros2/setup_starai.sh
+```
+
+Read-only preflight before every hardware session:
+
+```bash
+sg dialout -c 'exec /home/yz/starai_ws/preflight.sh'
+```
+
+Start guarded fake-hardware simulation after it confirms that no real control
+stack is active:
+
+```bash
+/home/yz/starai_ws/run_viola_simulation.sh
+```
+
+Close simulation and all LeRobot processes before hardware use. Start the
+patched hold-current driver in terminal 1. Physical commissioning has not yet
+been performed; for the first run, follow the supervised bring-up in the full
+guide instead of treating this short reference as a commissioning procedure:
+
+```bash
+sg dialout -c 'exec /home/yz/starai_ws/run_viola_driver.sh'
+```
+
+In terminal 2, load the same isolated ROS graph, verify all seven measured
+joints, and start MoveIt with execution disabled:
+
+```bash
+source /home/yz/starai_ws/starai_env.sh
+ros2 topic echo /joint_states --once
+ros2 launch viola_moveit_config actual_robot_demo.launch.py \
+  allow_trajectory_execution:=false
+```
+
+Do not enable execution until the physical arm and RViz agree. The staged
+hardware procedure and limitations are in [ROS 2 / MoveIt](ROS2_MOVEIT.md).
+
 ## Check and start ACT on the A100
 
 ```bash
@@ -90,4 +134,5 @@ cd ~/starai-viola-act-training
 
 Detailed procedures: [Safety](SAFETY.md), [Teleoperation](TELEOPERATION.md),
 [Episode recording](EPISODE_RECORDING.md), and
-[Troubleshooting](TROUBLESHOOTING.md).
+[Troubleshooting](TROUBLESHOOTING.md), plus the separate
+[ROS 2 / MoveIt workflow](ROS2_MOVEIT.md).

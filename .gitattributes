@@ -1,0 +1,2 @@
+# Email patches preserve the reviewed upstream bytes, including its whitespace.
+ros2/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
