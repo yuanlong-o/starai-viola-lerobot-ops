@@ -18,44 +18,242 @@ Validated runtime:
 > secure the base, keep the physical power cutoff accessible, and run the
 > read-only preflight before every session. Software bounds are not an E-stop.
 
-## New PC: clone to first inference
+## Migrate to a new PC: complete procedure
 
-Prerequisites: Linux, an NVIDIA driver compatible with PyTorch 2.7.1, Conda,
-Git, access to this private GitHub repository, and access to the checkpoint on
-NAS or another machine.
+The Git repository contains the operating code, pinned dependency list, and
+calibration snapshots. It deliberately does **not** contain the model checkpoint,
+datasets, recordings, logs, credentials, or the machine-local
+`config/operation.env`. Copy any of those that you want to keep separately.
+
+### 1. Prepare access and the new Linux PC
+
+Before disconnecting the old PC, confirm that the new PC can access:
+
+- the private GitHub repository `yuanlong-o/starai-viola-lerobot-ops`;
+- the complete seven-file ACT checkpoint on NAS, an external disk, or the old PC;
+- this exact physical Viola/Violin pair if the tracked calibrations will be used.
+
+Install an NVIDIA driver compatible with PyTorch 2.7.1, Conda (Miniconda or
+Anaconda), GitHub CLI, Git, `rsync`, `v4l2-ctl`, and FFmpeg. On Ubuntu, the
+ordinary system utilities can be installed with:
 
 ```bash
-gh repo clone yuanlong-o/starai-viola-lerobot-ops
-cd starai-viola-lerobot-ops
+sudo apt update
+sudo apt install -y git rsync v4l-utils ffmpeg
+gh auth login
+gh auth status
+```
 
+Do not copy the old Conda environment directory. The bootstrap recreates the
+validated Python 3.12 environment from the pinned requirements.
+
+### 2. Clone the private operations branch
+
+Until draft PR #1 is merged, clone the validated operations branch explicitly:
+
+```bash
+cd "${HOME}"
+gh repo clone yuanlong-o/starai-viola-lerobot-ops -- \
+  --branch agent/add-safe-viola-ros2-moveit \
+  --single-branch
+cd "${HOME}/starai-viola-lerobot-ops"
+git status
+```
+
+`git status` should report a clean worktree on
+`agent/add-safe-viola-ros2-moveit`. After PR #1 is merged, an ordinary clone of
+the default branch can be used instead.
+
+### 3. Recreate the unified operation environment
+
+```bash
 ./scripts/bootstrap_new_pc.sh
+conda activate lerobot
+python --version
+python -m pip check
+```
+
+The bootstrap creates the `lerobot` Conda environment and installs LeRobot
+0.6.1, the three StarAI plugins, camera/video support, Rerun, and inference
+dependencies. Training code and training dependencies are not installed.
+
+### 4. Grant serial and camera permissions
+
+```bash
 sudo usermod -aG dialout,video "$USER"
 ```
 
-Log out completely and back in after changing groups. Then identify the arm
-ports with the unplug procedure in [New-PC setup](docs/SETUP_AND_PORTS.md), and:
+Log out of the entire graphical desktop session and log back in; opening only a
+new terminal is insufficient. Then verify:
 
 ```bash
-cp config/operation.env.example config/operation.env
-${EDITOR:-nano} config/operation.env
+id -nG
+```
 
+Both `dialout` and `video` must appear. Do not run robot programs with `sudo`,
+use `chmod 777`, or create broad device permissions.
+
+### 5. Connect and identify the hardware
+
+Connect the arms and cameras, preferably to USB sockets that will remain fixed.
+The two CH340 arm adapters do not expose unique serial IDs, so identify them by
+unplugging one arm at a time:
+
+```bash
+ls -l /dev/serial/by-path/
+```
+
+Record which path disappears for the Viola follower and which disappears for
+the Violin leader. Then list the cameras:
+
+```bash
+ls -l /dev/v4l/by-id/
+```
+
+Use each Logitech camera's `video-index0` path. The camera serial IDs normally
+follow the cameras to the new PC, but the arm `by-path` values will commonly
+change. Never assume the old PC's port 10/port 11 mapping is still correct.
+
+### 6. Create the machine-local configuration
+
+The bootstrap normally creates this file. The guarded copy command also works
+if setup was performed manually:
+
+```bash
+cd "${HOME}/starai-viola-lerobot-ops"
+test -f config/operation.env || \
+  cp config/operation.env.example config/operation.env
+${EDITOR:-nano} config/operation.env
+```
+
+At minimum, verify or change these entries:
+
+```bash
+LEROBOT_ENV_NAME=lerobot
+VIOLA_ROBOT_PORT=/dev/serial/by-path/REPLACE_WITH_VIOLA_FOLLOWER_PATH
+VIOLA_TELEOP_PORT=/dev/serial/by-path/REPLACE_WITH_VIOLIN_LEADER_PATH
+VIOLA_FRONT_CAMERA=/dev/v4l/by-id/REPLACE_WITH_FRONT-video-index0
+VIOLA_UP_CAMERA=/dev/v4l/by-id/REPLACE_WITH_UP-video-index0
+VIOLA_ROBOT_ID=my_awesome_staraiviola_arm
+VIOLA_TELEOP_ID=my_awesome_staraiviolin_arm
+VIOLA_POLICY_DIR=${HOME}/models/act_viola_val20_step080000
+VIOLA_MAX_STEP=3.0
+```
+
+`config/operation.env` is intentionally ignored by Git because device and local
+storage paths differ between PCs.
+
+### 7. Verify both camera identities and framing
+
+Close all other camera applications, then run:
+
+```bash
+./scripts/run_dual_camera_view.sh
+```
+
+Confirm `front` is the task-wide view and `up` is the overhead view. Both must
+show 640×480 images continuously. Press Q or Esc to close both windows before
+starting another workflow. If the views are reversed, swap only
+`VIOLA_FRONT_CAMERA` and `VIOLA_UP_CAMERA` in `config/operation.env` and repeat.
+
+### 8. Restore calibration for this exact arm pair
+
+First inspect the destination:
+
+```bash
+./scripts/install_calibrations.sh --check || true
+```
+
+On a fresh PC, install the tracked snapshots:
+
+```bash
 ./scripts/install_calibrations.sh --install
+./scripts/install_calibrations.sh --check
+```
+
+Use `--replace` only when files already exist and you have confirmed that these
+are the same physical arms; the script backs up replaced files. Recalibrate
+instead of restoring snapshots after a motor replacement, joint reassembly, ID
+change, or mechanical alignment change.
+
+### 9. Transfer and verify the inference checkpoint
+
+If the original NAS path is mounted at the same location:
+
+```bash
 ./scripts/sync_policy.sh
+```
+
+If the checkpoint is on another mount, external disk, or copied from the old PC,
+point to the directory containing all seven `pretrained_model` files:
+
+```bash
+VIOLA_POLICY_SOURCE=/path/to/pretrained_model \
+  ./scripts/sync_policy.sh
+```
+
+The script copies the bundle to `VIOLA_POLICY_DIR` and refuses it unless all
+seven files exist and `model.safetensors` matches SHA-256
+`1093aaeddfb902e7e596425d87676baba58cb8ab617a52c954ec11940726b886`.
+
+### 10. Run the read-only migration gate
+
+```bash
 conda activate lerobot
+python -m pytest -q
 ./scripts/preflight.sh
 ```
 
-With the arm workspace clear, run ten seconds of displayed inference:
+Do not continue until the tests pass and preflight prints:
+
+```text
+Preflight passed. Hardware was not opened.
+```
+
+This checks the environment versions, imports, stable device paths,
+read/write permissions, both calibration hashes, and the policy hash without
+opening a serial port or camera.
+
+### 11. Test operation in increasing-risk order
+
+Clear the full arm workspace, secure both bases, support the follower, and keep
+the physical power cutoff reachable. Close every other camera and robot process.
+Then test in this order:
 
 ```bash
+# Cameras only; press Q or Esc after confirming both live views.
+./scripts/run_dual_camera_view.sh
+
+# Leader/follower control with both cameras displayed in Rerun; Ctrl-C stops.
+./scripts/run_viola_teleoperation.sh
+
+# Ten-second ACT rollout with both cameras displayed throughout.
 ./scripts/run_viola_inference.sh 10
 ```
 
-Rerun opens before hardware connection. After both cameras finish warming up,
-the `front` and `up` RGB streams are displayed throughout the policy-control
-phase. The launcher uses MJPG for `front` and YUYV for `up`; both decode to the
-same 640×480 RGB model inputs, while YUYV avoids the observed intermittent
-MJPEG stall on the up camera.
+Start teleoperation with small leader movements. Stop immediately if the arm
+roles are reversed, a joint direction is wrong, the follower jumps, either
+camera freezes, or Rerun does not show both views. Software bounds are not an
+E-stop.
+
+### 12. Optional: migrate local datasets and recordings
+
+This is unnecessary for operating or inference. If the old data is needed,
+copy it separately after the software migration, preserving directory contents:
+
+```bash
+rsync -a --info=progress2 \
+  OLD_PC_OR_DISK:/path/to/lerobot-data/ "${HOME}/lerobot-data/"
+```
+
+Update `VIOLA_DATASET_DIR` in `config/operation.env`, then inspect existing
+datasets before resuming them. Never append new episodes if either calibration
+changed. MP4 recordings, LeRobot datasets, logs, and checkpoints remain ignored
+by Git.
+
+Rerun opens before robot connection for teleoperation and inference. The
+launchers use MJPG for `front` and YUYV for `up`; both decode to 640×480 RGB,
+while YUYV avoids the observed intermittent MJPEG stall on the up camera.
 
 ## Model bundle
 
