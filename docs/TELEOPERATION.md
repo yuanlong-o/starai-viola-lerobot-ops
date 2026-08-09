@@ -16,21 +16,8 @@ poses.
 ## Copy/paste command
 
 ```bash
-sg dialout -c 'exec /home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/teleoperate_keep_pose.py \
-  --robot.type=lerobot_robot_viola \
-  --robot.port=/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0 \
-  --robot.id=my_awesome_staraiviola_arm \
-  --robot.disable_torque_on_disconnect=true \
-  --robot.use_degrees=false \
-  --robot.cameras="{\"front\":{\"type\":\"opencv\",\"index_or_path\":\"/dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0\",\"width\":640,\"height\":480,\"fps\":30,\"fourcc\":\"MJPG\"},\"up\":{\"type\":\"opencv\",\"index_or_path\":\"/dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0\",\"width\":640,\"height\":480,\"fps\":30,\"fourcc\":\"MJPG\"}}" \
-  --teleop.type=lerobot_teleoperator_violin \
-  --teleop.port=/dev/serial/by-path/pci-0000:00:14.0-usb-0:11:1.0-port0 \
-  --teleop.id=my_awesome_staraiviolin_arm \
-  --teleop.use_degrees=false \
-  --fps=30 \
-  --max_step=3.0 \
-  --display_data=true'
+./scripts/preflight.sh
+./scripts/run_viola_teleoperation.sh
 ```
 
 Stop with Ctrl+C. The follower disconnects with

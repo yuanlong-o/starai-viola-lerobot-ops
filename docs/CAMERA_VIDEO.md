@@ -16,12 +16,7 @@ reports duplicated frames and capture failures at the end.
 ## Preview both cameras
 
 ```bash
-/home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/dual_camera_view.py \
-  --devices \
-  /dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0 \
-  /dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0 \
-  --width 640 --height 480 --fps 30
+./scripts/run_dual_camera_view.sh
 ```
 
 Press Q or Esc in either window to close both. Close the viewer before any
@@ -31,17 +26,7 @@ cannot be owned by both programs.
 ## Record exactly five minutes
 
 ```bash
-cd /home/yz/lerobot
-
-/home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/dual_camera_record.py \
-  --devices \
-  /dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0 \
-  /dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0 \
-  --names front up \
-  --width 640 --height 480 --fps 30 \
-  --duration 300 --countdown 3 \
-  --output-dir /home/yz/lerobot/recordings
+./scripts/run_dual_camera_record.sh 300
 ```
 
 After the three-second countdown, demonstrate this loop for five minutes:

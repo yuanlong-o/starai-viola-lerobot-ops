@@ -49,6 +49,39 @@ If the shell variables are not exported, copy the two values from
 Use `--install` only when the destination is absent. Use `--replace` only after
 confirming these are the same physical arms; existing files are backed up.
 
+## Interactive calibration
+
+```bash
+./scripts/run_viola_calibration.sh violin
+./scripts/run_viola_calibration.sh viola
+```
+
+Run only the arm that actually needs calibration. These commands can move the
+arm during connection; follow the safety checklist in the calibration guide.
+
+## Five-minute two-camera video
+
+```bash
+./scripts/run_dual_camera_view.sh
+./scripts/run_dual_camera_record.sh 300
+```
+
+Both commands display both cameras for the entire process. Close either viewer
+with Q or Esc before starting teleoperation, episode recording, or inference.
+
+## Local LeRobot episode recording
+
+```bash
+./scripts/run_viola_episode_recording.sh right-to-left --check
+./scripts/run_viola_episode_recording.sh right-to-left
+
+./scripts/run_viola_episode_recording.sh left-to-right --check
+./scripts/run_viola_episode_recording.sh left-to-right
+```
+
+The recorder displays both cameras in Rerun throughout capture. Datasets remain
+local under `VIOLA_DATASET_DIR`; no Hub upload or model training is performed.
+
 ## Refresh or verify the policy
 
 ```bash

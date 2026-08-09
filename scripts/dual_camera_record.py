@@ -19,7 +19,7 @@ from PIL import Image, ImageTk
 class CameraReader:
     """Continuously capture the newest frame from one V4L2 camera."""
 
-    def __init__(self, name: str, device: str, width: int, height: int, fps: int) -> None:
+    def __init__(self, name: str, device: str, width: int, height: int, fps: int, fourcc: str) -> None:
         self.name = name
         self.device = device
         self.capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
@@ -27,7 +27,7 @@ class CameraReader:
             self.capture.release()
             raise RuntimeError(f"Could not open {name} camera at {device}")
 
-        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.capture.set(cv2.CAP_PROP_FPS, fps)
@@ -344,6 +344,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--fourccs", nargs=2, default=["MJPG", "YUYV"])
     parser.add_argument("--duration", type=float, default=300, help="recording duration in seconds")
     parser.add_argument("--countdown", type=float, default=3, help="delay before recording begins")
     parser.add_argument("--output-dir", type=Path, default=Path("recordings"))
@@ -377,8 +378,8 @@ def main() -> None:
     session: RecordingSession | None = None
 
     try:
-        for name, device in zip(args.names, args.devices, strict=True):
-            camera = CameraReader(name, device, args.width, args.height, args.fps)
+        for name, device, fourcc in zip(args.names, args.devices, args.fourccs, strict=True):
+            camera = CameraReader(name, device, args.width, args.height, args.fps, fourcc)
             cameras.append(camera)
             camera.start()
 

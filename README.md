@@ -1,8 +1,9 @@
 # StarAI Viola operations and inference
 
 Private, self-contained operating package for the StarAI Viola follower,
-StarAI Violin leader, two-camera teleoperation/display, and ACT policy
-inference. This repository intentionally contains **no training code**.
+StarAI Violin leader, calibration, two-camera preview/video, teleoperation,
+LeRobot episode recording, and ACT policy inference. This repository contains
+**no model-training code**.
 
 Validated runtime:
 
@@ -83,6 +84,7 @@ Override the source with `VIOLA_POLICY_SOURCE=/path/to/pretrained_model`.
 | Understand physical and software guards | [Safety](docs/SAFETY.md) |
 | Keep-pose leader/follower operation | [Teleoperation](docs/TELEOPERATION.md) |
 | Preview or record both cameras | [Camera and video](docs/CAMERA_VIDEO.md) |
+| Record local LeRobot episodes | [Episode recording](docs/EPISODE_RECORDING.md) |
 | Restore this exact arm pair's calibration | [Calibration](docs/CALIBRATION.md) |
 | Diagnose devices, cameras, or Rerun | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | Optional ROS 2 / MoveIt operation | [ROS 2 / MoveIt](docs/ROS2_MOVEIT.md) |
@@ -99,10 +101,11 @@ scripts/sync_policy.sh         transfers and verifies the ACT checkpoint
 scripts/infer_keep_pose.py      guarded LeRobot policy rollout wrapper
 scripts/run_viola_inference.sh displayed inference launcher
 scripts/teleoperate_keep_pose.py keep-pose leader/follower wrapper
+scripts/record_episodes_keep_pose.py guarded local episode recorder
 ros2/                           optional pinned ROS 2/MoveIt workflow
 tests/                          no-hardware regression tests
 ```
 
-Generated data, checkpoints, recordings, logs, credentials, and local
-`config/operation.env` are ignored. Training remains in the separate private
+Generated datasets, checkpoints, recordings, logs, credentials, and local
+`config/operation.env` are ignored. Model training remains in the separate private
 `yuanlong-o/starai-viola-act-training` repository and is not required here.
