@@ -15,8 +15,11 @@ even when the leader and follower are not physically aligned at launch.
 """
 
 import logging
+import os
+import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -27,8 +30,8 @@ from lerobot.processor import make_default_processors
 from lerobot.robots import make_robot_from_config
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig
 from lerobot.teleoperators import make_teleoperator_from_config
-from lerobot.utils.import_utils import register_third_party_devices
-from lerobot.utils.robot_utils import busy_wait
+from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
@@ -105,6 +108,11 @@ def teleoperate_keep_pose(cfg: KeepPoseTeleoperateConfig) -> None:
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
+        # `sg dialout` starts a clean shell whose PATH does not include the
+        # active Conda environment. Rerun's SDK discovers its viewer via PATH,
+        # so explicitly expose the bin directory belonging to this Python.
+        python_bin = str(Path(sys.executable).resolve().parent)
+        os.environ["PATH"] = python_bin + os.pathsep + os.environ.get("PATH", "")
         init_rerun(session_name="keep-pose teleoperation")
 
     teleop = make_teleoperator_from_config(cfg.teleop)
@@ -155,7 +163,7 @@ def teleoperate_keep_pose(cfg: KeepPoseTeleoperateConfig) -> None:
                 move_cursor_up(len(sent_action) + 5)
 
             elapsed = time.perf_counter() - loop_started_at
-            busy_wait(max(0.0, 1 / cfg.fps - elapsed))
+            precise_sleep(max(0.0, 1 / cfg.fps - elapsed))
 
             if cfg.teleop_time_s is not None and time.perf_counter() - started_at >= cfg.teleop_time_s:
                 break
@@ -171,7 +179,7 @@ def teleoperate_keep_pose(cfg: KeepPoseTeleoperateConfig) -> None:
 
 
 def main() -> None:
-    register_third_party_devices()
+    register_third_party_plugins()
     install_keep_pose_startup_patch()
     teleoperate_keep_pose()
 

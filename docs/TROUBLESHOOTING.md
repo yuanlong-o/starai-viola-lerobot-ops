@@ -71,7 +71,7 @@ GUI window exists.
 
 Cut power first. This usually means a stock command invoked the StarAI plugin's
 hardcoded startup pose. Confirm the command calls either
-`teleoperate_keep_pose.py` or `record_left_to_right_episode.sh`. Then verify arm
+`teleoperate_keep_pose.py` or `run_viola_inference.sh`. Then verify arm
 roles, calibration hashes, `use_degrees=false`, and pinned versions. See
 [Safety](SAFETY.md).
 

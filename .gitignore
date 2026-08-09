@@ -11,6 +11,7 @@ checkpoints/
 # Local machine overrides
 .env
 *.local.env
+config/operation.env
 
 # Python/editor artifacts
 __pycache__/

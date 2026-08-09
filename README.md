@@ -1,76 +1,108 @@
-# StarAI Viola + LeRobot operations
+# StarAI Viola operations and inference
 
-This private repository is the operating manual and tested support code for the
-current StarAI setup:
+Private, self-contained operating package for the StarAI Viola follower,
+StarAI Violin leader, two-camera teleoperation/display, and ACT policy
+inference. This repository intentionally contains **no training code**.
 
-- **Follower/robot:** StarAI Viola
-- **Teacher/leader/teleoperator:** StarAI Violin
-- **Observations:** front and overhead Logitech cameras
-- **Task:** move the blue cube first and the red cube second between the two desk regions
-- **LeRobot:** 0.4.2 at commit `d9e74a9d374a8f26582ad326c699740a227b483c`
-- **StarAI plugins:** Viola, Violin, and motor packages at 0.0.4
+Validated runtime:
 
-The normal commands in this repository preserve the arms' measured startup
-poses. Do not substitute stock `lerobot-teleoperate` or `lerobot-record`: the
-installed StarAI 0.0.4 plugins command a fixed pose during connection and can
-make an arm jump.
+- Python 3.12 and LeRobot 0.6.1
+- StarAI Viola, Violin, and motor plugins 0.0.4
+- Logitech `front` and `up` cameras at 640×480
+- ACT step-80,000 deployment checkpoint
+- keep-current-pose startup and a `3.0` normalized per-write bound
+- Rerun display of both cameras throughout inference
 
-> Before every motor command, clear the workspace, identify teacher and
-> follower, keep a hand near power/torque cutoff, and run the read-only
-> preflight. The keep-pose patch and `max_step` limit are software protections,
-> not a safety-rated emergency stop.
+> Physical robots can injure people or damage equipment. Clear the workspace,
+> secure the base, keep the physical power cutoff accessible, and run the
+> read-only preflight before every session. Software bounds are not an E-stop.
 
-## Start here on the current workstation
+## New PC: clone to first inference
+
+Prerequisites: Linux, an NVIDIA driver compatible with PyTorch 2.7.1, Conda,
+Git, access to this private GitHub repository, and access to the checkpoint on
+NAS or another machine.
 
 ```bash
-cd /home/yz/lerobot/starai-viola-lerobot-ops
+gh repo clone yuanlong-o/starai-viola-lerobot-ops
+cd starai-viola-lerobot-ops
 
-sg dialout -c 'exec ./scripts/preflight.sh'
+./scripts/bootstrap_new_pc.sh
+sudo usermod -aG dialout,video "$USER"
 ```
 
-That command checks paths, permissions, software versions, and calibration
-hashes. It does **not** open a camera, serial port, motor, or dataset.
+Log out completely and back in after changing groups. Then identify the arm
+ports with the unplug procedure in [New-PC setup](docs/SETUP_AND_PORTS.md), and:
 
-Then choose one documented workflow:
+```bash
+cp config/operation.env.example config/operation.env
+${EDITOR:-nano} config/operation.env
 
-| Goal | Documentation |
-|---|---|
-| Repeat a known workflow quickly | [Copy/paste command reference](docs/COMMAND_REFERENCE.md) |
-| Operate the arms and keep the current pose at startup | [Teleoperation](docs/TELEOPERATION.md) |
-| Preview both cameras or record a five-minute task video | [Cameras and five-minute video](docs/CAMERA_VIDEO.md) |
-| Record left-to-right LeRobot episodes | [Episode recording](docs/EPISODE_RECORDING.md) |
-| Understand or restore calibration | [Calibration](docs/CALIBRATION.md) |
-| Identify USB ports or move to another PC | [Setup, ports, and permissions](docs/SETUP_AND_PORTS.md) |
-| Inspect, reject, or rebuild demonstrations | [Datasets and filtering](docs/DATASETS_AND_FILTERING.md) |
-| Decide how much data to collect | [Data collection policy](docs/DATA_COLLECTION_POLICY.md) |
-| Resolve camera, Rerun, permission, or interruption errors | [Troubleshooting](docs/TROUBLESHOOTING.md) |
-| Simulate or operate the Viola with ROS 2 and MoveIt | [ROS 2 / MoveIt](docs/ROS2_MOVEIT.md) |
-| Train ACT on the A100 machine | [Training handoff](docs/TRAINING_HANDOFF.md) |
+./scripts/install_calibrations.sh --install
+./scripts/sync_policy.sh
+conda activate lerobot
+./scripts/preflight.sh
+```
 
-Read [Safety](docs/SAFETY.md) before calibration or first use on a new machine.
+With the arm workspace clear, run ten seconds of displayed inference:
 
-## What is tracked
+```bash
+./scripts/run_viola_inference.sh 10
+```
 
-This repository tracks the custom keep-pose wrappers, the active left-to-right
-launcher, camera tools, tests, exact documentation, two arm-specific calibration
-snapshots, and right-to-left filtering provenance.
+Rerun opens before hardware connection. After both cameras finish warming up,
+the `front` and `up` RGB streams are displayed throughout the policy-control
+phase. The launcher uses MJPG for `front` and YUYV for `up`; both decode to the
+same 640×480 RGB model inputs, while YUYV avoids the observed intermittent
+MJPEG stall on the up camera.
 
-It intentionally does not track raw datasets, recordings, logs, checkpoints,
-credentials, installed third-party plugin source, the unsafe stale
-`operation.yaml`, or the superseded weak-machine ACT launcher. Training code is
-maintained separately in the private
-[`starai-viola-act-training`](https://github.com/yuanlong-o/starai-viola-act-training)
-repository.
+## Model bundle
 
-## Repository layout
+Weights are deliberately excluded from Git. `scripts/sync_policy.sh` copies the
+complete seven-file checkpoint bundle and verifies the deployment model hash:
 
 ```text
-calibration/                 known calibration snapshots for this exact arm pair
-docs/                        operating procedures and copy/paste commands
-provenance/                  immutable right-to-left audit records
-scripts/                     active robot, camera, and preflight tools
-scripts/filtering/           task-specific canonical dataset builder
-ros2/                        pinned rootless ROS 2/MoveIt installer and safety patch
-tests/                       no-hardware regression tests
-archive/                     disabled historical launcher; never run for recording
+1093aaeddfb902e7e596425d87676baba58cb8ab617a52c954ec11940726b886
 ```
+
+Default source and destination:
+
+```text
+/mnt/nas02/yz/starai/outputs/act_viola_right_to_left_blue_then_red_val20_v1/checkpoints/080000/pretrained_model
+~/models/act_viola_val20_step080000
+```
+
+Override the source with `VIOLA_POLICY_SOURCE=/path/to/pretrained_model`.
+
+## Other operating workflows
+
+| Goal | Guide |
+|---|---|
+| Copy/paste repeat-use commands | [Command reference](docs/COMMAND_REFERENCE.md) |
+| Identify USB devices and migrate PCs | [Setup and ports](docs/SETUP_AND_PORTS.md) |
+| Understand physical and software guards | [Safety](docs/SAFETY.md) |
+| Keep-pose leader/follower operation | [Teleoperation](docs/TELEOPERATION.md) |
+| Preview or record both cameras | [Camera and video](docs/CAMERA_VIDEO.md) |
+| Restore this exact arm pair's calibration | [Calibration](docs/CALIBRATION.md) |
+| Diagnose devices, cameras, or Rerun | [Troubleshooting](docs/TROUBLESHOOTING.md) |
+| Optional ROS 2 / MoveIt operation | [ROS 2 / MoveIt](docs/ROS2_MOVEIT.md) |
+
+## Repository contents
+
+```text
+calibration/                    reviewed snapshots for this physical arm pair
+config/operation.env.example   portable machine/device configuration template
+docs/                           operating and migration procedures
+scripts/bootstrap_new_pc.sh    creates the unified Conda environment
+scripts/preflight.sh           read-only hardware/software/model verification
+scripts/sync_policy.sh         transfers and verifies the ACT checkpoint
+scripts/infer_keep_pose.py      guarded LeRobot policy rollout wrapper
+scripts/run_viola_inference.sh displayed inference launcher
+scripts/teleoperate_keep_pose.py keep-pose leader/follower wrapper
+ros2/                           optional pinned ROS 2/MoveIt workflow
+tests/                          no-hardware regression tests
+```
+
+Generated data, checkpoints, recordings, logs, credentials, and local
+`config/operation.env` are ignored. Training remains in the separate private
+`yuanlong-o/starai-viola-act-training` repository and is not required here.
