@@ -13,13 +13,13 @@ from PIL import Image, ImageTk
 
 
 class CameraReader:
-    def __init__(self, device: str, width: int, height: int, fps: int) -> None:
+    def __init__(self, device: str, width: int, height: int, fps: int, fourcc: str) -> None:
         self.device = device
         self.capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self.capture.isOpened():
             raise RuntimeError(f"Could not open {device}")
 
-        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.capture.set(cv2.CAP_PROP_FPS, fps)
@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--fourccs", nargs=2, default=["MJPG", "YUYV"])
     return parser.parse_args()
 
 
@@ -83,8 +84,8 @@ def main() -> None:
     root: tk.Tk | None = None
     try:
         cameras = [
-            CameraReader(device, args.width, args.height, args.fps)
-            for device in args.devices
+            CameraReader(device, args.width, args.height, args.fps, fourcc)
+            for device, fourcc in zip(args.devices, args.fourccs, strict=True)
         ]
         for camera in cameras:
             camera.start()

@@ -1,93 +1,103 @@
-# Copy/paste command reference
+# Operation command reference
 
-These commands are for the validated current workstation. Read the linked guide
-before first use; this page is the short repeat-use reference.
+Run commands from the repository root after completing
+[new-PC setup](SETUP_AND_PORTS.md). Paths and IDs come from
+`config/operation.env`.
 
-## Read-only robot preflight
+## Read-only preflight
 
 ```bash
-cd /home/yz/lerobot/starai-viola-lerobot-ops
-sg dialout -c 'exec ./scripts/preflight.sh'
+conda activate lerobot
+./scripts/preflight.sh
 ```
 
-## Preview front and up cameras
+## Displayed ACT inference
 
 ```bash
-/home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/dual_camera_view.py
+./scripts/run_viola_inference.sh 10
 ```
 
-Press Q or Esc to close both windows before another camera command.
+The argument is the positive inference duration in seconds. Rerun displays
+both cameras throughout the policy-control phase.
 
-## Record a five-minute two-camera video
+## Keep-pose leader/follower teleoperation
 
 ```bash
-/home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/dual_camera_record.py \
-  --duration 300 --countdown 3 \
-  --output-dir /home/yz/lerobot/recordings
+./scripts/run_viola_teleoperation.sh
 ```
 
-## Keep-current-pose teleoperation with cameras
+Press Ctrl-C to stop. The wrapper measures both startup poses and bounds each
+follower command by `VIOLA_MAX_STEP` (default `3.0`).
+
+## Preview both cameras without motors
 
 ```bash
-sg dialout -c 'exec /home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/teleoperate_keep_pose.py \
-  --robot.type=lerobot_robot_viola \
-  --robot.port=/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0 \
-  --robot.id=my_awesome_staraiviola_arm \
-  --robot.disable_torque_on_disconnect=true \
-  --robot.use_degrees=false \
-  --robot.cameras="{\"front\":{\"type\":\"opencv\",\"index_or_path\":\"/dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0\",\"width\":640,\"height\":480,\"fps\":30,\"fourcc\":\"MJPG\"},\"up\":{\"type\":\"opencv\",\"index_or_path\":\"/dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0\",\"width\":640,\"height\":480,\"fps\":30,\"fourcc\":\"MJPG\"}}" \
-  --teleop.type=lerobot_teleoperator_violin \
-  --teleop.port=/dev/serial/by-path/pci-0000:00:14.0-usb-0:11:1.0-port0 \
-  --teleop.id=my_awesome_staraiviolin_arm \
-  --teleop.use_degrees=false \
-  --fps=30 --max_step=3.0 --display_data=true'
+conda run --no-capture-output -n lerobot \
+  python scripts/dual_camera_view.py --devices \
+  "${VIOLA_FRONT_CAMERA}" "${VIOLA_UP_CAMERA}"
 ```
 
-## Check and record left-to-right episodes
+If the shell variables are not exported, copy the two values from
+`config/operation.env`. Press Q or Esc before starting another camera process.
+
+## Calibration snapshots
 
 ```bash
-sg dialout -c 'exec \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/record_left_to_right_episode.sh \
-  --check'
-```
-
-```bash
-sg dialout -c 'exec \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/record_left_to_right_episode.sh'
-```
-
-Recording starts automatically. Right accepts the episode; after encoding and
-cube reset, Right skips the remaining reset timer. Left discards/re-records. Esc
-during recording discards the partial episode; Esc during reset stops after
-preserving the accepted episode.
-
-## Check calibration snapshots
-
-```bash
-cd /home/yz/lerobot/starai-viola-lerobot-ops
 ./scripts/install_calibrations.sh --check
 ```
 
-## Validate right-to-left filtering assumptions
+Use `--install` only when the destination is absent. Use `--replace` only after
+confirming these are the same physical arms; existing files are backed up.
+
+## Interactive calibration
 
 ```bash
-/home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/filtering/build_right_to_left_training_dataset.py \
-  --check
+./scripts/run_viola_calibration.sh violin
+./scripts/run_viola_calibration.sh viola
 ```
 
-## Check and start ACT on the A100
+Run only the arm that actually needs calibration. These commands can move the
+arm during connection; follow the safety checklist in the calibration guide.
+
+## Five-minute two-camera video
 
 ```bash
-conda activate lerobot-a100
-cd ~/starai-viola-act-training
-./train_act.sh --check
-./train_act.sh
+./scripts/run_dual_camera_view.sh
+./scripts/run_dual_camera_record.sh 300
 ```
 
-Detailed procedures: [Safety](SAFETY.md), [Teleoperation](TELEOPERATION.md),
-[Episode recording](EPISODE_RECORDING.md), and
-[Troubleshooting](TROUBLESHOOTING.md).
+Both commands display both cameras for the entire process. Close either viewer
+with Q or Esc before starting teleoperation, episode recording, or inference.
+
+## Local LeRobot episode recording
+
+```bash
+./scripts/run_viola_episode_recording.sh right-to-left --check
+./scripts/run_viola_episode_recording.sh right-to-left
+
+./scripts/run_viola_episode_recording.sh left-to-right --check
+./scripts/run_viola_episode_recording.sh left-to-right
+```
+
+The recorder displays both cameras in Rerun throughout capture. Datasets remain
+local under `VIOLA_DATASET_DIR`; no Hub upload or model training is performed.
+
+## Refresh or verify the policy
+
+```bash
+./scripts/sync_policy.sh
+```
+
+Set `VIOLA_POLICY_SOURCE` when the NAS path differs.
+
+## No-hardware tests
+
+```bash
+conda run --no-capture-output -n lerobot python -m pytest -q
+```
+
+## Optional ROS 2 / MoveIt
+
+The ROS 2 workflow is isolated from LeRobot. Follow
+[ROS 2 / MoveIt](ROS2_MOVEIT.md); do not run ROS and LeRobot hardware control
+simultaneously.

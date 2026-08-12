@@ -15,7 +15,7 @@ ls -l /dev/ttyUSB* /dev/serial/by-path/*
 Use the exact documented wrapper for the current login:
 
 ```bash
-sg dialout -c 'exec /home/yz/lerobot/starai-viola-lerobot-ops/scripts/preflight.sh'
+./scripts/preflight.sh
 ```
 
 For a permanent fix, add the user to `dialout`, then fully log out and back in.
@@ -32,18 +32,18 @@ Close all preview and recording windows. Resolve the camera path and find users
 from the normal desktop shell:
 
 ```bash
-readlink -f /dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0
-
-/home/yz/anaconda3/envs/lerobot/bin/python \
-  /home/yz/lerobot/starai-viola-lerobot-ops/scripts/find_device_users.py \
-  /dev/video2
+source config/operation.env
+resolved_up="$(readlink -f -- "${VIOLA_UP_CAMERA}")"
+echo "${resolved_up}"
+conda run --no-capture-output -n "${LEROBOT_ENV_NAME:-lerobot}" \
+  python scripts/find_device_users.py "${resolved_up}"
 ```
 
 Repeat for the front camera. The helper is best-effort; `/proc` permissions can
 hide processes. Also check:
 
 ```bash
-v4l2-ctl --device=/dev/video2 --list-formats-ext
+v4l2-ctl --device="${resolved_up}" --list-formats-ext
 ```
 
 Use `video-index0`, not `video-index1`. Unplug/replug only after stopping robot
@@ -71,7 +71,7 @@ GUI window exists.
 
 Cut power first. This usually means a stock command invoked the StarAI plugin's
 hardcoded startup pose. Confirm the command calls either
-`teleoperate_keep_pose.py` or `record_left_to_right_episode.sh`. Then verify arm
+`teleoperate_keep_pose.py` or `run_viola_inference.sh`. Then verify arm
 roles, calibration hashes, `use_degrees=false`, and pinned versions. See
 [Safety](SAFETY.md).
 

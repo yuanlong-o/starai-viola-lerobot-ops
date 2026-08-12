@@ -25,7 +25,10 @@ from typing import Any
 # V4L2 reads short enough for the bounded startup recovery below to work.
 os.environ.setdefault("OPENCV_VIDEOIO_V4L_SELECT_TIMEOUT", "1")
 
-from lerobot.utils.import_utils import register_third_party_devices
+from lerobot.utils.import_utils import register_third_party_plugins
+
+# Keep the descriptive local name used by the recorder and its regression tests.
+register_third_party_devices = register_third_party_plugins
 
 
 MAX_STEP_ENV = "LEROBOT_KEEP_POSE_MAX_STEP"
@@ -546,6 +549,12 @@ def install_recording_control_guard(min_episode_time_s: float) -> None:
         raise ValueError("minimum episode time must be a positive finite number")
 
     from lerobot.scripts import lerobot_record as record_module
+    from lerobot.utils.keyboard_input import is_headless
+
+    # Compatibility for the isolated legacy guard tests. The guard itself is
+    # not installed by main() on LeRobot 0.6.1.
+    if not hasattr(record_module, "is_headless"):
+        record_module.is_headless = is_headless
 
     original_record_loop = record_module.record_loop
     if getattr(original_record_loop, "_keep_pose_control_guard", False):

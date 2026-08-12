@@ -63,25 +63,16 @@ renumbering is not a reason to recalibrate.
 > before the prompts begin. Clear the workspace, support the arm, identify the
 > exact port, and keep power cutoff available.
 
-Teacher/Violin:
+Teacher/Violin, from the repository root:
 
 ```bash
-sg dialout -c 'exec /home/yz/anaconda3/envs/lerobot/bin/lerobot-calibrate \
-  --teleop.type=lerobot_teleoperator_violin \
-  --teleop.port=/dev/serial/by-path/pci-0000:00:14.0-usb-0:11:1.0-port0 \
-  --teleop.id=my_awesome_staraiviolin_arm \
-  --teleop.use_degrees=false'
+./scripts/run_viola_calibration.sh violin
 ```
 
 Follower/Viola:
 
 ```bash
-sg dialout -c 'exec /home/yz/anaconda3/envs/lerobot/bin/lerobot-calibrate \
-  --robot.type=lerobot_robot_viola \
-  --robot.port=/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0 \
-  --robot.id=my_awesome_staraiviola_arm \
-  --robot.disable_torque_on_disconnect=true \
-  --robot.use_degrees=false'
+./scripts/run_viola_calibration.sh viola
 ```
 
 After calibration, record the new checksums:
