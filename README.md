@@ -47,22 +47,18 @@ gh auth status
 Do not copy the old Conda environment directory. The bootstrap recreates the
 validated Python 3.12 environment from the pinned requirements.
 
-### 2. Clone the private operations branch
+### 2. Clone the private operations repository
 
-Until draft PR #1 is merged, clone the validated operations branch explicitly:
+The validated operations code is on the default `main` branch:
 
 ```bash
 cd "${HOME}"
-gh repo clone yuanlong-o/starai-viola-lerobot-ops -- \
-  --branch agent/add-safe-viola-ros2-moveit \
-  --single-branch
+gh repo clone yuanlong-o/starai-viola-lerobot-ops
 cd "${HOME}/starai-viola-lerobot-ops"
 git status
 ```
 
-`git status` should report a clean worktree on
-`agent/add-safe-viola-ros2-moveit`. After PR #1 is merged, an ordinary clone of
-the default branch can be used instead.
+`git status` should report a clean worktree on `main`.
 
 ### 3. Recreate the unified operation environment
 
