@@ -33,8 +33,8 @@ DEFAULT_DATASET_ROOT: Final = Path(
 )
 DEFAULT_WANDB_PROJECT: Final = "starai-viola-policy-benchmark"
 DEFAULT_MATERIAL_ROOT: Final = Path(
-    "~/.local/share/viola/producer-materials/v1"
-).expanduser()
+    "/mnt/nas02/yz/starai/producer-materials/v1"
+)
 
 RELEASE_ID: Final = "viola-cubes-right-to-left-blue-then-red-v1--31cf41385cd9e183"
 DATASET_REPO_ID: Final = "bourn117/viola_cubes_right_to_left_blue_then_red_train_v1"

@@ -11,6 +11,7 @@ import pytest
 import viola_ops.hardware as hardware
 from viola_ops.errors import SafetyGateError
 from viola_ops.hardware import (
+    AmbiguousMotorWriteError,
     JointCalibration,
     PostWriteFeedbackError,
     SafeViolaConfig,
@@ -36,6 +37,8 @@ class FakePort:
         self.current_position = current_position
         self.fail_reads = False
         self.reads_before_failure = 0
+        self.read_error: BaseException = OSError("monitor unavailable")
+        self.write_error: BaseException | None = None
         self.pings: list[int] = []
         self.writes: list[dict[str, Any]] = []
 
@@ -54,12 +57,29 @@ class FakePort:
         assert realtime is True
         if self.fail_reads:
             if self.reads_before_failure == 0:
-                raise OSError("monitor unavailable")
+                raise self.read_error
             self.reads_before_failure -= 1
         return {joint: Monitor(self.current_position) for joint in motors}
 
     def SyncPositionControl_EX(self, motors: dict[str, Any]) -> None:
         self.writes.append(motors)
+        if self.write_error is not None:
+            raise self.write_error
+
+
+class FakeCamera:
+    def __init__(self) -> None:
+        self.connects = 0
+        self.disconnects = 0
+        self.is_connected = False
+
+    def connect(self) -> None:
+        self.connects += 1
+        self.is_connected = True
+
+    def disconnect(self) -> None:
+        self.disconnects += 1
+        self.is_connected = False
 
 
 def _calibration(path: Path) -> Path:
@@ -147,7 +167,7 @@ def test_load_calibration_requires_exact_joint_ids(tmp_path: Path) -> None:
         load_calibration(path)
 
 
-def test_safe_adapter_holds_measured_pose_without_plugin_connect(
+def test_safe_adapter_connect_is_read_only_and_connects_reviewed_cameras(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
@@ -159,26 +179,25 @@ def test_safe_adapter_holds_measured_pose_without_plugin_connect(
         id="test",
         calibration_dir=tmp_path / "lerobot-calibration",
     )
+    cameras = {"front": FakeCamera(), "up": FakeCamera()}
     robot = SafeViolaRobot(
         config,
         _permit(),
         port_factory=lambda _path, _baud: port,
         command_factory=lambda *values: values,
-        camera_factory=lambda _configs: {},
+        camera_factory=lambda _configs: cameras,
     )
     robot.connect(calibrate=False)
     assert port.pings == list(range(7))
-    assert len(port.writes) == 1
-    hold = port.writes[0]
-    assert set(hold) == set(JOINTS)
-    assert all(command[1] == 0 for command in hold.values())
-    assert robot.last_receipt is not None
-    assert robot.last_receipt.proposed == robot.last_receipt.feedback_before
+    assert port.writes == []
+    assert robot.last_receipt is None
+    assert all(camera.connects == 1 for camera in cameras.values())
     robot.disconnect()
+    assert all(camera.disconnects == 1 for camera in cameras.values())
     assert port.closed is True
 
 
-def test_out_of_domain_feedback_prevents_initial_hold_write_and_closes_port(
+def test_out_of_domain_feedback_prevents_camera_connect_and_closes_port(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
@@ -203,7 +222,7 @@ def test_out_of_domain_feedback_prevents_initial_hold_write_and_closes_port(
     assert robot.is_connected is False
 
 
-def test_pose_outside_reviewed_session_limits_prevents_initial_hold_write(
+def test_pose_outside_reviewed_session_limits_prevents_camera_connect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
@@ -254,7 +273,7 @@ def test_rejected_action_causes_zero_additional_writes(
     action["Motor_0.pos"] = float("nan")
     with pytest.raises(SafetyGateError, match="finite"):
         robot.send_action(action)
-    assert len(port.writes) == 1
+    assert port.writes == []
     robot.disconnect()
 
 
@@ -285,7 +304,8 @@ def test_successful_write_retains_receipt_when_feedback_read_fails(
     with pytest.raises(PostWriteFeedbackError, match="motor write completed") as failed:
         robot.send_action(action)
 
-    assert len(port.writes) == 2
+    assert len(port.writes) == 1
+    assert failed.value.write_outcome_confirmed is True
     assert failed.value.action_receipt is robot.last_receipt
     assert robot.last_receipt is not None
     assert robot.last_receipt.command_sequence == 1
@@ -294,4 +314,163 @@ def test_successful_write_retains_receipt_when_feedback_read_fails(
     assert robot.last_receipt.feedback_received_ns == 0
     assert robot.last_receipt.feedback_failed_ns >= robot.last_receipt.write_completed_ns
     assert robot.last_receipt.feedback_error == "OSError: monitor unavailable"
+    robot.disconnect()
+
+
+def test_sdk_write_exception_creates_immutable_unknown_outcome_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
+    port = FakePort()
+    robot = SafeViolaRobot(
+        SafeViolaConfig(
+            port="/dev/fake",
+            calibration_path=_calibration(tmp_path / "calibration.json"),
+            cameras={},
+            id="test",
+            calibration_dir=tmp_path / "lerobot-calibration",
+        ),
+        _permit(),
+        port_factory=lambda _path, _baud: port,
+        command_factory=lambda *values: values,
+        camera_factory=lambda _configs: {},
+    )
+    robot.connect(calibrate=False)
+    port.write_error = OSError("serial reply lost")
+    action = {f"{joint}.pos": (50.0 if joint == "gripper" else 0.0) for joint in JOINTS}
+    action["Motor_0.pos"] = 0.5
+
+    with pytest.raises(AmbiguousMotorWriteError, match="outcome is unknown") as failed:
+        robot.send_action(action)
+
+    assert len(port.writes) == 1
+    receipt = failed.value.action_receipt
+    assert receipt is robot.last_receipt
+    assert receipt.write_outcome == "unknown"
+    assert receipt.attempt_sequence == 1
+    assert receipt.previous_command_sequence == 0
+    assert dict(receipt.attempted) == action
+    assert not hasattr(receipt, "sent")
+    with pytest.raises(TypeError):
+        receipt.attempted["Motor_0.pos"] = 99.0
+    assert receipt.write_failed_ns >= receipt.write_started_ns
+    assert receipt.write_error == "OSError: serial reply lost"
+    robot.disconnect()
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt("operator stop"), SystemExit(23)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_sdk_write_process_control_preserves_signal_and_unknown_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal: BaseException,
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
+    port = FakePort()
+    robot = SafeViolaRobot(
+        SafeViolaConfig(
+            port="/dev/fake",
+            calibration_path=_calibration(tmp_path / "calibration.json"),
+            cameras={},
+            id="test",
+            calibration_dir=tmp_path / "lerobot-calibration",
+        ),
+        _permit(),
+        port_factory=lambda _path, _baud: port,
+        command_factory=lambda *values: values,
+        camera_factory=lambda _configs: {},
+    )
+    robot.connect(calibrate=False)
+    port.write_error = signal
+    action = {f"{joint}.pos": (50.0 if joint == "gripper" else 0.0) for joint in JOINTS}
+
+    with pytest.raises(type(signal)) as raised:
+        robot.send_action(action)
+
+    assert raised.value is signal
+    if isinstance(signal, SystemExit):
+        assert raised.value.code == 23
+    assert getattr(signal, "write_outcome_unknown") is True
+    assert getattr(signal, "action_receipt") is robot.last_receipt
+    assert robot.last_receipt.write_outcome == "unknown"
+    robot.disconnect()
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt("operator stop"), SystemExit(23)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_feedback_process_control_preserves_signal_and_confirmed_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal: BaseException,
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
+    port = FakePort()
+    robot = SafeViolaRobot(
+        SafeViolaConfig(
+            port="/dev/fake",
+            calibration_path=_calibration(tmp_path / "calibration.json"),
+            cameras={},
+            id="test",
+            calibration_dir=tmp_path / "lerobot-calibration",
+        ),
+        _permit(),
+        port_factory=lambda _path, _baud: port,
+        command_factory=lambda *values: values,
+        camera_factory=lambda _configs: {},
+    )
+    robot.connect(calibrate=False)
+    port.fail_reads = True
+    port.reads_before_failure = 1
+    port.read_error = signal
+    action = {f"{joint}.pos": (50.0 if joint == "gripper" else 0.0) for joint in JOINTS}
+    action["Motor_0.pos"] = 0.5
+
+    with pytest.raises(type(signal)) as raised:
+        robot.send_action(action)
+
+    assert raised.value is signal
+    if isinstance(signal, SystemExit):
+        assert raised.value.code == 23
+    assert getattr(signal, "write_outcome_confirmed") is True
+    assert getattr(signal, "action_receipt") is robot.last_receipt
+    assert robot.last_receipt.command_sequence == 1
+    robot.disconnect()
+
+
+def test_command_construction_failure_is_definitely_before_sdk_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
+    port = FakePort()
+
+    def fail_command(*_values: Any) -> Any:
+        raise ValueError("cannot construct command")
+
+    robot = SafeViolaRobot(
+        SafeViolaConfig(
+            port="/dev/fake",
+            calibration_path=_calibration(tmp_path / "calibration.json"),
+            cameras={},
+            id="test",
+            calibration_dir=tmp_path / "lerobot-calibration",
+        ),
+        _permit(),
+        port_factory=lambda _path, _baud: port,
+        command_factory=fail_command,
+        camera_factory=lambda _configs: {},
+    )
+    robot.connect(calibrate=False)
+    action = {f"{joint}.pos": (50.0 if joint == "gripper" else 0.0) for joint in JOINTS}
+
+    with pytest.raises(ValueError, match="cannot construct command"):
+        robot.send_action(action)
+
+    assert port.writes == []
+    assert robot.last_receipt is None
     robot.disconnect()

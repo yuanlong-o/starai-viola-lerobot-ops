@@ -75,6 +75,8 @@ viola-ops policy shadow \
 Verification and replay are hardware-inert. Live soak is camera-only; it has no
 robot or motor construction path. Both modes seal an external `shadow_record`;
 its output root must remain visible to PC B until acceptance.
+Each invocation creates a fresh immutable attempt directory. Failed attempts
+remain incomplete; use only the exact successful path printed by the command.
 
 ## Supervised inference
 
@@ -86,6 +88,10 @@ viola-ops policy execute \
   --evidence-root /mnt/nas02/yz/starai/evidence/v1/rollout \
   --wandb-entity <entity>
 ```
+
+The hold phase is observation-only. Connection reads and validates the current
+pose and connects both cameras without sending a motor command, so its evidence
+records `motion: false`.
 
 Later phases additionally require accepted predecessor evidence. Run
 `viola-ops policy execute --help`. There is no valid motion command before a

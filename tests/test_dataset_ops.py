@@ -12,6 +12,7 @@ from viola_ops.dataset import (
     ACCEPTED_SOURCE_EPISODES,
     CURRENT_DATASET,
     DATASET_INVENTORY_SHA256,
+    DEFAULT_MATERIAL_ROOT,
     EPISODE_LENGTHS,
     EVALUATION_EPISODES,
     ExpectedFile,
@@ -24,6 +25,10 @@ from viola_ops.dataset import (
 )
 from viola_ops.errors import ValidationError
 from viola_ops.jsonutil import sha256_json
+
+
+def test_programmatic_release_defaults_to_shared_nas_material() -> None:
+    assert DEFAULT_MATERIAL_ROOT == Path("/mnt/nas02/yz/starai/producer-materials/v1")
 
 
 class FakeDataset:

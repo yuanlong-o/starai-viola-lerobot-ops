@@ -26,8 +26,9 @@ unforgeable in-process object tied to one session, phase, and challenge.
 
 ## During execution
 
-- Connection uses the reviewed public FashionStar interface and commands only
-  the freshly measured current pose at startup.
+- Connection uses the reviewed public FashionStar interface to read and check
+  the current pose, then connects both cameras. It performs zero motor writes;
+  hold commissioning is observation-only and is recorded as `motion: false`.
 - Every action must name exactly seven joints and contain finite values.
 - An action that is out of bounds or would need clamping is rejected; it is not
   silently corrected.
@@ -38,6 +39,10 @@ unforgeable in-process object tied to one session, phase, and challenge.
   operator stop aborts before the current write whenever possible.
 - Evidence capacity is reserved before a motor write. Proposed, sent, and
   feedback actions plus timings, freshness, hashes, and videos are retained.
+- If the public SDK write call raises, its physical outcome is unknowable. The
+  reserved frames and an immutable `write_outcome: unknown` attempt receipt are
+  retained, `sent_action` stays null, and execution aborts. Failures proven to
+  occur before that SDK call release the unused reservation.
 - Network and ordinary filesystem work stay outside the 30 Hz loop.
 - Torque is retained on disconnect; the operator owns physical safeing.
 
@@ -62,3 +67,10 @@ trace shapes. Repo A preserves the richer safety trace and derives Repo B's
 compact completed view, but it will not mint `READY` unsafe evidence until both
 repositories share one schema that can prove the required safety facts. This
 blocks a readiness claim; it is not relaxed at runtime.
+
+Repo B also currently derives its benchmark-report configuration identity from
+resolved absolute checkout paths. Identical Repo-B source trees therefore
+produce different report IDs when checked out in different directories. Repo A
+continues to fail closed on that mismatch; Repo B must publish one
+path-independent configuration identity before a production report can pass
+`viola-ops report inspect`.

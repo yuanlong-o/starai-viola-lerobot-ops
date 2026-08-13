@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import queue
+import re
+import stat
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -65,6 +69,8 @@ from .shadow import (
 from .wandb_ops import WandbRunIdentity, planned_run, publish_finished_run
 
 DEFAULT_WANDB_PROJECT = "starai-viola-policy-benchmark"
+_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 _VERIFICATION_FIELDS = {
     "schema_version",
@@ -203,6 +209,7 @@ def verify_command(
     bundle_evidence_logger: viola_handoff.EvidenceLogger | None = None,
     clock: Callable[[], float] = time.perf_counter,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    attempt_id: str | None = None,
 ) -> VerificationEvidence:
     """Verify one accepted candidate and persist authoritative online evidence."""
 
@@ -214,11 +221,13 @@ def verify_command(
     )
     _require_pc_a_identity(identity)
     repo = _repo_identity(identity)
+    attempt = _attempt_id(attempt_id)
     material = _material_root(
         output_root,
         candidate=candidate,
         commit=identity.repository_commit,
         operation="verification",
+        attempt=attempt,
     )
     observation = observation_loader(candidate)
     result = verify_policy(
@@ -233,6 +242,7 @@ def verify_command(
             "bundle_id": candidate.bundle_id,
             "content_id": candidate.content_id,
             "repo_commit": identity.repository_commit,
+            "attempt_id": attempt,
         }
     )
     wandb = planned_run(wandb_entity, wandb_project, f"verify-{seed[:16]}")
@@ -324,6 +334,7 @@ def shadow_command(
     clock: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    attempt_id: str | None = None,
 ) -> ShadowEvidence:
     """Run replay or camera-only live soak, publish W&B, then seal evidence."""
 
@@ -342,13 +353,15 @@ def shadow_command(
         verification_path,
         expected_repo=repo,
     )
-    runtime = runtime_factory(candidate)
+    attempt = _attempt_id(attempt_id)
     material = _material_root(
         output_root,
         candidate=candidate,
         commit=identity.repository_commit,
         operation=mode,
+        attempt=attempt,
     )
+    runtime = runtime_factory(candidate)
     payload_root = material / "payload"
     artifact_root = material / "shadow_record"
     payload_root.mkdir(parents=True, exist_ok=True)
@@ -435,6 +448,7 @@ def shadow_command(
             "content_id": candidate.content_id,
             "repo_commit": identity.repository_commit,
             "setup_hashes": setup_hashes,
+            "attempt_id": attempt,
         }
     )
     wandb = planned_run(wandb_entity, wandb_project, f"shadow-{mode.replace('-', '_')}-{seed[:16]}")
@@ -945,16 +959,54 @@ def _material_root(
     candidate: AcceptedPolicyCandidate,
     commit: str,
     operation: str,
+    attempt: str,
 ) -> Path:
-    root = (
-        Path(output_root).expanduser().resolve()
+    parent = (
+        _safe_output_directory(output_root)
         / candidate.policy
         / candidate.bundle_id
         / commit
         / operation
     )
-    root.mkdir(parents=True, exist_ok=True)
+    parent.mkdir(parents=True, exist_ok=True)
+    root = parent / attempt
+    try:
+        root.mkdir()
+    except FileExistsError as exc:
+        raise ValidationError(
+            f"policy attempt already exists and will not be reused: {root}"
+        ) from exc
     return root
+
+
+def _attempt_id(value: str | None) -> str:
+    """Return a fresh path-safe ID; injection is reserved for deterministic tests."""
+
+    attempt = uuid.uuid4().hex if value is None else value
+    if not isinstance(attempt, str) or not _ATTEMPT_ID_RE.fullmatch(attempt):
+        raise ValidationError(
+            "policy attempt_id must be 1-64 path-safe letters, digits, '.', '_', or '-'"
+        )
+    return attempt
+
+
+def _safe_output_directory(path: str | Path) -> Path:
+    """Create an output root without following an existing symlink component."""
+
+    candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(mode):
+            raise ValidationError(f"symlink output path is forbidden: {current}")
+        if not stat.S_ISDIR(mode):
+            raise ValidationError(f"output path component is not a directory: {current}")
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
 
 
 def _repo_identity(identity: viola_handoff.RuntimeIdentity) -> dict[str, Any]:
@@ -969,6 +1021,22 @@ def _repo_identity(identity: viola_handoff.RuntimeIdentity) -> dict[str, Any]:
 def _require_pc_a_identity(identity: viola_handoff.RuntimeIdentity) -> None:
     if identity.role != "pc_a" or identity.repository_clean is not True:
         raise ValidationError("policy evidence requires a clean pc_a runtime identity")
+    if not isinstance(identity.repository_commit, str) or not _GIT_SHA_RE.fullmatch(
+        identity.repository_commit
+    ):
+        raise ValidationError("policy evidence requires a full lowercase Git commit SHA")
+    if (
+        not isinstance(identity.hostname, str)
+        or not identity.hostname
+        or not isinstance(identity.python_version, str)
+        or identity.python_version.split(".")[:2] != ["3", "12"]
+        or identity.lerobot_version != "0.6.1"
+        or identity.conda_environment != "lerobot"
+    ):
+        raise ValidationError(
+            "policy evidence requires a complete Python 3.12 / LeRobot 0.6.1 "
+            "lerobot-environment identity"
+        )
 
 
 def _seal(

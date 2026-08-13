@@ -12,7 +12,13 @@ import viola_ops.policy_runtime as policy_runtime
 import viola_ops.rollout_evidence as rollout_evidence
 from viola_handoff import canonical_json_bytes
 from viola_ops.errors import SafetyGateError, ValidationError
-from viola_ops.execution import ACTION_KEYS, PhaseResult
+from viola_ops.execution import (
+    ACTION_KEYS,
+    PhaseResult,
+    TrialOutcome,
+    TrialResult,
+    shakedown_conditions,
+)
 
 
 class _StopBeforeHardware(RuntimeError):
@@ -680,6 +686,54 @@ def test_phase_result_round_trip_preserves_completed_hold(tmp_path: Path) -> Non
     path = tmp_path / "PHASE_RESULT.json"
     path.write_bytes(canonical_json_bytes(execute_ops._phase_result_payload(result)))
     assert execute_ops._load_phase_result(path, permit=_permit()) == result
+
+
+def test_phase_result_round_trip_preserves_zero_send_ambiguous_abort(
+    tmp_path: Path,
+) -> None:
+    permit = _permit()
+    permit.phase = "shakedown"
+    permit.speed_scale = 0.25
+    trial = TrialResult(
+        trial_id="session-1-shakedown-01",
+        index=0,
+        condition=shakedown_conditions()[0].to_dict(),
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        duration_sec=1.0,
+        actions=0,
+        replans=0,
+        inference_latency_ms=(),
+        control_latency_ms=(),
+        outcome=TrialOutcome(
+            False,
+            "safety_abort",
+            "feedback_loss",
+            None,
+            None,
+            None,
+            0.0,
+        ),
+        safety_events=("feedback_loss",),
+        trace_path="trials/trial-00.jsonl",
+        front_video_path="videos/trial-00-front.mp4",
+        up_video_path="videos/trial-00-up.mp4",
+    )
+    result = PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="shakedown",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=0.25,
+        held_action=None,
+        trials=(trial,),
+        terminal_event="feedback_loss",
+        terminal_reason="motor write outcome was unknown",
+    )
+    path = tmp_path / "PHASE_RESULT.json"
+    path.write_bytes(canonical_json_bytes(execute_ops._phase_result_payload(result)))
+    assert execute_ops._load_phase_result(path, permit=permit) == result
 
 
 def test_phase_result_loader_rejects_wrong_trial_count_for_completed_motion(

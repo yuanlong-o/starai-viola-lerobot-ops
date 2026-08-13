@@ -170,12 +170,21 @@ Both shadow modes default `--output-root` to the shared
 remain readable from PC B until acceptance; a PC-A-local override is not a
 portable handoff.
 
+Every verification or shadow invocation creates a fresh immutable attempt
+directory. Failed attempts remain incomplete and are never overwritten; pass
+forward only the exact successful evidence path printed by the command.
+
 ### `viola-ops report inspect`
 
 Read-only validation of an accepted Repo-B `report` bundle. It checks complete
 lineage, exact eight-policy ordering, recomputed metrics, CSV/Markdown/JSON
 agreement, hashes, receipts, and the finished W&B report run. It prints terminal
 outcomes; it does not rank, rewrite, publish, or declare the robot ready.
+
+The merged Repo-B implementation still hashes resolved checkout paths into its
+report configuration identity. Repo A keeps one reviewed digest and rejects
+any mismatch; a report cannot support a readiness claim until Repo B replaces
+that path-dependent value with one digest shared by both repositories.
 
 ```bash
 viola-ops report inspect \
@@ -199,7 +208,9 @@ viola-ops policy execute \
   --wandb-entity <entity>
 ```
 
-That is intentionally a hold-only commissioning command. It does not accept a
+That is intentionally an observation-only hold commissioning command. Startup
+reads and validates the current pose and connects both cameras without a motor
+write; its evidence therefore records `motion: false`. It does not accept a
 checkpoint path, duration, task, or speed override. After Repo B accepts the
 hold evidence, run `--phase shakedown --prior-hold <accepted-hold-bundle>`.
 After Repo B accepts the two shakedowns, run `--phase scored` with both

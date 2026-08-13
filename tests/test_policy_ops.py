@@ -5,8 +5,10 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 
 from viola_handoff import RuntimeIdentity, inspect_bundle
+from viola_ops.errors import ValidationError
 from viola_ops.policies import CANONICAL_TASK, get_policy_spec
 from viola_ops.policy_ops import ShadowEvidence, shadow_command, verify_command
 from viola_ops.policy_runtime import AcceptedPolicyCandidate
@@ -16,6 +18,12 @@ class FakeEvidence:
     def record(self, *, project: str, run_id: str, event: str, metadata: Any) -> str:
         del event, metadata
         return f"https://wandb.ai/test/{project}/runs/{run_id}"
+
+
+class FailingEvidence:
+    def record(self, *, project: str, run_id: str, event: str, metadata: Any) -> str:
+        del project, run_id, event, metadata
+        raise ValidationError("simulated handoff publication failure")
 
 
 class FakeRuntime:
@@ -231,3 +239,212 @@ def test_unsafe_shadow_summary_never_says_passed(tmp_path: Path) -> None:
     assert "Policy shadow: unsafe; motion remains blocked" in rendered
     assert "Status: unsafe_shadow" in rendered
     assert "Policy shadow: passed" not in rendered
+
+
+def test_verify_retry_uses_a_fresh_attempt_after_wandb_failure(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr("viola_ops.policy_ops.inspect_candidate", lambda _path: candidate)
+    run_ids: list[str] = []
+    runtime_loads = 0
+
+    def runtime_factory(_candidate: Any) -> FakeRuntime:
+        nonlocal runtime_loads
+        runtime_loads += 1
+        return FakeRuntime()
+
+    def publisher(identity: Any, **_kwargs: Any) -> Any:
+        run_ids.append(identity.run_id)
+        if len(run_ids) == 1:
+            raise ValidationError("simulated W&B failure")
+        return identity
+
+    arguments = {
+        "bundle": "/accepted/candidate",
+        "output_root": tmp_path / "output",
+        "repo_root": tmp_path,
+        "wandb_entity": "test",
+        "runtime_factory": runtime_factory,
+        "observation_loader": lambda _candidate: _observation(),
+        "publisher": publisher,
+        "producer_identity": _identity(),
+        "clock": FastClock(),
+    }
+    with pytest.raises(ValidationError, match="simulated W&B failure"):
+        verify_command(**arguments)
+
+    attempts_root = (
+        tmp_path
+        / "output"
+        / "act"
+        / candidate.bundle_id
+        / _identity().repository_commit
+        / "verification"
+    )
+    first = next(attempts_root.iterdir())
+    first_bytes = (first / "verification.json").read_bytes()
+    assert not (first / "verification_WANDB_SYNCED.json").exists()
+
+    evidence = verify_command(**arguments)
+    assert evidence.root != first
+    assert len(evidence.root.name) == len(first.name) == 32
+    assert (first / "verification.json").read_bytes() == first_bytes
+    assert runtime_loads == 2
+    assert len(set(run_ids)) == 2
+
+
+def test_shadow_seal_retry_keeps_failed_attempt_unready_and_isolated(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr("viola_ops.policy_ops.inspect_candidate", lambda _path: candidate)
+    _calls, publisher = _publisher_calls()
+    verification = verify_command(
+        "/accepted/candidate",
+        tmp_path / "output",
+        tmp_path,
+        wandb_entity="test",
+        runtime_factory=lambda _candidate: FakeRuntime(),
+        observation_loader=lambda _candidate: _observation(),
+        publisher=publisher,
+        producer_identity=_identity(),
+        clock=FastClock(),
+        attempt_id="verification",
+    )
+    runtime_loads = 0
+    replay_loads = 0
+    shadow_run_ids: list[str] = []
+
+    def runtime_factory(_candidate: Any) -> FakeRuntime:
+        nonlocal runtime_loads
+        runtime_loads += 1
+        return FakeRuntime([0.0] * 6 + [float("nan")])
+
+    def replay_loader(_candidate: Any) -> list[dict[str, Any]]:
+        nonlocal replay_loads
+        replay_loads += 1
+        return _frames()
+
+    def shadow_publisher(identity: Any, **_kwargs: Any) -> Any:
+        shadow_run_ids.append(identity.run_id)
+        return identity
+
+    arguments = {
+        "bundle": "/accepted/candidate",
+        "mode": "replay",
+        "verification_path": verification.verification_path,
+        "output_root": tmp_path / "output",
+        "repo_root": tmp_path,
+        "handoff_root": tmp_path / "handoffs",
+        "wandb_entity": "test",
+        "runtime_factory": runtime_factory,
+        "replay_loader": replay_loader,
+        "publisher": shadow_publisher,
+        "producer_identity": _identity(),
+        "clock": FastClock(),
+    }
+    with pytest.raises(ValidationError, match="simulated handoff publication failure"):
+        shadow_command(
+            **arguments,
+            bundle_evidence_logger=FailingEvidence(),
+            attempt_id="attempt-one",
+        )
+
+    bundles = list((tmp_path / "handoffs" / "shadow_evidence").iterdir())
+    assert len(bundles) == 1
+    failed_bundle = bundles[0]
+    failed_manifest = (failed_bundle / "manifest.json").read_bytes()
+    assert not (failed_bundle / "READY.json").exists()
+
+    evidence = shadow_command(
+        **arguments,
+        bundle_evidence_logger=FakeEvidence(),
+        attempt_id="attempt-two",
+    )
+    assert evidence.root.name == "attempt-two"
+    assert evidence.bundle.path != failed_bundle
+    assert (failed_bundle / "manifest.json").read_bytes() == failed_manifest
+    assert not (failed_bundle / "READY.json").exists()
+    assert (evidence.bundle.path / "READY.json").is_file()
+    assert runtime_loads == replay_loads == 2
+    assert len(set(shadow_run_ids)) == 2
+
+
+def test_attempt_ids_are_path_safe_and_existing_attempts_fail_before_inference(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr("viola_ops.policy_ops.inspect_candidate", lambda _path: candidate)
+    loads = 0
+
+    def observation_loader(_candidate: Any) -> dict[str, Any]:
+        nonlocal loads
+        loads += 1
+        return _observation()
+
+    common = {
+        "bundle": "/accepted/candidate",
+        "output_root": tmp_path / "output",
+        "repo_root": tmp_path,
+        "wandb_entity": "test",
+        "runtime_factory": lambda _candidate: FakeRuntime(),
+        "observation_loader": observation_loader,
+        "publisher": _publisher_calls()[1],
+        "producer_identity": _identity(),
+        "clock": FastClock(),
+    }
+    with pytest.raises(ValidationError, match="path-safe"):
+        verify_command(**common, attempt_id="../escape")
+    assert loads == 0
+
+    verify_command(**common, attempt_id="same-attempt")
+    with pytest.raises(ValidationError, match="will not be reused"):
+        verify_command(**common, attempt_id="same-attempt")
+    assert loads == 1
+
+
+def test_verify_rejects_untrusted_identity_and_symlink_output_before_inference(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr("viola_ops.policy_ops.inspect_candidate", lambda _path: candidate)
+    loads = 0
+
+    def observation_loader(_candidate: Any) -> dict[str, Any]:
+        nonlocal loads
+        loads += 1
+        return _observation()
+
+    arguments = {
+        "bundle": "/accepted/candidate",
+        "output_root": tmp_path / "output",
+        "repo_root": tmp_path,
+        "wandb_entity": "test",
+        "runtime_factory": lambda _candidate: FakeRuntime(),
+        "observation_loader": observation_loader,
+        "publisher": _publisher_calls()[1],
+        "clock": FastClock(),
+    }
+    unsafe_identity = RuntimeIdentity(
+        role="pc_a",
+        repository_commit="../unreviewed",
+        repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.13",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
+    )
+    with pytest.raises(ValidationError, match="full lowercase Git commit SHA"):
+        verify_command(**arguments, producer_identity=unsafe_identity)
+
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    linked_output = tmp_path / "linked-output"
+    linked_output.symlink_to(real_output, target_is_directory=True)
+    with pytest.raises(ValidationError, match="symlink output path is forbidden"):
+        verify_command(
+            **{**arguments, "output_root": linked_output},
+            producer_identity=_identity(),
+        )
+    assert loads == 0

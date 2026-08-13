@@ -208,6 +208,17 @@ class _Abort(Exception):
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class _WriteFailureEvidence:
+    """Normalized evidence for a write call that did not finish normally."""
+
+    write_outcome: str
+    attempted_action: Mapping[str, float]
+    sent_action: Mapping[str, float] | None
+    feedback_check: Mapping[str, Any]
+    confirmed_sent: bool
+
+
 def canonical_scored_conditions() -> tuple[TrialCondition, ...]:
     """Return the preregistered seed-1000 order shared with Repo B."""
 
@@ -261,6 +272,7 @@ def execute_phase(
     begin_permit_execution(permit)
     robot: RolloutRobot | None = None
     connected = False
+    active_error: BaseException | None = None
     try:
         robot = robot_factory(permit)
         robot.connect(calibrate=False)
@@ -282,7 +294,7 @@ def execute_phase(
             )
 
         # Loading a model is intentionally after the permit and after the
-        # reviewed robot has successfully entered current-pose hold.
+        # reviewed robot and cameras have passed their read-only startup checks.
         runtime = runtime_factory(candidate)
         conditions = (
             shakedown_conditions() if permit.phase == "shakedown" else canonical_scored_conditions()
@@ -310,7 +322,13 @@ def execute_phase(
                     clock_ns=clock_ns,
                     sleep=sleep,
                 )
-            finally:
+            except BaseException as exc:
+                try:
+                    recorder.close()
+                except Exception as cleanup_error:
+                    exc.add_note(f"trial evidence cleanup also failed: {cleanup_error}")
+                raise
+            else:
                 recorder.close()
             results.append(result)
             if not result.completed_safely:
@@ -339,12 +357,27 @@ def execute_phase(
             None,
             None,
         )
+    except BaseException as exc:
+        active_error = exc
+        raise
     finally:
+        cleanup_error: Exception | None = None
         try:
             if connected and robot is not None:
                 robot.disconnect()
-        finally:
+        except Exception as exc:
+            cleanup_error = exc
+        try:
             finish_permit_execution(permit)
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+            else:
+                cleanup_error.add_note(f"permit cleanup also failed: {exc}")
+        if cleanup_error is not None:
+            if active_error is None:
+                raise cleanup_error
+            active_error.add_note(f"execution cleanup also failed: {cleanup_error}")
 
 
 def run_control_trial(
@@ -374,6 +407,8 @@ def run_control_trial(
     inference_samples: list[float] = []
     control_samples: list[float] = []
     actions = 0
+    action_attempts = 0
+    ambiguous_write_attempts = 0
     replans = 0
     safety_events: list[str] = []
     initial_receipt = getattr(robot, "last_receipt", None)
@@ -460,28 +495,45 @@ def run_control_trial(
             except SafetyGateError as exc:
                 reservation.cancel()
                 raise _Abort("clamped_action", f"write-side safety check rejected action: {exc}") from exc
-            except Exception as exc:
-                failed_receipt = _post_write_failure_receipt(
+            except BaseException as exc:
+                failed_write = _write_failure_evidence(
                     exc,
                     robot.last_receipt,
+                    proposed_map,
                     expected_sequence=previous_command_sequence + 1,
                     expected_previous_feedback_received_ns=previous_feedback_received_ns,
                 )
-                if failed_receipt is None:
+                if failed_write is None:
+                    # The adapter did not enter the public SDK write call.  It
+                    # is safe to release the reservation because no motor-write
+                    # attempt is associated with these frames.
                     reservation.cancel()
-                    raise _Abort("feedback_loss", f"write/feedback transaction failed: {exc}") from exc
+                    if not isinstance(exc, Exception):
+                        raise
+                    raise _Abort(
+                        "feedback_loss",
+                        f"transaction failed before the SDK motor-write call: {exc}",
+                    ) from exc
 
-                # The motor write is irreversible at this point.  Consume the
-                # pre-write reservation with an explicit missing-feedback row
-                # instead of discarding the only frames bound to that action.
+                # The public SDK call was entered.  Consume the reservation even
+                # when its physical outcome is unknown; these are the only
+                # camera frames bound to that attempt.
                 write_finished = clock()
                 control_ms = (write_finished - iteration_started) * 1_000.0
                 elapsed_s = write_finished - started
                 period_ms = (elapsed_s - previous_elapsed_s) * 1_000.0
-                actions += 1
-                replans += int(step % 10 == 0)
-                inference_samples.append(inference_ms)
-                control_samples.append(control_ms)
+                action_attempts += 1
+                actions += int(failed_write.confirmed_sent)
+                ambiguous_write_attempts += int(
+                    failed_write.write_outcome == "unknown"
+                )
+                # TrialResult's aggregate timing arrays describe confirmed
+                # actions.  The richer failure row below retains timing for an
+                # ambiguous attempt without pretending it was sent.
+                if failed_write.confirmed_sent:
+                    replans += int(step % 10 == 0)
+                    inference_samples.append(inference_ms)
+                    control_samples.append(control_ms)
                 failure_row = {
                     "trial": trial_id,
                     "condition": condition.to_dict(),
@@ -492,9 +544,15 @@ def run_control_trial(
                     "replan": step % 10 == 0,
                     "state": state,
                     "proposed_action": proposed_map,
-                    "sent_action": failed_receipt["sent_action"],
+                    "attempted_action": dict(failed_write.attempted_action),
+                    "sent_action": (
+                        None
+                        if failed_write.sent_action is None
+                        else dict(failed_write.sent_action)
+                    ),
+                    "write_outcome": failed_write.write_outcome,
                     "feedback_action": None,
-                    "feedback_check": failed_receipt["feedback_check"],
+                    "feedback_check": dict(failed_write.feedback_check),
                     "inference_ms": inference_ms,
                     "control_ms": control_ms,
                     "deadline_ms": CONTROL_DEADLINE_MS,
@@ -508,14 +566,27 @@ def run_control_trial(
                 try:
                     reservation.commit(failure_row)
                 except Exception as evidence_error:
+                    qualifier = (
+                        "confirmed motor write"
+                        if failed_write.confirmed_sent
+                        else "ambiguous motor-write attempt"
+                    )
+                    if not isinstance(exc, Exception):
+                        exc.add_note(
+                            f"evidence writer also failed after {qualifier}: {evidence_error}"
+                        )
+                        raise exc.with_traceback(exc.__traceback__) from evidence_error
                     raise _Abort(
                         "safety_abort",
-                        f"evidence writer failed after confirmed motor write: {evidence_error}",
+                        f"evidence writer failed after {qualifier}: {evidence_error}",
                     ) from evidence_error
+                if not isinstance(exc, Exception):
+                    raise
                 raise _Abort("feedback_loss", str(exc)) from exc
 
             # A normal return confirms the SDK write.  Count it even if later
             # receipt validation or evidence persistence reports a fault.
+            action_attempts += 1
             actions += 1
             write_finished = clock()
             control_ms = (write_finished - iteration_started) * 1_000.0
@@ -532,7 +603,9 @@ def run_control_trial(
                 "replan": step % 10 == 0,
                 "state": state,
                 "proposed_action": proposed_map,
+                "attempted_action": proposed_map,
                 "sent_action": sent,
+                "write_outcome": "confirmed",
                 "feedback_action": None,
                 "feedback_check": None,
                 "inference_ms": inference_ms,
@@ -612,11 +685,13 @@ def run_control_trial(
             {
                 "trial": trial_id,
                 "condition": condition.to_dict(),
-                "index": actions,
+                "index": action_attempts,
                 "elapsed_s": max(clock() - started, 0.0),
                 "event": abort.event,
                 "detail": abort.reason,
                 "actions_sent": actions,
+                "action_attempts": action_attempts,
+                "ambiguous_write_attempts": ambiguous_write_attempts,
             }
         )
 
@@ -670,25 +745,54 @@ def _feedback_after(receipt: Any) -> dict[str, float]:
     return {key: _finite(receipt.feedback_after[key], f"feedback {key}") for key in ACTION_KEYS}
 
 
-def _post_write_failure_receipt(
-    error: Exception,
+def _write_failure_evidence(
+    error: BaseException,
     robot_receipt: Any,
+    proposed_action: Mapping[str, float],
     *,
     expected_sequence: int,
     expected_previous_feedback_received_ns: int,
-) -> dict[str, Any] | None:
-    """Return evidence only for the adapter's definitive post-write failure."""
+) -> _WriteFailureEvidence | None:
+    """Classify a failed transaction without guessing whether motion occurred.
+
+    No marked receipt means the failure was definitely before the public SDK
+    write boundary, so the caller may cancel its frame reservation.  A marked
+    ambiguous write always retains that reservation, even if secondary receipt
+    validation also fails.
+    """
+
+    if getattr(error, "write_outcome_unknown", False) is True:
+        return _ambiguous_write_evidence(
+            error,
+            robot_receipt,
+            proposed_action,
+            expected_sequence=expected_sequence,
+            expected_previous_feedback_received_ns=expected_previous_feedback_received_ns,
+        )
 
     receipt = getattr(error, "action_receipt", None)
+    confirmed_marker = getattr(error, "write_outcome_confirmed", False) is True
     if receipt is None or receipt is not robot_receipt:
-        return None
-    sequence = int(getattr(receipt, "command_sequence", 0))
-    previous_received = int(getattr(receipt, "previous_feedback_received_ns", -1))
-    control_started = int(getattr(receipt, "control_started_ns", 0))
-    prewrite_received = int(getattr(receipt, "prewrite_received_ns", 0))
-    write_started = int(getattr(receipt, "write_started_ns", 0))
-    write_completed = int(getattr(receipt, "write_completed_ns", 0))
-    feedback_failed = int(getattr(receipt, "feedback_failed_ns", 0))
+        return (
+            _invalid_confirmed_write_evidence(error, proposed_action)
+            if confirmed_marker
+            else None
+        )
+    try:
+        sequence = int(getattr(receipt, "command_sequence", 0))
+        previous_received = int(getattr(receipt, "previous_feedback_received_ns", -1))
+        control_started = int(getattr(receipt, "control_started_ns", 0))
+        prewrite_received = int(getattr(receipt, "prewrite_received_ns", 0))
+        write_started = int(getattr(receipt, "write_started_ns", 0))
+        write_completed = int(getattr(receipt, "write_completed_ns", 0))
+        feedback_failed = int(getattr(receipt, "feedback_failed_ns", 0))
+        poll_count = int(getattr(receipt, "poll_count", 0))
+    except (TypeError, ValueError, OverflowError):
+        return (
+            _invalid_confirmed_write_evidence(error, proposed_action)
+            if confirmed_marker
+            else None
+        )
     feedback_error = getattr(receipt, "feedback_error", None)
     if (
         sequence != expected_sequence
@@ -700,13 +804,27 @@ def _post_write_failure_receipt(
             <= write_completed <= feedback_failed
         )
     ):
-        return None
+        return (
+            _invalid_confirmed_write_evidence(error, proposed_action)
+            if confirmed_marker
+            else None
+        )
     try:
         before = _receipt_action(receipt, "feedback_before")
         sent = _receipt_action(receipt, "sent")
         minimum = _minimum_progress(receipt)
     except _Abort:
-        return None
+        return (
+            _invalid_confirmed_write_evidence(error, proposed_action)
+            if confirmed_marker
+            else None
+        )
+    if sent != dict(proposed_action):
+        return (
+            _invalid_confirmed_write_evidence(error, proposed_action)
+            if confirmed_marker
+            else None
+        )
     check = {
         "freshness_source": "bounded_synchronous_fashionstar_monitor_poll",
         "joint_order": list(JOINT_NAMES),
@@ -718,7 +836,7 @@ def _post_write_failure_receipt(
         "write_completed_ns": write_completed,
         "feedback_received_ns": 0,
         "feedback_failed_ns": feedback_failed,
-        "poll_count": int(getattr(receipt, "poll_count", 0)),
+        "poll_count": poll_count,
         "prewrite_action": before,
         "target_action": sent,
         "feedback_action": None,
@@ -727,7 +845,125 @@ def _post_write_failure_receipt(
         "feedback_error": feedback_error,
         "passed": False,
     }
-    return {"sent_action": sent, "feedback_check": check}
+    return _WriteFailureEvidence(
+        write_outcome="confirmed",
+        attempted_action=sent,
+        sent_action=sent,
+        feedback_check=check,
+        confirmed_sent=True,
+    )
+
+
+def _invalid_confirmed_write_evidence(
+    error: BaseException,
+    proposed_action: Mapping[str, float],
+) -> _WriteFailureEvidence:
+    """Retain frames when a typed post-write error has a damaged receipt."""
+
+    attempted = dict(proposed_action)
+    return _WriteFailureEvidence(
+        write_outcome="confirmed",
+        attempted_action=attempted,
+        sent_action=attempted,
+        feedback_check={
+            "freshness_source": "bounded_synchronous_fashionstar_monitor_poll",
+            "joint_order": list(JOINT_NAMES),
+            "target_action": attempted,
+            "feedback_action": None,
+            "receipt_violations": ["invalid_post_write_failure_receipt"],
+            "feedback_error": f"{type(error).__name__}: {error}",
+            "passed": False,
+        },
+        confirmed_sent=True,
+    )
+
+
+def _ambiguous_write_evidence(
+    error: BaseException,
+    robot_receipt: Any,
+    proposed_action: Mapping[str, float],
+    *,
+    expected_sequence: int,
+    expected_previous_feedback_received_ns: int,
+) -> _WriteFailureEvidence:
+    """Retain an SDK-call failure while refusing to call its target "sent"."""
+
+    receipt = getattr(error, "action_receipt", None)
+    violations = ["sdk_write_outcome_unknown"]
+    attempted = dict(proposed_action)
+    check: dict[str, Any] = {
+        "freshness_source": "bounded_synchronous_fashionstar_monitor_poll",
+        "joint_order": list(JOINT_NAMES),
+        "command_attempt_sequence": expected_sequence,
+        "confirmed_command_sequence": expected_sequence - 1,
+        "previous_feedback_received_ns": expected_previous_feedback_received_ns,
+        "target_action": attempted,
+        "feedback_action": None,
+        "receipt_violations": violations,
+        "write_error": f"{type(error).__name__}: {error}",
+        "write_outcome": "unknown",
+        "passed": False,
+    }
+
+    # The exception marker proves that the SDK call boundary was entered.  If
+    # its accompanying receipt is malformed, retain the frames and describe
+    # that secondary problem instead of erasing evidence for a possible write.
+    if receipt is None or receipt is not robot_receipt:
+        violations.append("invalid_ambiguous_write_receipt")
+        return _WriteFailureEvidence("unknown", attempted, None, check, False)
+
+    try:
+        attempt_sequence = int(getattr(receipt, "attempt_sequence", 0))
+        previous_sequence = int(getattr(receipt, "previous_command_sequence", -1))
+        previous_received = int(getattr(receipt, "previous_feedback_received_ns", -1))
+        control_started = int(getattr(receipt, "control_started_ns", 0))
+        prewrite_received = int(getattr(receipt, "prewrite_received_ns", 0))
+        write_started = int(getattr(receipt, "write_started_ns", 0))
+        write_failed = int(getattr(receipt, "write_failed_ns", 0))
+        receipt_attempted = _receipt_action(receipt, "attempted")
+        receipt_proposed = _receipt_action(receipt, "proposed")
+        before = _receipt_action(receipt, "feedback_before")
+        minimum = _minimum_progress(receipt)
+    except (TypeError, ValueError, OverflowError, _Abort):
+        violations.append("invalid_ambiguous_write_receipt")
+        return _WriteFailureEvidence("unknown", attempted, None, check, False)
+
+    write_error = getattr(receipt, "write_error", None)
+    receipt_outcome = getattr(receipt, "write_outcome", None)
+    receipt_is_valid = not (
+        attempt_sequence != expected_sequence
+        or previous_sequence != expected_sequence - 1
+        or previous_received != expected_previous_feedback_received_ns
+        or receipt_attempted != attempted
+        or receipt_proposed != attempted
+        or receipt_outcome != "unknown"
+        or not isinstance(write_error, str)
+        or not write_error
+        or not (
+            0 <= previous_received <= control_started < prewrite_received < write_started
+            <= write_failed
+        )
+    )
+    if not receipt_is_valid:
+        violations.append("invalid_ambiguous_write_receipt")
+
+    check.update(
+        {
+            "command_attempt_sequence": attempt_sequence,
+            "confirmed_command_sequence": previous_sequence,
+            "previous_feedback_received_ns": previous_received,
+            "control_started_ns": control_started,
+            "prewrite_received_ns": prewrite_received,
+            "write_started_ns": write_started,
+            "write_failed_ns": write_failed,
+            "prewrite_action": before,
+            "receipt_attempted_action": receipt_attempted,
+            "receipt_proposed_action": receipt_proposed,
+            "minimum_observable_progress": minimum,
+            "write_error": write_error,
+        }
+    )
+    return _WriteFailureEvidence("unknown", attempted, None, check, False)
 
 
 def _camera_freshness(receipt: Any, now_ns: int) -> dict[str, Any]:

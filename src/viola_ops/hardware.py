@@ -2,8 +2,8 @@
 
 This module never patches the installed StarAI plugins.  The stock plugin's
 ``connect`` method disables torque and commands a fixed pose, so production
-execution instead uses the public FashionStar SDK to read the current pose and
-then holds that same pose after the operator has received a motion permit.
+execution instead uses the public FashionStar SDK directly.  Connection is
+read-only: it checks the measured pose, then connects the reviewed cameras.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
@@ -67,10 +68,49 @@ class ActionReceipt:
 class PostWriteFeedbackError(RuntimeError):
     """The public SDK accepted a write, but its required feedback read failed."""
 
+    write_outcome_confirmed = True
+
     def __init__(self, receipt: ActionReceipt, cause: BaseException) -> None:
         self.action_receipt = receipt
         super().__init__(
             "motor write completed, but synchronous feedback failed: "
+            f"{type(cause).__name__}: {cause}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AmbiguousWriteReceipt:
+    """Immutable evidence that an SDK write call began but did not return.
+
+    ``attempted`` is the validated target passed to the public SDK.  It is not
+    named ``sent`` because an exception cannot prove whether the SDK sent none,
+    some, or all of the underlying serial commands.
+    """
+
+    proposed: Mapping[str, float]
+    attempted: Mapping[str, float]
+    feedback_before: Mapping[str, float]
+    attempt_sequence: int
+    previous_command_sequence: int
+    control_started_ns: int
+    prewrite_received_ns: int
+    write_started_ns: int
+    write_failed_ns: int
+    previous_feedback_received_ns: int
+    minimum_observable_progress: Mapping[str, float]
+    write_error: str
+    write_outcome: str = "unknown"
+
+
+class AmbiguousMotorWriteError(RuntimeError):
+    """The public SDK write call raised, so physical outcome is unknowable."""
+
+    write_outcome_unknown = True
+
+    def __init__(self, receipt: AmbiguousWriteReceipt, cause: BaseException) -> None:
+        self.action_receipt = receipt
+        super().__init__(
+            "motor write call failed; physical write outcome is unknown: "
             f"{type(cause).__name__}: {cause}"
         )
 
@@ -144,8 +184,9 @@ class SafeViolaRobot(Robot):
         )
         self._port: PublicFashionStarPort | None = None
         self._connected = False
-        self._last_receipt: ActionReceipt | None = None
+        self._last_receipt: ActionReceipt | AmbiguousWriteReceipt | None = None
         self._command_sequence = 0
+        self._write_attempt_sequence = 0
         self._last_feedback_received_ns = 0
 
     @cached_property
@@ -169,14 +210,15 @@ class SafeViolaRobot(Robot):
         return set(self._calibration) == set(JOINTS)
 
     @property
-    def last_receipt(self) -> ActionReceipt | None:
+    def last_receipt(self) -> ActionReceipt | AmbiguousWriteReceipt | None:
         return self._last_receipt
 
     def connect(self, calibrate: bool = False) -> None:
-        """Open, read, and hold the measured pose after authorization.
+        """Open serial, validate the measured pose, and connect cameras.
 
         Calibration is immutable session input.  Runtime calibration is
         intentionally unsupported because it would change reviewed setup.
+        Connection sends no position, torque, or configuration command.
         """
 
         assert_permit_current(self.permit, require_active=True)
@@ -200,30 +242,16 @@ class SafeViolaRobot(Robot):
             self._port = port
             current = self._read_positions()
             # A calibration-valid position may still lie outside the narrower
-            # limits reviewed for this session.  Reject it before cameras or a
-            # motor write exist; never "hold" by commanding a clipped value.
-            safe_current = validate_action(current, current, self.permit)
+            # limits reviewed for this session.  Reject it before cameras are
+            # connected.  Connection itself is always motor-write-free.
+            validate_action(current, current, self.permit)
             for camera in self.cameras.values():
                 camera.connect()
                 connected_cameras.append(camera)
             self._connected = True
-            # This is the first command and occurs only after the explicit arm
-            # challenge.  Requested position equals the synchronous measurement.
-            self._write_positions(safe_current)
-            feedback = self._read_positions()
-            connected_at = time.perf_counter_ns()
-            self._last_receipt = ActionReceipt(
-                safe_current,
-                safe_current,
-                current,
-                feedback,
-                command_sequence=0,
-                feedback_received_ns=connected_at,
-                minimum_observable_progress=self._minimum_observable_progress(),
-                poll_count=1,
-            )
-            # Policy-action receipt chaining starts at zero.  The startup hold
-            # is commissioning evidence, not action sequence 1.
+            self._last_receipt = None
+            self._command_sequence = 0
+            self._write_attempt_sequence = 0
             self._last_feedback_received_ns = 0
         except BaseException:
             self._connected = False
@@ -283,8 +311,35 @@ class SafeViolaRobot(Robot):
         safe = validate_action(action, before, self.permit)
         proposed = {key: float(action[key]) for key in self.action_features}
         minimum_progress = self._minimum_observable_progress()
+        commands = self._position_commands(safe)
+        port = self._require_port()
+        attempt_sequence = self._write_attempt_sequence + 1
         write_started = time.perf_counter_ns()
-        self._write_positions(safe)
+        self._write_attempt_sequence = attempt_sequence
+        try:
+            port.SyncPositionControl_EX(commands)
+        except BaseException as exc:
+            failed_at = time.perf_counter_ns()
+            receipt = AmbiguousWriteReceipt(
+                proposed=_immutable_action(proposed),
+                attempted=_immutable_action(safe),
+                feedback_before=_immutable_action(before),
+                attempt_sequence=attempt_sequence,
+                previous_command_sequence=self._command_sequence,
+                control_started_ns=control_started,
+                prewrite_received_ns=prewrite_received,
+                write_started_ns=write_started,
+                write_failed_ns=failed_at,
+                previous_feedback_received_ns=self._last_feedback_received_ns,
+                minimum_observable_progress=MappingProxyType(dict(minimum_progress)),
+                write_error=f"{type(exc).__name__}: {exc}",
+            )
+            self._last_receipt = receipt
+            if not isinstance(exc, Exception):
+                exc.action_receipt = receipt
+                exc.write_outcome_unknown = True
+                raise
+            raise AmbiguousMotorWriteError(receipt, exc) from exc
         write_completed = time.perf_counter_ns()
         # Once the public SDK call returns, this sequence number represents a
         # physical write even if the following monitor read fails.
@@ -322,6 +377,10 @@ class SafeViolaRobot(Robot):
                 feedback_error=f"{type(exc).__name__}: {exc}",
             )
             self._last_receipt = receipt
+            if not isinstance(exc, Exception):
+                exc.action_receipt = receipt
+                exc.write_outcome_confirmed = True
+                raise
             raise PostWriteFeedbackError(receipt, exc) from exc
         self._last_receipt = ActionReceipt(
             proposed=proposed,
@@ -377,8 +436,9 @@ class SafeViolaRobot(Robot):
             )
         return result
 
-    def _write_positions(self, values: Mapping[str, float]) -> None:
-        port = self._require_port()
+    def _position_commands(self, values: Mapping[str, float]) -> dict[str, Any]:
+        """Build and validate SDK command objects without touching the port."""
+
         expected = {f"{joint}.pos" for joint in JOINTS}
         if set(values) != expected:
             raise SafetyGateError("motor command must name exactly seven Viola joints")
@@ -398,7 +458,7 @@ class SafeViolaRobot(Robot):
                 DEFAULT_ACCEL_TIME,
                 DEFAULT_DECEL_TIME,
             )
-        port.SyncPositionControl_EX(commands)
+        return commands
 
     def _minimum_observable_progress(self) -> dict[str, float]:
         """Return one encoder-count quantum in normalized joint units."""
@@ -549,6 +609,12 @@ def _fashionstar_command(*arguments: Any) -> Any:
     from fashionstar_uart_sdk import SyncPositionControlOptions
 
     return SyncPositionControlOptions(*arguments)
+
+
+def _immutable_action(values: Mapping[str, float]) -> Mapping[str, float]:
+    """Take an immutable snapshot for evidence that outlives the SDK call."""
+
+    return MappingProxyType({key: float(value) for key, value in values.items()})
 
 
 def _finite(value: Any, label: str) -> float:

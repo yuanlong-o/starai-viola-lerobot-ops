@@ -271,6 +271,46 @@ def test_phase_stops_after_first_unsafe_trial_and_tears_down() -> None:
     assert robot.connects == robot.disconnects == 1
 
 
+def test_process_control_is_not_masked_by_recorder_or_robot_cleanup() -> None:
+    signal = KeyboardInterrupt("operator stop")
+
+    class BrokenRecorder(_Recorder):
+        def close(self):
+            self.closed = True
+            raise RuntimeError("recorder close failed")
+
+    class BrokenEvidenceFactory:
+        def start_trial(self, _trial_id):
+            return BrokenRecorder()
+
+    class BrokenDisconnectRobot(_Robot):
+        def disconnect(self):
+            super().disconnect()
+            raise RuntimeError("robot disconnect failed")
+
+    def interrupt_trial(*_args, **_kwargs):
+        raise signal
+
+    robot = BrokenDisconnectRobot()
+    with pytest.raises(KeyboardInterrupt) as raised:
+        execute_phase(
+            _permit("shakedown"),
+            _candidate(),
+            runtime_factory=lambda _candidate: _Runtime(),
+            robot_factory=lambda _permit: robot,
+            evidence_factory=BrokenEvidenceFactory(),
+            operator=_Operator(),
+            safety_monitor=_Monitor(),
+            trial_runner=interrupt_trial,
+        )
+
+    assert raised.value is signal
+    assert robot.disconnects == 1
+    notes = getattr(signal, "__notes__", [])
+    assert any("trial evidence cleanup also failed" in note for note in notes)
+    assert any("execution cleanup also failed" in note for note in notes)
+
+
 def test_motion_permit_is_consumed_after_one_execution_attempt() -> None:
     permit = _permit("hold")
     robot = _Robot()
@@ -589,6 +629,291 @@ def test_feedback_read_exception_keeps_reserved_frames_and_sent_action() -> None
     assert row["feedback_check"]["passed"] is False
     assert row["feedback_check"]["receipt_violations"] == ["feedback_read_failed"]
     assert recorder.terminal[0]["actions_sent"] == 1
+
+
+def test_ambiguous_sdk_write_keeps_frames_without_claiming_a_sent_action() -> None:
+    robot = _Robot()
+    attempted = []
+
+    def fail_inside_sdk_call(action):
+        attempted.append(dict(action))
+        before = {key: (50.0 if key == "gripper.pos" else 0.0) for key in ACTION_KEYS}
+        receipt = SimpleNamespace(
+            proposed=dict(action),
+            attempted=dict(action),
+            feedback_before=before,
+            attempt_sequence=1,
+            previous_command_sequence=0,
+            previous_feedback_received_ns=0,
+            control_started_ns=2,
+            prewrite_received_ns=3,
+            write_started_ns=4,
+            write_failed_ns=5,
+            minimum_observable_progress={joint: 0.01 for joint in JOINTS},
+            write_error="OSError: serial reply lost",
+            write_outcome="unknown",
+        )
+        robot.last_receipt = receipt
+        error = RuntimeError("physical write outcome is unknown")
+        error.write_outcome_unknown = True
+        error.action_receipt = receipt
+        raise error
+
+    robot.send_action = fail_inside_sdk_call
+    recorder = _Recorder()
+    result = run_control_trial(
+        _permit(),
+        _candidate(),
+        robot,
+        _Runtime(),
+        recorder,
+        _Operator(),
+        _Monitor(),
+        index=0,
+        trial_id="trial",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=lambda: 1.0,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=lambda seconds: None,
+    )
+
+    assert result.safety_events == ("feedback_loss",)
+    assert result.actions == 0
+    assert len(attempted) == 1
+    reservation = recorder.reservations[0]
+    assert reservation.cancelled is False
+    assert len(reservation.rows) == 1
+    row = reservation.rows[0]
+    assert row["write_outcome"] == "unknown"
+    assert row["attempted_action"] == attempted[0]
+    assert row["sent_action"] is None
+    assert row["feedback_action"] is None
+    assert row["feedback_check"]["passed"] is False
+    assert row["feedback_check"]["receipt_violations"] == [
+        "sdk_write_outcome_unknown"
+    ]
+    assert recorder.terminal[0]["actions_sent"] == 0
+    assert recorder.terminal[0]["action_attempts"] == 1
+    assert recorder.terminal[0]["ambiguous_write_attempts"] == 1
+    assert result.replans == 0
+    assert result.inference_latency_ms == ()
+    assert result.control_latency_ms == ()
+
+
+def test_invalid_ambiguous_receipt_cannot_replace_known_attempted_action() -> None:
+    robot = _Robot()
+
+    def fail_inside_sdk_call(action):
+        forged = dict(action)
+        forged["Motor_0.pos"] += 0.5
+        receipt = SimpleNamespace(
+            proposed=forged,
+            attempted=forged,
+            feedback_before={
+                key: (50.0 if key == "gripper.pos" else 0.0) for key in ACTION_KEYS
+            },
+            attempt_sequence=1,
+            previous_command_sequence=0,
+            previous_feedback_received_ns=0,
+            control_started_ns=2,
+            prewrite_received_ns=3,
+            write_started_ns=4,
+            write_failed_ns=5,
+            minimum_observable_progress={joint: 0.01 for joint in JOINTS},
+            write_error="OSError: serial reply lost",
+            write_outcome="unknown",
+        )
+        robot.last_receipt = receipt
+        error = RuntimeError("physical write outcome is unknown")
+        error.write_outcome_unknown = True
+        error.action_receipt = receipt
+        raise error
+
+    robot.send_action = fail_inside_sdk_call
+    recorder = _Recorder()
+    result = run_control_trial(
+        _permit(),
+        _candidate(),
+        robot,
+        _Runtime(),
+        recorder,
+        _Operator(),
+        _Monitor(),
+        index=0,
+        trial_id="trial",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=lambda: 1.0,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=lambda seconds: None,
+    )
+
+    row = recorder.reservations[0].rows[0]
+    assert result.actions == 0
+    assert row["attempted_action"] == row["proposed_action"]
+    assert row["attempted_action"]["Motor_0.pos"] == 0.0
+    assert row["feedback_check"]["receipt_attempted_action"]["Motor_0.pos"] == 0.5
+    assert "invalid_ambiguous_write_receipt" in row["feedback_check"][
+        "receipt_violations"
+    ]
+
+
+def test_typed_confirmed_write_with_malformed_receipt_keeps_frames() -> None:
+    robot = _Robot()
+
+    def send_then_fail(action):
+        robot.writes.append(dict(action))
+        robot.last_receipt = SimpleNamespace(command_sequence="damaged")
+        error = RuntimeError("feedback failed after confirmed write")
+        error.write_outcome_confirmed = True
+        error.action_receipt = robot.last_receipt
+        raise error
+
+    robot.send_action = send_then_fail
+    recorder = _Recorder()
+    result = run_control_trial(
+        _permit(),
+        _candidate(),
+        robot,
+        _Runtime(),
+        recorder,
+        _Operator(),
+        _Monitor(),
+        index=0,
+        trial_id="trial",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=lambda: 1.0,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=lambda seconds: None,
+    )
+
+    reservation = recorder.reservations[0]
+    assert result.actions == 1
+    assert reservation.cancelled is False
+    assert reservation.rows[0]["sent_action"] == robot.writes[0]
+    assert reservation.rows[0]["feedback_check"]["receipt_violations"] == [
+        "invalid_post_write_failure_receipt"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "signal"),
+    [
+        ("unknown", KeyboardInterrupt("operator stop")),
+        ("confirmed", SystemExit(23)),
+    ],
+)
+def test_process_control_after_sdk_boundary_keeps_frames_and_escapes(
+    outcome: str,
+    signal: BaseException,
+) -> None:
+    robot = _Robot()
+
+    def interrupt_after_sdk_boundary(action):
+        receipt = SimpleNamespace()
+        robot.last_receipt = receipt
+        signal.action_receipt = receipt
+        if outcome == "unknown":
+            signal.write_outcome_unknown = True
+        else:
+            signal.write_outcome_confirmed = True
+        raise signal
+
+    robot.send_action = interrupt_after_sdk_boundary
+    recorder = _Recorder()
+    with pytest.raises(type(signal)) as raised:
+        run_control_trial(
+            _permit(),
+            _candidate(),
+            robot,
+            _Runtime(),
+            recorder,
+            _Operator(),
+            _Monitor(),
+            index=0,
+            trial_id="trial",
+            condition=SimpleNamespace(to_dict=lambda: {}),
+            clock=lambda: 1.0,
+            clock_ns=lambda: 1_000_000_000,
+            sleep=lambda seconds: None,
+        )
+
+    assert raised.value is signal
+    if isinstance(signal, SystemExit):
+        assert raised.value.code == 23
+    reservation = recorder.reservations[0]
+    assert reservation.cancelled is False
+    assert len(reservation.rows) == 1
+    assert reservation.rows[0]["write_outcome"] == outcome
+    if outcome == "unknown":
+        assert reservation.rows[0]["sent_action"] is None
+    else:
+        assert reservation.rows[0]["sent_action"] is not None
+
+
+def test_prewrite_process_control_cancels_reservation_and_escapes() -> None:
+    robot = _Robot()
+    signal = KeyboardInterrupt("operator stop before SDK write")
+
+    def interrupt_before_sdk_boundary(_action):
+        raise signal
+
+    robot.send_action = interrupt_before_sdk_boundary
+    recorder = _Recorder()
+    with pytest.raises(KeyboardInterrupt) as raised:
+        run_control_trial(
+            _permit(),
+            _candidate(),
+            robot,
+            _Runtime(),
+            recorder,
+            _Operator(),
+            _Monitor(),
+            index=0,
+            trial_id="trial",
+            condition=SimpleNamespace(to_dict=lambda: {}),
+            clock=lambda: 1.0,
+            clock_ns=lambda: 1_000_000_000,
+            sleep=lambda seconds: None,
+        )
+
+    assert raised.value is signal
+    assert recorder.reservations[0].cancelled is True
+    assert recorder.reservations[0].rows == []
+
+
+def test_definite_prewrite_failure_releases_reserved_frames() -> None:
+    robot = _Robot()
+
+    def fail_before_sdk_call(_action):
+        raise OSError("prewrite monitor unavailable")
+
+    robot.send_action = fail_before_sdk_call
+    recorder = _Recorder()
+    result = run_control_trial(
+        _permit(),
+        _candidate(),
+        robot,
+        _Runtime(),
+        recorder,
+        _Operator(),
+        _Monitor(),
+        index=0,
+        trial_id="trial",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=lambda: 1.0,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=lambda seconds: None,
+    )
+
+    assert result.safety_events == ("feedback_loss",)
+    assert result.actions == 0
+    reservation = recorder.reservations[0]
+    assert reservation.cancelled is True
+    assert reservation.rows == []
+    assert recorder.terminal[0]["actions_sent"] == 0
+    assert recorder.terminal[0]["action_attempts"] == 0
+    assert recorder.terminal[0]["ambiguous_write_attempts"] == 0
+    assert "before the SDK motor-write call" in recorder.terminal[0]["detail"]
 
 
 def test_confirmed_write_with_invalid_receipt_keeps_reserved_evidence() -> None:
