@@ -44,6 +44,8 @@ RATE_TOLERANCE_MS = 5.0
 CONTROL_DEADLINE_MS = 300.0
 OBSERVATION_DEADLINE_MS = 100.0
 TRIAL_DURATION_S = 60.0
+LOCAL_ACT_DURATION_S = 10.0
+LOCAL_ACT_WARMUP_CALLS = 2
 STABLE_SUCCESS_S = 3.0
 
 
@@ -199,6 +201,8 @@ class PhaseResult:
     def status(self) -> str:
         if self.terminal_event is None:
             return "completed"
+        if self.phase == "local_act":
+            return "unsafe_local_act"
         return "unsafe_shakedown"
 
 
@@ -260,14 +264,26 @@ def execute_phase(
     clock_ns: Callable[[], int] = time.perf_counter_ns,
     sleep: Callable[[float], None] = time.sleep,
     trial_runner: Callable[..., TrialResult] | None = None,
+    local_act_duration_s: float = LOCAL_ACT_DURATION_S,
 ) -> PhaseResult:
     """Execute exactly one authorized phase and always tear the robot down."""
 
     assert_permit_current(permit)
     if candidate.bundle_id != permit.candidate_bundle_id or candidate.policy != permit.policy:
         raise SafetyGateError("motion permit belongs to another accepted policy candidate")
-    if permit.phase not in {"hold", "shakedown", "scored"}:
+    if permit.phase not in {"hold", "shakedown", "scored", "local_act"}:
         raise SafetyGateError("motion permit names an unsupported phase")
+    if (
+        isinstance(local_act_duration_s, bool)
+        or not isinstance(local_act_duration_s, int | float)
+        or not math.isfinite(float(local_act_duration_s))
+        or not 0 < float(local_act_duration_s) <= TRIAL_DURATION_S
+    ):
+        raise SafetyGateError("local ACT duration must be between 0 and 60 seconds")
+    if permit.phase == "local_act" and permit.local_act_duration_s != float(
+        local_act_duration_s
+    ):
+        raise SafetyGateError("local ACT duration differs from the armed motion permit")
 
     started_at = _utc_now()
     begin_permit_execution(permit)
@@ -297,9 +313,33 @@ def execute_phase(
         # Loading a model is intentionally after the permit and after the
         # reviewed robot and cameras have passed their read-only startup checks.
         runtime = runtime_factory(candidate)
-        conditions = (
-            shakedown_conditions() if permit.phase == "shakedown" else canonical_scored_conditions()
-        )
+        if permit.phase == "local_act":
+            # The reviewed Titan Xp can exceed the write deadline on the first
+            # CUDA call. Warm up without a motor command before asking the
+            # operator to START; the normal per-trial reset follows START.
+            receipt = robot.capture_observation()
+            freshness = _camera_freshness(receipt, clock_ns())
+            if (
+                receipt.observation_read_ms > OBSERVATION_DEADLINE_MS
+                or any(
+                    age > OBSERVATION_DEADLINE_MS
+                    for age in freshness["frame_age_ms"].values()
+                )
+            ):
+                raise SafetyGateError("local ACT warmup observation exceeded 100 ms")
+            warmup = prepare_observation(
+                candidate.spec,
+                _policy_observation(receipt.observation),
+            )
+            runtime.reset()
+            for _ in range(LOCAL_ACT_WARMUP_CALLS):
+                finite_action(runtime.infer(warmup))
+        if permit.phase == "shakedown":
+            conditions = shakedown_conditions()
+        elif permit.phase == "scored":
+            conditions = canonical_scored_conditions()
+        else:
+            conditions = (TrialCondition("local_act_01", "local_act"),)
         run = trial_runner or run_control_trial
         results: list[TrialResult] = []
         for index, condition in enumerate(conditions):
@@ -313,6 +353,16 @@ def execute_phase(
             runtime.reset()
             recorder = evidence_factory.start_trial(trial_id)
             try:
+                run_arguments = {
+                    "index": index,
+                    "trial_id": trial_id,
+                    "condition": condition,
+                    "clock": clock,
+                    "clock_ns": clock_ns,
+                    "sleep": sleep,
+                }
+                if permit.phase == "local_act":
+                    run_arguments["duration_s"] = float(local_act_duration_s)
                 result = run(
                     permit,
                     candidate,
@@ -321,12 +371,7 @@ def execute_phase(
                     recorder,
                     operator,
                     safety_monitor,
-                    index=index,
-                    trial_id=trial_id,
-                    condition=condition,
-                    clock=clock,
-                    clock_ns=clock_ns,
-                    sleep=sleep,
+                    **run_arguments,
                 )
             except BaseException as exc:
                 try:
@@ -404,10 +449,21 @@ def run_control_trial(
     clock: Callable[[], float] = time.perf_counter,
     clock_ns: Callable[[], int] = time.perf_counter_ns,
     sleep: Callable[[float], None] = time.sleep,
+    duration_s: float | None = None,
 ) -> TrialResult:
-    """Run one canonical 60-second control loop, aborting before unsafe writes."""
+    """Run one bounded control loop, aborting before unsafe writes."""
 
     assert_permit_current(permit)
+    if duration_s is None:
+        duration_s = TRIAL_DURATION_S
+    if (
+        isinstance(duration_s, bool)
+        or not isinstance(duration_s, int | float)
+        or not math.isfinite(float(duration_s))
+        or not 0 < float(duration_s) <= TRIAL_DURATION_S
+    ):
+        raise ValidationError("control duration must be between 0 and 60 seconds")
+    duration_s = float(duration_s)
     started_wall = datetime.now(UTC)
     started = clock()
     next_tick = started
@@ -430,7 +486,7 @@ def run_control_trial(
     )
 
     try:
-        for step in range(round(TRIAL_DURATION_S * TARGET_HZ)):
+        for step in range(round(duration_s * TARGET_HZ)):
             delay = next_tick - clock()
             if delay > 0:
                 sleep(delay)
@@ -481,8 +537,17 @@ def run_control_trial(
 
             proposed_map = dict(zip(ACTION_KEYS, proposed, strict=True))
             state = _state_from_observation(observation_receipt.observation)
+            commanded_map = proposed_map
+            bounded_from_proposal = False
+            if permit.phase == "local_act":
+                commanded_map = _bounded_local_act_action(
+                    proposed_map,
+                    state,
+                    permit,
+                )
+                bounded_from_proposal = commanded_map != proposed_map
             try:
-                validate_action(proposed_map, state, permit)
+                validate_action(commanded_map, state, permit)
             except SafetyGateError as exc:
                 raise _Abort("clamped_action", f"action would require clamping: {exc}") from exc
 
@@ -501,7 +566,7 @@ def run_control_trial(
             if reservation is None:
                 raise _Abort("safety_abort", "evidence queue has no capacity")
             try:
-                sent = robot.send_action(proposed_map)
+                sent = robot.send_action(commanded_map)
             except SafetyGateError as exc:
                 reservation.cancel()
                 raise _Abort("clamped_action", f"write-side safety check rejected action: {exc}") from exc
@@ -509,7 +574,7 @@ def run_control_trial(
                 failed_write = _write_failure_evidence(
                     exc,
                     robot.last_receipt,
-                    proposed_map,
+                    commanded_map,
                     expected_sequence=previous_command_sequence + 1,
                     expected_previous_feedback_received_ns=previous_feedback_received_ns,
                 )
@@ -571,8 +636,13 @@ def run_control_trial(
                     "rate_tolerance_ms": RATE_TOLERANCE_MS,
                     "period_ms": period_ms,
                     "rate_passed": period_ms <= 1_000.0 / TARGET_HZ + RATE_TOLERANCE_MS,
-                    "limit_check": _limit_receipt(permit, state, proposed_map),
+                    "limit_check": _limit_receipt(permit, state, commanded_map),
                 }
+                if permit.phase == "local_act":
+                    failure_row.update(
+                        commanded_action=commanded_map,
+                        bounded_from_proposal=bounded_from_proposal,
+                    )
                 try:
                     reservation.commit(failure_row)
                 except Exception as evidence_error:
@@ -613,7 +683,7 @@ def run_control_trial(
                 "replan": step % 10 == 0,
                 "state": state,
                 "proposed_action": proposed_map,
-                "attempted_action": proposed_map,
+                "attempted_action": commanded_map,
                 "sent_action": sent,
                 "write_outcome": "confirmed",
                 "feedback_action": None,
@@ -626,14 +696,19 @@ def run_control_trial(
                 "rate_tolerance_ms": RATE_TOLERANCE_MS,
                 "period_ms": period_ms,
                 "rate_passed": rate_passed,
-                "limit_check": _limit_receipt(permit, state, proposed_map),
+                "limit_check": _limit_receipt(permit, state, commanded_map),
             }
+            if permit.phase == "local_act":
+                row.update(
+                    commanded_action=commanded_map,
+                    bounded_from_proposal=bounded_from_proposal,
+                )
             try:
                 feedback = _feedback_after(robot.last_receipt)
                 row["feedback_action"] = feedback
                 feedback_check = _feedback_receipt(
                     permit,
-                    proposed_map,
+                    commanded_map,
                     feedback,
                     robot.last_receipt,
                     expected_sequence=previous_command_sequence + 1,
@@ -686,7 +761,7 @@ def run_control_trial(
             if not rate_passed:
                 raise _Abort("deadline_miss", "control rate missed the reviewed tolerance")
             next_tick += TARGET_PERIOD_S
-        remaining = started + TRIAL_DURATION_S - clock()
+        remaining = started + duration_s - clock()
         if remaining > 0:
             sleep(remaining)
         control_completed_duration = max(clock() - started, 0.0)
@@ -751,6 +826,32 @@ def _state_from_observation(value: Mapping[str, Any]) -> dict[str, float]:
         return {key: _finite(value[key], f"state {key}") for key in ACTION_KEYS}
     except KeyError as exc:
         raise _Abort("feedback_loss", f"state feedback is missing {exc.args[0]}") from exc
+
+
+def _bounded_local_act_action(
+    proposed: Mapping[str, float],
+    current: Mapping[str, float],
+    permit: MotionPermit,
+) -> dict[str, float]:
+    """Reproduce the historical ACT target bound, visibly and locally.
+
+    The shared eight-policy path continues to reject any action that would need
+    clamping. Only the explicit local compatibility phase first bounds the raw
+    ACT proposal to reviewed absolute limits and then to the permit-scaled
+    per-step envelope. Evidence retains both proposal and commanded target.
+    """
+
+    result: dict[str, float] = {}
+    for key in ACTION_KEYS:
+        joint = key.removesuffix(".pos")
+        if key not in proposed or key not in current:
+            raise _Abort("malformed_action", f"local ACT action lacks {key}")
+        lower, upper = permit.absolute_limits[joint]
+        desired = min(float(upper), max(float(lower), float(proposed[key])))
+        step = float(permit.max_step_deltas[joint]) * permit.speed_scale
+        present = float(current[key])
+        result[key] = min(present + step, max(present - step, desired))
+    return result
 
 
 def _feedback_after(receipt: Any) -> dict[str, float]:
@@ -1200,6 +1301,8 @@ def _utc_now() -> str:
 __all__ = [
     "ACTION_KEYS",
     "CONTROL_DEADLINE_MS",
+    "LOCAL_ACT_DURATION_S",
+    "LOCAL_ACT_WARMUP_CALLS",
     "OBSERVATION_DEADLINE_MS",
     "RATE_TOLERANCE_MS",
     "SAFETY_EVENTS",

@@ -97,6 +97,50 @@ remain incomplete; use only the exact successful path printed by the command.
 
 ## Supervised rollout and inference
 
+### Independent Repo-A ACT inference
+
+The previously deployed ACT checkpoint has a separate Repo-A-owned path and
+does not require a Repo-B candidate, receipt, or rollout session:
+
+```bash
+conda activate lerobot
+sg dialout -c 'CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run'
+```
+
+The current PC-A login needs the `sg dialout` wrapper for the reviewed serial
+device. A new login whose `id` already includes `dialout` can run the inner
+`CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run` command directly.
+Serial and both camera paths are checked before ARM and before any online
+intent is written.
+
+Defaults bind `/home/yz/models/act_viola_val20_step080000`, the frozen
+34-episode dataset, and `config/local_act_setup.json`. The default run is 10
+seconds at the shared 30 Hz safety loop and 25% of the reviewed per-step limit.
+The operator must first physically test the E-stop, then type the printed
+`ARM ... ESTOP TESTED` and `START ...` phrases on a real TTY. No Repo-B action
+is involved. Evidence is local-only plus online W&B and is never presented as
+a Repo-B `READY` bundle or benchmark result.
+
+Use `viola-ops act run --help` for optional operator, trial, duration, path, and
+evidence-root arguments. Alternate checkpoint paths are useful only for an
+identical copy: different bytes are rejected.
+
+Raw ACT outputs are recorded separately from the exact commanded actions. The
+local compatibility transform clamps first to reviewed absolute limits, then
+to the 25%-scaled per-step envelope; the shared benchmark path remains strict
+and rejects rather than transforms out-of-envelope proposals.
+
+If the command retains a failure after motion or an online outage, publish that
+same terminal without repeating motion:
+
+```bash
+viola-ops act recover-failure --attempt <printed-attempt-directory>
+```
+
+This recovery is hardware-free and creates no `READY` handoff.
+
+### Shared eight-policy benchmark rollout
+
 ```bash
 viola-ops policy execute \
   --session ~/.local/share/viola/handoffs/v1/rollout_session/<session-id> \
@@ -123,8 +167,8 @@ viola-ops policy execute \
   --wandb-entity <entity>
 ```
 
-Later phases additionally require accepted predecessor evidence. Run
-`viola-ops policy execute --help`. There is no valid motion command before a
+Later shared benchmark phases additionally require accepted predecessor evidence. Run
+`viola-ops policy execute --help`. There is no valid shared benchmark motion command before a
 blocker-free accepted live session, reviewed setup/current E-stop evidence,
 online intent receipt, and exact interactive operator action all pass.
 Only a post-frame unsafe shakedown whose retained traces and videos pass the

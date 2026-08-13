@@ -14,8 +14,8 @@ pass at the time of use.
 ## Safety boundary
 
 A policy candidate permits disconnected work only. It cannot move the robot.
-Motion is possible only through `viola-ops policy execute`, after all of these
-conditions pass:
+Benchmark motion is possible only through `viola-ops policy execute`, after all
+of these conditions pass:
 
 - Repo A has locally accepted the exact policy candidate and Repo-B-produced
   `rollout_session`.
@@ -31,8 +31,19 @@ conditions pass:
 - The named operator uses a real TTY to type the session-specific `ARM ...`
   challenge and explicitly starts every trial.
 
-There is no `--yes`, environment-variable bypass, checkpoint override, task
-override, or piped-input arming path. The old inference, calibration,
+Repo A also owns one deliberately narrow, independent compatibility path for
+the exact ACT checkpoint that was deployed before the two-PC benchmark
+workflow existed: `viola-ops act run`. It does not need a Repo-B candidate,
+receipt, or rollout session. It still refuses motion unless the checkpoint and
+dataset hashes, versioned local setup, current clean revision, Python/LeRobot
+environment, online W&B intent, current E-stop assertion, absolute/step limits,
+and real-TTY `ARM ... ESTOP TESTED` and `START ...` actions all pass. Its output
+is clearly marked `local_only`, never a Repo-B `READY` handoff or benchmark
+result.
+
+There is no `--yes`, environment-variable bypass, task override, or piped-input
+arming path. The local ACT command accepts a path only so it can prove the bytes
+equal the one reviewed deployment; arbitrary checkpoints are rejected. The old inference, calibration,
 teleoperation, recording, and ROS hardware launchers are retired and exit before
 opening a device. Software is not an E-stop.
 
@@ -169,7 +180,7 @@ recaptures positions.
 - `shadow --mode live-soak` opens only both reviewed cameras, uses a signed
   frozen seven-axis state, records both videos, and proposes at least 9,000
   actions over at least 300 wall seconds. It never constructs a robot or motor.
-- `execute` is the sole policy-motion entrypoint. It validates every gate before
+- `execute` is the shared benchmark policy-motion entrypoint. It validates every gate before
   hardware-capable imports, records a finished online intent run, requires TTY
   operator actions, executes only the canonical hold → two 25%-rate shakedowns
   → ten scored trials, and retains complete action traces plus both encoded
@@ -204,6 +215,53 @@ portable handoff.
 Every verification or shadow invocation creates a fresh immutable attempt
 directory. Failed attempts remain incomplete and are never overwritten; pass
 forward only the exact successful evidence path printed by the command.
+
+### `viola-ops act run`
+
+Runs the previously deployed ACT step-80,000 checkpoint directly from Repo A.
+This is the independent inference command: it does not wait for Repo B and does
+not accept any Repo-B handoff. The default duration is 10 seconds; the policy is
+loaded from exact reviewed local bytes with a recorded 100-to-10 action-queue
+deployment overlay through public LeRobot APIs. For compatibility with the
+historical runner, each raw ACT proposal is first bounded to the reviewed
+absolute range and then to the 25%-scaled per-step envelope; evidence records
+both the raw proposal and the exact commanded target.
+
+From an operator-controlled terminal, after physically testing the E-stop and
+clearing the workspace:
+
+```bash
+conda activate lerobot
+sg dialout -c 'CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run'
+```
+
+PC A's current login has not inherited its configured `dialout` membership;
+the wrapper above preserves the `lerobot` environment and real terminal while
+granting access to the reviewed serial device. After a fresh login that already
+shows `dialout` in `id`, the inner command is equivalent:
+`CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run`.
+The command checks serial and camera access before asking for ARM or writing a
+W&B intent.
+
+The command prints the exact session-specific `ARM ... ESTOP TESTED` phrase and
+then the exact trial-specific `START ...` phrase. These are physical operator
+actions, not Repo-A or Repo-B approvals. Optional human-readable overrides are
+available through `viola-ops act run --help`, including `--operator`, `--trial`,
+and `--duration-seconds`; a checkpoint override still has to match the reviewed
+step-80,000 inventory byte for byte.
+
+If motion or final W&B publication fails, the attempt is never repeated in
+place. The command retains a bound `LOCAL_ACT_FAILURE.json`, tries to publish a
+deterministic failure run, and prints an upload-only recovery command. If the
+network was unavailable, run that exact command, for example:
+
+```bash
+viola-ops act recover-failure \
+  --attempt /mnt/nas02/yz/starai/evidence/v1/local-act/<session>/<trial>
+```
+
+Recovery revalidates immutable failure/intent/partial-motion evidence and the
+clean revision, but never prompts, loads the model, or opens a device.
 
 ### `viola-ops report inspect`
 
@@ -272,8 +330,10 @@ policy-specific and explicitly excludes every shared hardware, control,
 safety, evidence, and W&B component. Repo A verifies the attached outcome and
 attestation bytes before it can issue a permit.
 
-If an accepted blocker-free rollout session does not yet exist, there is no
-valid inference command that moves the robot.
+If an accepted blocker-free rollout session does not yet exist, no shared
+eight-policy benchmark inference may move the robot. The separately documented
+local ACT compatibility run remains local-only and cannot substitute for that
+benchmark evidence chain.
 
 ## Disconnected verification
 

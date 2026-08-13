@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "local-act-manual-reset-v1",
+  "automatic_reset": false,
+  "automatic_return": false,
+  "instructions": [
+    "Keep physical ownership of the E-stop.",
+    "Place the blue and red cubes at their reviewed nominal start positions.",
+    "Keep people and loose objects outside the robot workspace.",
+    "Type the trial-specific START phrase only after the workspace is clear."
+  ]
+}

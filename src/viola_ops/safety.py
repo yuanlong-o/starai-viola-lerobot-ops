@@ -28,6 +28,7 @@ from viola_handoff import (
     VerifiedBundle,
     canonical_json_bytes,
     inspect_bundle,
+    inventory_root,
     require_active_canonical_source,
     resolve_bundle,
 )
@@ -91,6 +92,7 @@ class MotionPermit:
     reset_protocol_path: Path = Path()
     executor_entrypoint: Path = Path()
     camera_configs: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    local_act_duration_s: float = 0.0
     _use: _PermitUse = field(default_factory=_PermitUse, repr=False, compare=False)
 
     def allows(self, *, session_id: str, phase: str, trial: str) -> bool:
@@ -115,6 +117,41 @@ class GateRequest:
     handoff_root: Path
     prior_hold_bundle: Path | None = None
     prior_shakedown_bundle: Path | None = None
+    now: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LocalActCheckpointBinding:
+    """Exact local ACT bytes approved for one Repo-A-only inference path.
+
+    This is deliberately not a ``policy_candidate`` handoff.  Its identity is
+    derived from the complete checkpoint inventory, frozen dataset identity,
+    and explicit ten-action deployment overlay, so it cannot be confused with
+    Repo-B acceptance.
+    """
+
+    root: Path
+    inventory: Mapping[str, Any]
+    model_sha256: str
+    dataset_release_id: str
+    dataset_inventory_sha256: str
+    dataset_metadata_inventory_sha256: str
+    deployment_action_steps: int = 10
+
+
+@dataclass(frozen=True, slots=True)
+class LocalActGateRequest:
+    """Reviewed local inputs needed to issue an ACT commissioning permit."""
+
+    setup: ResolvedSetup
+    checkpoint: LocalActCheckpointBinding
+    operator: str
+    estop_tested_at: datetime
+    estop_attestation_sha256: str
+    estop_passed: bool
+    trial: str
+    duration_s: float
+    repository_root: Path
     now: datetime | None = None
 
 
@@ -147,6 +184,20 @@ class _ValidatedGate:
     operator: str
     policy: str
     speed_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedLocalActGate:
+    """Immutable projection of one fully rechecked local ACT authority."""
+
+    checked_at: datetime
+    session_id: str
+    session_binding_id: str
+    candidate_id: str
+    setup: ResolvedSetup
+    operator: str
+    estop_tested_at: datetime
+    duration_s: float
 
 
 def authorize_motion(
@@ -219,11 +270,124 @@ def authorize_motion(
     )
 
 
+def authorize_local_act_motion(
+    request: LocalActGateRequest,
+    *,
+    identity: RuntimeIdentity,
+    input_stream: TextIO | None = None,
+    terminal_check: Callable[[TextIO], bool] | None = None,
+) -> MotionPermit:
+    """Issue one local ACT commissioning permit after an explicit E-stop phrase.
+
+    Repo A owns this narrow authorization.  It does not create or impersonate
+    a Repo-B candidate, rollout session, receipt, or READY handoff.  The
+    resulting permit enters the same one-use execution state machine as the
+    two-PC path.
+    """
+
+    checked = _validate_local_act_gate(request, identity=identity)
+    owns_stream = input_stream is None
+    stream = input_stream if input_stream is not None else _open_operator_terminal()
+    checker = terminal_check or _is_terminal
+    try:
+        if not checker(stream):
+            raise SafetyGateError("operator confirmation requires an interactive terminal")
+        challenge = local_act_operator_challenge(
+            checked.session_id,
+            request.trial,
+            checked.duration_s,
+        )
+        stream.write(f"Type exactly: {challenge}\n> ")
+        stream.flush()
+        response = stream.readline()
+    except (OSError, ValueError) as exc:
+        raise SafetyGateError(f"could not read operator confirmation: {exc}") from exc
+    finally:
+        if owns_stream:
+            stream.close()
+    if response.rstrip("\r\n") != challenge:
+        raise SafetyGateError("operator confirmation did not match the local ACT challenge")
+
+    setup = checked.setup
+    nonce_material = (
+        f"{checked.session_binding_id}:{checked.candidate_id}:local_act:"
+        f"{request.trial}:{checked.operator}:{checked.checked_at.isoformat()}:"
+        f"{os.getpid()}:{socket.gethostname()}"
+    )
+    return MotionPermit(
+        session_id=checked.session_id,
+        session_bundle_id=checked.session_binding_id,
+        candidate_bundle_id=checked.candidate_id,
+        policy="act",
+        phase="local_act",
+        trial=request.trial,
+        operator=checked.operator,
+        setup_hashes=dict(setup.setup_hashes),
+        absolute_limits=dict(setup.absolute_limits),
+        max_step_deltas=dict(setup.max_step_deltas),
+        speed_scale=0.25,
+        issued_at=checked.checked_at,
+        estop_tested_at=checked.estop_tested_at,
+        _nonce=hashlib.sha256(nonce_material.encode()).hexdigest(),
+        _authority=_PERMIT_AUTHORITY,
+        setup_id=setup.setup_id,
+        robot_port=setup.robot_port,
+        calibration_path=setup.calibration_path,
+        reset_protocol_path=setup.reset_protocol_path,
+        executor_entrypoint=setup.executor_entrypoint,
+        camera_configs={name: dict(value) for name, value in setup.camera_configs.items()},
+        local_act_duration_s=checked.duration_s,
+    )
+
+
+def revalidate_local_act_motion(
+    request: LocalActGateRequest,
+    permit: MotionPermit,
+    *,
+    identity: RuntimeIdentity,
+    allow_consumed: bool = False,
+) -> tuple[str, str]:
+    """Recheck local ACT authority without asking the operator to arm again.
+
+    Call this at every boundary where the unified executor currently calls
+    :func:`revalidate_motion`.  It re-inventories the checkpoint, reproduces
+    the setup hashes, verifies the current clean runtime, and checks E-stop
+    freshness before returning the local session and candidate identities.
+    """
+
+    if allow_consumed:
+        _assert_consumed_local_act_permit(permit)
+    else:
+        assert_permit_current(permit)
+    checked = _validate_local_act_gate(request, identity=identity)
+    _check_local_act_permit_binding(permit, request, checked)
+    # Hashing a checkpoint can take long enough for a nearly-expired E-stop to
+    # cross its boundary.  Keep freshness as the final validation as well.
+    if allow_consumed:
+        _assert_consumed_local_act_permit(permit)
+    else:
+        assert_permit_current(permit)
+    return checked.session_binding_id, checked.candidate_id
+
+
+def _assert_consumed_local_act_permit(permit: MotionPermit) -> None:
+    """Require a genuine local permit whose one execution has torn down."""
+
+    if not isinstance(permit, MotionPermit) or permit._authority is not _PERMIT_AUTHORITY:
+        raise SafetyGateError("post-execution evidence requires an issued motion permit")
+    if permit.phase != "local_act":
+        raise SafetyGateError("post-execution evidence requires a local ACT permit")
+    with permit._use.lock:
+        if permit._use.state != "consumed":
+            raise SafetyGateError("local ACT execution has not completed permit teardown")
+
+
 def revalidate_motion(
     request: GateRequest,
     permit: MotionPermit,
     *,
     identity: RuntimeIdentity,
+    allow_consumed: bool = False,
 ) -> tuple[VerifiedBundle, VerifiedBundle]:
     """Recheck live authority without asking the operator to arm a second time.
 
@@ -233,14 +397,32 @@ def revalidate_motion(
     signed into the reviewed setup.
     """
 
-    assert_permit_current(permit)
+    if allow_consumed:
+        _assert_consumed_shared_permit(permit)
+    else:
+        assert_permit_current(permit)
     checked = _validate_gate(request)
     _check_permit_binding(permit, request, checked)
     _check_runtime_identity(identity, checked.setup)
     # The validation above can take time while hashing setup artifacts and
     # reopening canonical sources.  Make E-stop/permit freshness the last gate.
-    assert_permit_current(permit)
+    if allow_consumed:
+        _assert_consumed_shared_permit(permit)
+    else:
+        assert_permit_current(permit)
     return checked.session, checked.candidate
+
+
+def _assert_consumed_shared_permit(permit: MotionPermit) -> None:
+    """Require a genuine shared permit whose one execution has torn down."""
+
+    if not isinstance(permit, MotionPermit) or permit._authority is not _PERMIT_AUTHORITY:
+        raise SafetyGateError("post-execution evidence requires an issued motion permit")
+    if permit.phase not in PHASES:
+        raise SafetyGateError("post-execution evidence requires a shared execution permit")
+    with permit._use.lock:
+        if permit._use.state != "consumed":
+            raise SafetyGateError("shared execution has not completed permit teardown")
 
 
 def _validate_gate(request: GateRequest) -> _ValidatedGate:
@@ -328,6 +510,277 @@ def _validate_gate(request: GateRequest) -> _ValidatedGate:
     )
 
 
+def _validate_local_act_gate(
+    request: LocalActGateRequest,
+    *,
+    identity: RuntimeIdentity,
+) -> _ValidatedLocalActGate:
+    """Reproduce every local binding before issuing or reusing a permit."""
+
+    if not isinstance(request, LocalActGateRequest):
+        raise SafetyGateError("local ACT authorization requires a local gate request")
+    current_time = _utc_now(request.now)
+    operator = _nonempty(request.operator, "local ACT operator")
+    if request.estop_passed is not True:
+        raise SafetyGateError("local ACT requires a passed physical E-stop test")
+    estop_tested_at = _utc_now(request.estop_tested_at)
+    if estop_tested_at > current_time:
+        raise SafetyGateError("local ACT E-stop evidence is future-dated")
+    if current_time - estop_tested_at >= ESTOP_MAX_AGE:
+        raise SafetyGateError("local ACT E-stop evidence is 24 hours old or older")
+    estop_digest = _digest(
+        request.estop_attestation_sha256,
+        "local ACT E-stop attestation",
+    )
+    _safe_local_component(request.trial, "local ACT trial")
+    duration_s = _local_act_duration(request.duration_s)
+
+    setup = _validate_local_act_setup(
+        request.setup,
+        repository_root=request.repository_root,
+    )
+    _check_runtime_identity(identity, setup)
+    check_current_checkout(
+        {"executor": {"repository_commit": identity.repository_commit}},
+        request.repository_root,
+    )
+    candidate_id, checkpoint_inventory = _validate_local_act_checkpoint(
+        request.checkpoint
+    )
+    entrypoint_sha256 = _sha256_file(setup.executor_entrypoint)
+    session_material = {
+        "schema_version": 1,
+        "kind": "repo_a_local_act_authorization",
+        "candidate_id": candidate_id,
+        "checkpoint_inventory_sha256": checkpoint_inventory["inventory_sha256"],
+        "deployment_action_steps": request.checkpoint.deployment_action_steps,
+        "setup_id": setup.setup_id,
+        "setup_hashes": dict(setup.setup_hashes),
+        "executor_entrypoint_sha256": entrypoint_sha256,
+        "repository_commit": identity.repository_commit,
+        "operator": operator,
+        "estop_tested_at": estop_tested_at.isoformat(),
+        "estop_attestation_sha256": estop_digest,
+        "policy": "act",
+        "phase": "local_act",
+        "duration_s": duration_s,
+        "task": CANONICAL_TASK,
+    }
+    session_binding_id = _sha256_json(session_material)
+    return _ValidatedLocalActGate(
+        checked_at=current_time,
+        session_id=f"local-act-{session_binding_id[:24]}",
+        session_binding_id=session_binding_id,
+        candidate_id=candidate_id,
+        setup=setup,
+        operator=operator,
+        estop_tested_at=estop_tested_at,
+        duration_s=duration_s,
+    )
+
+
+def _validate_local_act_checkpoint(
+    binding: LocalActCheckpointBinding,
+) -> tuple[str, dict[str, Any]]:
+    """Re-inventory and identify a local ACT checkpoint without loading it."""
+
+    if not isinstance(binding, LocalActCheckpointBinding):
+        raise SafetyGateError("local ACT requires a validated checkpoint binding")
+    if binding.deployment_action_steps != 10:
+        raise SafetyGateError("local ACT deployment must use exactly ten queued actions")
+    try:
+        expected = json.loads(canonical_json_bytes(dict(binding.inventory)))
+        actual = inventory_root(binding.root)
+    except Exception as exc:
+        raise SafetyGateError(f"cannot verify local ACT checkpoint: {exc}") from exc
+    if actual != expected:
+        raise SafetyGateError("local ACT checkpoint differs from its approved inventory")
+
+    model_sha256 = _digest(binding.model_sha256, "local ACT model")
+    dataset_release_id = _safe_local_component(
+        binding.dataset_release_id, "local ACT dataset release"
+    )
+    dataset_inventory_sha256 = _digest(
+        binding.dataset_inventory_sha256, "local ACT dataset inventory"
+    )
+    dataset_metadata_inventory_sha256 = _digest(
+        binding.dataset_metadata_inventory_sha256,
+        "local ACT dataset metadata inventory",
+    )
+
+    required = {
+        "config.json",
+        "model.safetensors",
+        "policy_preprocessor.json",
+        "policy_postprocessor.json",
+    }
+    files = {entry["path"] for entry in actual["files"]}
+    missing = sorted(required - files)
+    if missing:
+        raise SafetyGateError(f"local ACT checkpoint is missing required files: {missing}")
+    if _sha256_file(Path(binding.root) / "model.safetensors") != model_sha256:
+        raise SafetyGateError("local ACT model differs from its approved digest")
+    config = _read_local_json_object(Path(binding.root) / "config.json", "ACT config")
+    if config.get("type") != "act":
+        raise SafetyGateError("local checkpoint policy type is not ACT")
+    source_steps = config.get("n_action_steps")
+    chunk_size = config.get("chunk_size")
+    if (
+        isinstance(source_steps, bool)
+        or not isinstance(source_steps, int)
+        or source_steps <= 0
+        or isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, int)
+        or chunk_size < binding.deployment_action_steps
+    ):
+        raise SafetyGateError("local ACT checkpoint has an invalid action queue or chunk size")
+
+    candidate_material = {
+        "policy": "act",
+        "model_sha256": model_sha256,
+        "checkpoint_inventory_sha256": expected["inventory_sha256"],
+        "dataset_release_id": dataset_release_id,
+        "dataset_inventory_sha256": dataset_inventory_sha256,
+        "dataset_metadata_inventory_sha256": dataset_metadata_inventory_sha256,
+        "deployment_queue_actions": binding.deployment_action_steps,
+    }
+    return _sha256_json(candidate_material), actual
+
+
+def _validate_local_act_setup(
+    setup: ResolvedSetup,
+    *,
+    repository_root: Path,
+) -> ResolvedSetup:
+    """Reproduce a validated setup directly from its reviewed local bytes."""
+
+    if not isinstance(setup, ResolvedSetup):
+        raise SafetyGateError("local ACT requires a validated reviewed setup")
+    _safe_local_component(setup.setup_id, "local ACT setup_id")
+    if not isinstance(setup.robot_port, str) or not setup.robot_port.startswith("/dev/"):
+        raise SafetyGateError("local ACT setup must name an explicit /dev robot port")
+    if set(setup.camera_configs) != {"front", "up"}:
+        raise SafetyGateError("local ACT setup must name front and up cameras")
+    cameras: dict[str, dict[str, Any]] = {}
+    camera_paths: list[str] = []
+    for name in ("front", "up"):
+        camera = setup.camera_configs[name]
+        local_camera_fields = {
+            "type",
+            "index_or_path",
+            "width",
+            "height",
+            "fps",
+            "fourcc",
+            "warmup_s",
+        }
+        camera_fields = set(camera)
+        if camera_fields != local_camera_fields:
+            raise SafetyGateError(f"local ACT {name} camera fields differ")
+        device = camera.get("index_or_path")
+        if (
+            camera.get("type") != "opencv"
+            or (camera.get("width"), camera.get("height"), camera.get("fps"))
+            != (640, 480, 30)
+            or not isinstance(device, str)
+            or not device.startswith("/dev/")
+        ):
+            raise SafetyGateError(
+                f"local ACT {name} camera must be OpenCV 640x480 at 30 fps"
+            )
+        expected_fourcc = "MJPG" if name == "front" else "YUYV"
+        if camera.get("fourcc") != expected_fourcc or camera.get("warmup_s") != 8:
+            raise SafetyGateError(
+                f"local ACT {name} camera format/warmup differs from the reviewed rig"
+            )
+        cameras[name] = dict(camera)
+        camera_paths.append(device)
+    if len(set(camera_paths)) != 2:
+        raise SafetyGateError("local ACT front and up cameras must be distinct")
+
+    if set(setup.absolute_limits) != set(JOINTS) or set(setup.max_step_deltas) != set(
+        JOINTS
+    ):
+        raise SafetyGateError("local ACT setup must bind all seven joint safety limits")
+    limits: dict[str, list[float]] = {}
+    deltas: dict[str, float] = {}
+    for joint in JOINTS:
+        pair = setup.absolute_limits[joint]
+        if not isinstance(pair, list | tuple) or len(pair) != 2:
+            raise SafetyGateError(f"local ACT {joint} limit must have lower/upper values")
+        lower = _finite(pair[0], f"local ACT {joint} lower limit")
+        upper = _finite(pair[1], f"local ACT {joint} upper limit")
+        if lower >= upper:
+            raise SafetyGateError(f"local ACT {joint} limits are not increasing")
+        delta = _finite(
+            setup.max_step_deltas[joint], f"local ACT {joint} maximum step"
+        )
+        if delta <= 0:
+            raise SafetyGateError(f"local ACT {joint} maximum step must be positive")
+        limits[joint] = [lower, upper]
+        deltas[joint] = delta
+
+    expected_hashes = {
+        "calibration": _sha256_file(setup.calibration_path),
+        "camera": _sha256_json(cameras),
+        "robot": _sha256_json(
+            {
+                "robot_port": setup.robot_port,
+                "joint_limits": limits,
+                "max_step_deltas": deltas,
+                "speed_scale": 1.0,
+            }
+        ),
+        "reset": _sha256_file(setup.reset_protocol_path),
+    }
+    if dict(setup.setup_hashes) != expected_hashes:
+        raise SafetyGateError("local ACT setup hashes do not reproduce from reviewed bytes")
+
+    reviewed_entrypoint = _sha256_file(setup.executor_entrypoint)
+    current_entrypoint = (
+        Path(repository_root).resolve() / "src/viola_ops/execution.py"
+    )
+    if _sha256_file(current_entrypoint) != reviewed_entrypoint:
+        raise SafetyGateError("local ACT executor differs from the reviewed setup snapshot")
+    return setup
+
+
+def _check_local_act_permit_binding(
+    permit: MotionPermit,
+    request: LocalActGateRequest,
+    checked: _ValidatedLocalActGate,
+) -> None:
+    """Require a local permit to match the freshly reproduced authority."""
+
+    setup = checked.setup
+    if not permit.allows(
+        session_id=checked.session_id,
+        phase="local_act",
+        trial=request.trial,
+    ):
+        raise SafetyGateError("local ACT permit no longer matches this execution")
+    if (
+        permit.session_bundle_id != checked.session_binding_id
+        or permit.candidate_bundle_id != checked.candidate_id
+        or permit.policy != "act"
+        or permit.operator != checked.operator
+        or permit.estop_tested_at != checked.estop_tested_at
+        or permit.speed_scale != 0.25
+        or permit.local_act_duration_s != checked.duration_s
+        or permit.setup_id != setup.setup_id
+        or permit.robot_port != setup.robot_port
+        or permit.calibration_path != setup.calibration_path
+        or permit.reset_protocol_path != setup.reset_protocol_path
+        or permit.executor_entrypoint != setup.executor_entrypoint
+        or dict(permit.setup_hashes) != dict(setup.setup_hashes)
+        or dict(permit.absolute_limits) != dict(setup.absolute_limits)
+        or dict(permit.max_step_deltas) != dict(setup.max_step_deltas)
+        or dict(permit.camera_configs)
+        != {name: dict(value) for name, value in setup.camera_configs.items()}
+    ):
+        raise SafetyGateError("local ACT permit differs from revalidated reviewed inputs")
+
+
 def _check_permit_binding(
     permit: MotionPermit,
     request: GateRequest,
@@ -393,6 +846,19 @@ def operator_challenge(session_id: str, phase: str, trial: str) -> str:
                 f"operator challenge {label} must be one path-safe component"
             )
     return f"ARM {session_id} {phase} {trial}"
+
+
+def local_act_operator_challenge(
+    session_id: str,
+    trial: str,
+    duration_s: float,
+) -> str:
+    """Return the explicit local phrase that records the E-stop assertion."""
+
+    _safe_local_component(session_id, "local ACT session_id")
+    _safe_local_component(trial, "local ACT trial")
+    duration = _local_act_duration(duration_s)
+    return f"ARM {session_id} local_act {trial} {duration:g}s ESTOP TESTED"
 
 
 def assert_permit_current(
@@ -1505,6 +1971,37 @@ def _require_phase(value: str) -> str:
     if value not in PHASES:
         raise SafetyGateError(f"phase must be one of {', '.join(PHASES)}")
     return value
+
+
+def _safe_local_component(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _SAFE_COMPONENT.fullmatch(value) is None:
+        raise SafetyGateError(f"{label} must be one path-safe component")
+    return value
+
+
+def _local_act_duration(value: Any) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not 0 < float(value) <= 60.0
+        or not float("-inf") < float(value) < float("inf")
+    ):
+        raise SafetyGateError("local ACT duration must be between 0 and 60 seconds")
+    return float(value)
+
+
+def _read_local_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SafetyGateError(f"cannot read local {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SafetyGateError(f"local {label} must be a JSON object")
+    return value
+
+
+def _reject_constant(token: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {token}")
 
 
 def _digest(value: Any, label: str) -> str:

@@ -6,7 +6,7 @@ input as a blocker.
 
 ## Before hardware can exist
 
-`viola-ops policy execute` checks, in order:
+The shared benchmark path, `viola-ops policy execute`, checks, in order:
 
 1. locally accepted Repo-B candidate and rollout session;
 2. `live_session` permission and exactly `blockers: []`;
@@ -24,6 +24,13 @@ input as a blocker.
 Only then are hardware-capable modules imported. The motion permit is an
 unforgeable in-process object tied to one session, phase, and challenge.
 
+The independent `viola-ops act run` path replaces steps 1–4 and 8 with a
+Repo-A-local binding to the exact historical ACT checkpoint, frozen dataset,
+and versioned `config/local_act_setup.json`. It performs the same environment,
+setup, E-stop, TTY, online-intent, one-use-permit, execution-lease, and boundary
+revalidation checks. It imports hardware only after those checks pass and marks
+all output local-only rather than creating a benchmark `READY` bundle.
+
 ## During execution
 
 - Connection uses the reviewed public FashionStar interface to read and check
@@ -34,6 +41,10 @@ unforgeable in-process object tied to one session, phase, and challenge.
   silently corrected.
 - Shakedowns use 25% of reviewed per-step limits. Scored trials use the reviewed
   limits without a runtime override.
+- Independent ACT inference likewise uses 25% of the reviewed per-step limits
+  and one bounded trial (10 seconds by default, never more than 60 seconds).
+  Its historical compatibility transform retains the raw proposal, bounds to
+  absolute then per-step limits, and records the exact commanded action.
 - Stale camera data, one missed control deadline, feedback loss, malformed
   action, limit failure, evidence-queue saturation, collision, intervention, or
   operator stop aborts before the current write whenever possible.

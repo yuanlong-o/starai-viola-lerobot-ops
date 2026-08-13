@@ -11,6 +11,7 @@ import re
 import select
 import socket
 import stat
+import termios
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -182,6 +183,11 @@ class _OperatorTerminal:
     def readline(self) -> str:
         return self._reader.readline().decode("utf-8")
 
+    def discard_pending_input(self) -> None:
+        """Drop bytes typed before the next explicit operator prompt."""
+
+        termios.tcflush(self._reader.fileno(), termios.TCIFLUSH)
+
     def write(self, value: str) -> int:
         return self._writer.write(value)
 
@@ -211,6 +217,15 @@ class InteractiveTrialOperator:
 
     def prepare_trial(self, session_id: str, trial_id: str, condition: dict[str, Any]) -> None:
         phrase = f"START {trial_id}"
+        # An ARM response and a predicted START line must never be pasted as a
+        # single replayable input block. Only input typed after this prompt is
+        # eligible to start the trial.
+        self._input_buffer.clear()
+        self._pending_event = None
+        try:
+            self._terminal.discard_pending_input()
+        except (AttributeError, OSError, termios.error) as exc:
+            raise SafetyGateError("cannot clear stale operator input before START") from exc
         self._terminal.write(
             "\nPrepare the reviewed reset and cube condition:\n"
             f"{_render_trial_condition(condition)}\n"
@@ -515,6 +530,7 @@ def _execute_authorized_command(
         runtime_snapshot: Any | None,
         *,
         boundary: str,
+        allow_consumed: bool = False,
     ) -> RuntimeIdentity:
         """Reopen every signed input before another trusted boundary."""
 
@@ -523,6 +539,7 @@ def _execute_authorized_command(
             gate_request,
             permit,
             identity=current_identity,
+            allow_consumed=allow_consumed,
         )
         _require_same_bundle(current_session, accepted_session, "rollout session")
         _require_same_bundle(
@@ -721,6 +738,7 @@ def _execute_authorized_command(
                     failure_stage: str = "execution_revalidation",
                     success_stage: str = "execution",
                     boundary: str = "at an execution boundary",
+                    allow_consumed: bool = False,
                 ) -> None:
                     """Reopen every live input at one motion boundary."""
 
@@ -729,6 +747,7 @@ def _execute_authorized_command(
                     identity = revalidate_current_authority(
                         runtime_snapshot,
                         boundary=boundary,
+                        allow_consumed=allow_consumed,
                     )
                     stage = success_stage
 
@@ -768,6 +787,7 @@ def _execute_authorized_command(
                 failure_stage="post_execution_revalidation",
                 success_stage="post_execution_revalidation",
                 boundary="after hardware disconnect and before finalization",
+                allow_consumed=True,
             )
         except BaseException as exc:
             return record_execution_failure(exc, failure_stage=stage)

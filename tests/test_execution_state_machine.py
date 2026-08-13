@@ -34,12 +34,15 @@ def _permit(phase: str = "shakedown", *, forged: bool = False) -> MotionPermit:
             joint: ((0.0, 100.0) if joint == "gripper" else (-100.0, 100.0))
             for joint in JOINTS
         },
-        max_step_deltas={joint: 4.0 for joint in JOINTS},
-        speed_scale=0.25 if phase == "shakedown" else 1.0,
+        max_step_deltas={
+            joint: (3.0 if phase == "local_act" else 4.0) for joint in JOINTS
+        },
+        speed_scale=0.25 if phase in {"shakedown", "local_act"} else 1.0,
         issued_at=now,
         estop_tested_at=now - timedelta(hours=1),
         _nonce="nonce",
         _authority=object() if forged else safety._PERMIT_AUTHORITY,
+        local_act_duration_s=10.0 if phase == "local_act" else 0.0,
     )
 
 
@@ -330,6 +333,64 @@ def test_phase_schedule_is_exact_and_teardown_is_guaranteed(phase, expected) -> 
     assert robot.connects == robot.disconnects == 1
 
 
+def test_local_act_is_one_bounded_trial_on_the_shared_state_machine() -> None:
+    seen: list[tuple[str, float, dict[str, object]]] = []
+
+    def run_trial(*_args, trial_id, condition, duration_s, index, **_kwargs):
+        seen.append((trial_id, duration_s, condition.to_dict()))
+        return TrialResult(
+            trial_id=trial_id,
+            index=index,
+            condition=condition.to_dict(),
+            started_at=datetime.now(UTC).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
+            duration_sec=duration_s,
+            actions=0,
+            replans=0,
+            inference_latency_ms=(),
+            control_latency_ms=(),
+            outcome=TrialOutcome(False, "failure", "timeout", None, None, None, 0.0),
+            safety_events=(),
+            trace_path="trace",
+            front_video_path="front",
+            up_video_path="up",
+        )
+
+    robot = _Robot()
+    runtime = _Runtime()
+    result = execute_phase(
+        _permit("local_act"),
+        _candidate(),
+        runtime_factory=lambda _candidate: runtime,
+        robot_factory=lambda _permit: robot,
+        evidence_factory=_EvidenceFactory(),
+        operator=_Operator(),
+        safety_monitor=_Monitor(),
+        revalidate_authority=_allow_authority,
+        trial_runner=run_trial,
+        local_act_duration_s=10.0,
+        clock_ns=lambda: 1_000_000_000,
+    )
+
+    assert result.status == "completed"
+    assert seen == [
+        (
+            "session-1-local_act-01",
+            10.0,
+            {
+                "condition_id": "local_act_01",
+                "stratum": "local_act",
+                "blue_axis": None,
+                "blue_offset_mm": 0.0,
+                "red_axis": None,
+                "red_offset_mm": 0.0,
+            },
+        )
+    ]
+    assert runtime.resets == 2
+    assert robot.connects == robot.disconnects == 1
+
+
 def test_each_start_is_followed_by_authority_check_before_trial_work() -> None:
     events: list[str] = []
 
@@ -585,6 +646,53 @@ def test_bad_policy_action_aborts_without_a_motor_write(action, event) -> None:
     )
     assert result.safety_events == (event,)
     assert robot.writes == []
+
+
+def test_local_act_bounds_proposal_before_safe_write_and_records_both() -> None:
+    robot = _Robot()
+    recorder = _Recorder()
+    permit = _permit("local_act")
+    # Bypass receipt validation after the confirmed fake write so the test can
+    # focus on the local proposal-to-command transform.
+    def send(action):
+        robot.writes.append(dict(action))
+        robot.last_receipt = SimpleNamespace(feedback_after=dict(action))
+        return dict(action)
+
+    robot.send_action = send
+    result = run_control_trial(
+        permit,
+        _candidate(),
+        robot,
+        _Runtime([50.0, -50.0, 101.0, 2.0, 0.0, 0.0, -5.0]),
+        recorder,
+        _Operator(),
+        _Monitor(),
+        index=0,
+        trial_id="session-1-local_act-01",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=lambda: 1.0,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=lambda _seconds: None,
+        duration_s=0.04,
+    )
+
+    assert result.actions == 1
+    assert robot.writes == [
+        {
+            "Motor_0.pos": 0.75,
+            "Motor_1.pos": -0.75,
+            "Motor_2.pos": 0.75,
+            "Motor_3.pos": 0.75,
+            "Motor_4.pos": 0.0,
+            "Motor_5.pos": 0.0,
+            "gripper.pos": 49.25,
+        }
+    ]
+    row = recorder.reservations[0].rows[0]
+    assert row["proposed_action"]["Motor_0.pos"] == 50.0
+    assert row["commanded_action"] == robot.writes[0]
+    assert row["bounded_from_proposal"] is True
 
 
 def test_stale_camera_and_full_evidence_queue_abort_before_write() -> None:

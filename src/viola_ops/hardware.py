@@ -646,6 +646,8 @@ def config_from_permit(permit: MotionPermit) -> SafeViolaConfig:
             width=int(item["width"]),
             height=int(item["height"]),
             fps=int(item["fps"]),
+            fourcc=(None if item.get("fourcc") is None else str(item["fourcc"])),
+            warmup_s=int(item.get("warmup_s", 1)),
         )
     return SafeViolaConfig(
         port=permit.robot_port,

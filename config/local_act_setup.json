@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "setup_id": "pc-a-local-act-existing-rig-v1",
+  "robot_port": "/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0",
+  "cameras": {
+    "front": {
+      "type": "opencv",
+      "index_or_path": "/dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "warmup_s": 8
+    },
+    "up": {
+      "type": "opencv",
+      "index_or_path": "/dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "YUYV",
+      "warmup_s": 8
+    }
+  },
+  "calibration_path": "calibration/robots/starai_viola/my_awesome_staraiviola_arm.json",
+  "reset_protocol_path": "config/local_act_reset_protocol.json",
+  "joint_limits": {
+    "Motor_0": [-100.0, 100.0],
+    "Motor_1": [-100.0, 100.0],
+    "Motor_2": [-100.0, 100.0],
+    "Motor_3": [-100.0, 100.0],
+    "Motor_4": [-100.0, 100.0],
+    "Motor_5": [-100.0, 100.0],
+    "gripper": [0.0, 100.0]
+  },
+  "max_step_deltas": {
+    "Motor_0": 3.0,
+    "Motor_1": 3.0,
+    "Motor_2": 3.0,
+    "Motor_3": 3.0,
+    "Motor_4": 3.0,
+    "Motor_5": 3.0,
+    "gripper": 3.0
+  }
+}

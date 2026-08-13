@@ -197,6 +197,59 @@ def test_operator_poll_buffers_partial_pty_input_without_blocking() -> None:
         os.close(master_fd)
 
 
+def test_trial_start_discards_typeahead_from_before_the_prompt() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty.setraw(slave_fd)
+    terminal = execute_ops._OperatorTerminal(os.ttyname(slave_fd))
+    os.close(slave_fd)
+    operator = execute_ops.InteractiveTrialOperator.__new__(
+        execute_ops.InteractiveTrialOperator
+    )
+    operator._terminal = terminal
+    operator._pending_event = None
+    operator._input_buffer = bytearray()
+    completed = threading.Event()
+    failure: list[BaseException] = []
+    trial_id = "local-act-session-local_act-01"
+
+    def prepare() -> None:
+        try:
+            operator.prepare_trial(
+                "local-act-session",
+                trial_id,
+                {
+                    "condition_id": "local_act_01",
+                    "stratum": "local_act",
+                    "blue_axis": None,
+                    "blue_offset_mm": 0.0,
+                    "red_axis": None,
+                    "red_offset_mm": 0.0,
+                },
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            failure.append(exc)
+        finally:
+            completed.set()
+
+    try:
+        # This line was typed before the START prompt and must be discarded.
+        os.write(master_fd, f"START {trial_id}\n".encode())
+        worker = threading.Thread(target=prepare)
+        worker.start()
+        readable, _, _ = select.select([master_fd], [], [], 2.0)
+        assert readable
+        assert b"Type exactly" in os.read(master_fd, 8192)
+        assert completed.wait(0.1) is False
+
+        os.write(master_fd, f"START {trial_id}\n".encode())
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert failure == []
+    finally:
+        operator.close()
+        os.close(master_fd)
+
+
 def test_trial_condition_prompt_is_plain_language() -> None:
     rendered = execute_ops._render_trial_condition(
         {
@@ -707,6 +760,54 @@ def test_post_disconnect_revocation_preserves_result_and_records_non_ready_failu
         "viola-policy-execution-intent",
         "viola-policy-execution-failure",
     ]
+
+
+def test_only_post_disconnect_revalidation_allows_a_consumed_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    allow_consumed_calls: list[bool] = []
+
+    def revalidate(*_args, **kwargs):
+        allow_consumed_calls.append(kwargs.get("allow_consumed", False))
+        session, candidate = _accepted_material()
+        return session, candidate.bundle
+
+    held = {key: (50.0 if key == "gripper.pos" else 0.0) for key in ACTION_KEYS}
+    result = PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="hold",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=1.0,
+        held_action=held,
+        trials=(),
+        terminal_event=None,
+        terminal_reason=None,
+    )
+
+    class Operator:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(execute_ops, "revalidate_motion", revalidate)
+    monkeypatch.setattr(execute_ops, "InteractiveTrialOperator", Operator)
+    import viola_ops.execution as execution
+
+    monkeypatch.setattr(execution, "execute_phase", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_completed_phase",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            bundle=SimpleNamespace(bundle_id="e" * 64)
+        ),
+    )
+
+    _execute(tmp_path, publisher=lambda run, **_kwargs: run)
+
+    assert allow_consumed_calls == [False, False, True]
 
 
 def test_execution_revalidation_rejects_same_runtime_hashes_from_another_bundle(

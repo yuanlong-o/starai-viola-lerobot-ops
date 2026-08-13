@@ -17,6 +17,7 @@ from viola_ops.hardware import (
     PostWriteFeedbackError,
     SafeViolaConfig,
     SafeViolaRobot,
+    config_from_permit,
     degrees_to_raw,
     load_calibration,
     normalized_to_raw,
@@ -138,6 +139,43 @@ def test_position_conversions_round_trip() -> None:
         assert raw_to_normalized(raw, gripper, gripper=True) == pytest.approx(normalized)
     for degrees in (-180.0, -90.0, 0.0, 90.0, 180.0):
         assert raw_to_degrees(degrees_to_raw(degrees)) == pytest.approx(degrees)
+
+
+def test_local_act_camera_formats_reach_public_camera_configs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda *_args, **_kwargs: None)
+    permit = replace(
+        _permit_with_calibration(_calibration(tmp_path / "calibration.json")),
+        robot_port="/dev/fake-local-act",
+        camera_configs={
+            "front": {
+                "type": "opencv",
+                "index_or_path": "/dev/video-front",
+                "width": 640,
+                "height": 480,
+                "fps": 30,
+                "fourcc": "MJPG",
+                "warmup_s": 8,
+            },
+            "up": {
+                "type": "opencv",
+                "index_or_path": "/dev/video-up",
+                "width": 640,
+                "height": 480,
+                "fps": 30,
+                "fourcc": "YUYV",
+                "warmup_s": 8,
+            },
+        },
+    )
+
+    config = config_from_permit(permit)
+
+    assert config.cameras["front"].fourcc == "MJPG"
+    assert config.cameras["front"].warmup_s == 8
+    assert config.cameras["up"].fourcc == "YUYV"
+    assert config.cameras["up"].warmup_s == 8
 
 
 @pytest.mark.parametrize("degrees", [-180.0001, 180.0001, float("nan")])

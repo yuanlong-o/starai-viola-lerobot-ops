@@ -61,6 +61,18 @@ class Backends:
             self.calls.append(("execute_command", args, kwargs))
             return {"policy": "act", "phase": kwargs["phase"], "status": "completed"}
 
+        def run_local_act(*args, **kwargs):
+            self.calls.append(("run_local_act", args, kwargs))
+            return {
+                "status": "completed",
+                "session_id": "local-act-session",
+                "candidate_id": "c" * 64,
+            }
+
+        def recover_local_act(*args, **kwargs):
+            self.calls.append(("recover_local_act", args, kwargs))
+            return {"status": "failure_recorded", "hardware_opened": False}
+
         class ReportSummary:
             def render_text(_self) -> str:
                 return "Eight-policy report verified"
@@ -84,6 +96,10 @@ class Backends:
                 shadow_command=shadow_command,
             ),
             "execute_ops": SimpleNamespace(execute_command=execute_command),
+            "local_act_ops": SimpleNamespace(
+                run_command=run_local_act,
+                recover_failure_command=recover_local_act,
+            ),
             "report": SimpleNamespace(inspect_report=inspect_report),
         }
 
@@ -103,9 +119,9 @@ def test_top_level_help_lists_every_operator_area(capsys) -> None:
         cli.main(["--help"])
     assert stopped.value.code == 0
     output = " ".join(capsys.readouterr().out.split())
-    for area in ("dataset", "session-inputs", "setup", "policy", "report"):
+    for area in ("dataset", "session-inputs", "setup", "policy", "act", "report"):
         assert area in output
-    assert "No physical command bypasses accepted-session safety gates" in output
+    assert "Repo-A-local ACT safety gate" in output
 
 
 def test_execute_help_explains_where_evidence_may_be_written(capsys) -> None:
@@ -157,6 +173,8 @@ def test_operator_docs_keep_cross_pc_artifacts_on_shared_storage() -> None:
         (["policy", "verify", "--help"], "without connecting hardware"),
         (["policy", "shadow", "--help"], "without motor commands"),
         (["policy", "execute", "--help"], "interactive operator arming"),
+        (["act", "run", "--help"], "does not require Repo-B candidates"),
+        (["act", "recover-failure", "--help"], "does not prompt"),
         (["report", "inspect", "--help"], "readable summary"),
     ],
 )
@@ -164,7 +182,7 @@ def test_every_named_command_has_human_help(arguments, phrase: str, capsys) -> N
     with pytest.raises(SystemExit) as stopped:
         cli.main(arguments)
     assert stopped.value.code == 0
-    assert phrase in capsys.readouterr().out
+    assert phrase in " ".join(capsys.readouterr().out.split())
 
 
 def test_dataset_validate_delegates_without_video_when_requested(
@@ -476,6 +494,72 @@ def test_execute_delegates_only_after_phase_evidence_is_present(
     assert keywords["prior_shakedown_bundle"] == Path("/shakedown")
     assert keywords["wandb_entity"] == "entity"
     assert "Phase: scored" in capsys.readouterr().out
+
+
+def test_local_act_run_is_repo_a_owned_and_has_human_defaults(
+    backends: Backends, capsys
+) -> None:
+    assert (
+        cli.main(
+            [
+                "act",
+                "run",
+                "--repo-root",
+                "/repo",
+                "--operator",
+                "operator-a",
+                "--trial",
+                "act-smoke",
+                "--duration-seconds",
+                "5",
+            ]
+        )
+        == 0
+    )
+    name, positional, keywords = backends.calls[0]
+    assert name == "run_local_act"
+    assert positional == ()
+    assert keywords["checkpoint"] == Path(
+        "~/models/act_viola_val20_step080000"
+    ).expanduser()
+    assert keywords["dataset_root"] == cli.DEFAULT_DATASET_ROOT
+    assert keywords["setup_path"] == Path("config/local_act_setup.json")
+    assert keywords["evidence_root"] == cli.DEFAULT_OUTPUT_ROOT / "local-act"
+    assert keywords["operator"] == "operator-a"
+    assert keywords["trial"] == "act-smoke"
+    assert keywords["duration_s"] == 5.0
+    assert keywords["wandb_entity"] == "yuanlongzhang94"
+    assert "Status: completed" in capsys.readouterr().out
+
+
+def test_local_act_failure_recovery_delegates_without_run_arguments(
+    backends: Backends, capsys
+) -> None:
+    assert (
+        cli.main(
+            [
+                "act",
+                "recover-failure",
+                "--attempt",
+                "/evidence/attempt",
+                "--repo-root",
+                "/repo",
+            ]
+        )
+        == 0
+    )
+    assert backends.calls == [
+        (
+            "recover_local_act",
+            (Path("/evidence/attempt"),),
+            {
+                "repo_root": Path("/repo"),
+                "wandb_entity": "yuanlongzhang94",
+                "wandb_project": cli.DEFAULT_WANDB_PROJECT,
+            },
+        )
+    ]
+    assert "Hardware opened: False" in capsys.readouterr().out
 
 
 def test_report_inspect_uses_human_renderer(backends: Backends, capsys) -> None:

@@ -35,7 +35,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="viola-ops",
         description=(
             "Readable Repo-A tools for the eight-policy Viola benchmark. "
-            "No physical command bypasses accepted-session safety gates."
+            "Physical commands require either the shared session gate or the "
+            "explicit Repo-A-local ACT safety gate."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -230,6 +231,79 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prior-shakedown", type=Path, help="accepted shakedown evidence bundle"
     )
 
+    act = commands.add_parser(
+        "act",
+        help="run the exact previously deployed ACT checkpoint from Repo A",
+    )
+    act_commands = act.add_subparsers(dest="act_command", required=True)
+    act_run = act_commands.add_parser(
+        "run",
+        help="run supervised ACT inference without any Repo-B handoff",
+        description=(
+            "Run the exact reviewed local step-80,000 ACT checkpoint. This path "
+            "does not require Repo-B candidates, receipts, or rollout sessions; "
+            "it still requires online W&B and real-TTY E-stop/ARM/START actions."
+        ),
+    )
+    act_run.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("~/models/act_viola_val20_step080000").expanduser(),
+        help="exact previously deployed ACT checkpoint (default: %(default)s)",
+    )
+    act_run.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=DEFAULT_DATASET_ROOT,
+        help="frozen 34-episode dataset used to bind the ACT model (default: %(default)s)",
+    )
+    act_run.add_argument(
+        "--setup",
+        type=Path,
+        default=Path("config/local_act_setup.json"),
+        help="versioned Repo-A local hardware setup (default: %(default)s)",
+    )
+    act_run.add_argument(
+        "--evidence-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT / "local-act",
+        help="immutable local ACT evidence base outside Git (default: %(default)s)",
+    )
+    act_run.add_argument(
+        "--duration-seconds",
+        type=float,
+        default=10.0,
+        help="bounded inference duration, greater than 0 and at most 60 (default: %(default)s)",
+    )
+    act_run.add_argument(
+        "--operator",
+        help="physical E-stop owner (default: current operating-system user)",
+    )
+    act_run.add_argument(
+        "--trial",
+        help="immutable attempt label (default: current UTC timestamp)",
+    )
+    act_run.add_argument("--repo-root", type=Path, default=Path.cwd())
+    act_run.add_argument("--wandb-entity", default="yuanlongzhang94")
+    act_run.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
+    act_recover = act_commands.add_parser(
+        "recover-failure",
+        help="publish retained ACT failure evidence without opening hardware",
+        description=(
+            "Validate and publish one immutable failed ACT attempt. This recovery "
+            "does not prompt, load a policy, or open cameras, serial, or motors."
+        ),
+    )
+    act_recover.add_argument(
+        "--attempt",
+        type=Path,
+        required=True,
+        help="failed attempt directory printed by act run",
+    )
+    act_recover.add_argument("--repo-root", type=Path, default=Path.cwd())
+    act_recover.add_argument("--wandb-entity", default="yuanlongzhang94")
+    act_recover.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
+
     report = commands.add_parser("report", help="inspect Repo B's final benchmark report")
     report_commands = report.add_subparsers(dest="report_command", required=True)
     report_inspect = report_commands.add_parser(
@@ -250,6 +324,8 @@ def _run(args: argparse.Namespace) -> int:
         return _run_setup(args)
     if args.area == "policy":
         return _run_policy(args)
+    if args.area == "act":
+        return _run_act(args)
     if args.area == "report":
         return _run_report(args)
     raise AssertionError(f"unhandled command area: {args.area}")
@@ -367,6 +443,35 @@ def _run_policy(args: argparse.Namespace) -> int:
         print(_backend_text("Policy execution phase complete", result))
         return 0
     raise AssertionError(f"unhandled policy command: {args.policy_command}")
+
+
+def _run_act(args: argparse.Namespace) -> int:
+    backend = _backend("local_act_ops")
+    if args.act_command == "run":
+        result = backend.run_command(
+            repo_root=args.repo_root,
+            checkpoint=args.checkpoint,
+            dataset_root=args.dataset_root,
+            setup_path=args.setup,
+            evidence_root=args.evidence_root,
+            operator=args.operator,
+            trial=args.trial,
+            duration_s=args.duration_seconds,
+            wandb_entity=args.wandb_entity,
+            wandb_project=args.wandb_project,
+        )
+        print(_backend_text("Local ACT inference complete", result))
+        return 0
+    if args.act_command == "recover-failure":
+        result = backend.recover_failure_command(
+            args.attempt,
+            repo_root=args.repo_root,
+            wandb_entity=args.wandb_entity,
+            wandb_project=args.wandb_project,
+        )
+        print(_backend_text("Local ACT failure synchronized", result))
+        return 0
+    raise AssertionError(f"unhandled ACT command: {args.act_command}")
 
 
 def _run_report(args: argparse.Namespace) -> int:

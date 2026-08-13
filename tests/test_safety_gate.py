@@ -16,10 +16,12 @@ from viola_ops.safety import (
     ResolvedSetup,
     authorize_motion,
     assert_permit_current,
+    begin_permit_execution,
     check_current_checkout,
     check_estop_freshness,
     check_phase_predecessors,
     check_session_shape,
+    finish_permit_execution,
     operator_challenge,
     revalidate_motion,
     validate_action,
@@ -476,6 +478,90 @@ def test_final_revalidation_reopens_every_authority_and_exact_runtime(
         "estop",
         "checkout",
     ]
+
+
+def test_post_execution_revalidation_accepts_only_a_consumed_shared_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    session, candidate = _stub_authorization_dependencies(monkeypatch, now)
+    request = GateRequest(
+        session_bundle=Path("session"),
+        candidate_bundle=Path("candidate"),
+        phase="hold",
+        trial="commissioning",
+        repository_root=Path.cwd(),
+        handoff_root=Path("handoffs"),
+        now=now,
+    )
+    identity = RuntimeIdentity(
+        role="pc_a",
+        repository_commit="7" * 40,
+        repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.13",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
+    )
+    permit = authorize_motion(
+        request,
+        input_stream=_ChallengeStream("ARM session-1 hold commissioning\n"),
+        terminal_check=lambda _stream: True,
+    )
+
+    begin_permit_execution(permit)
+    finish_permit_execution(permit)
+
+    assert revalidate_motion(
+        request,
+        permit,
+        identity=identity,
+        allow_consumed=True,
+    ) == (session, candidate)
+    with pytest.raises(SafetyGateError, match="already consumed"):
+        revalidate_motion(request, permit, identity=identity)
+
+
+@pytest.mark.parametrize("lifecycle", ["issued", "active"])
+def test_post_execution_revalidation_rejects_unconsumed_shared_permit(
+    monkeypatch: pytest.MonkeyPatch,
+    lifecycle: str,
+) -> None:
+    now = datetime.now(UTC)
+    _stub_authorization_dependencies(monkeypatch, now)
+    request = GateRequest(
+        session_bundle=Path("session"),
+        candidate_bundle=Path("candidate"),
+        phase="hold",
+        trial="commissioning",
+        repository_root=Path.cwd(),
+        handoff_root=Path("handoffs"),
+        now=now,
+    )
+    permit = authorize_motion(
+        request,
+        input_stream=_ChallengeStream("ARM session-1 hold commissioning\n"),
+        terminal_check=lambda _stream: True,
+    )
+    if lifecycle == "active":
+        begin_permit_execution(permit)
+    identity = RuntimeIdentity(
+        role="pc_a",
+        repository_commit="7" * 40,
+        repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.13",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
+    )
+
+    with pytest.raises(SafetyGateError, match="has not completed permit teardown"):
+        revalidate_motion(
+            request,
+            permit,
+            identity=identity,
+            allow_consumed=True,
+        )
 
 
 def test_final_revalidation_rejects_runtime_different_from_signed_setup(

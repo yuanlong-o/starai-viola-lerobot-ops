@@ -139,4 +139,4 @@ def test_inference_stubs_point_to_unified_execute_command() -> None:
 
     for relative_path in inference_paths:
         source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        assert "viola-ops policy execute --help" in source
+        assert "viola-ops act run --help" in source
