@@ -27,6 +27,13 @@ from .jsonutil import (
     write_canonical_json,
     write_text_once,
 )
+from .publication_guard import (
+    GuardedEvidenceLogger,
+    PublicationSnapshot,
+    require_same_runtime,
+    require_sealed_bundle_matches,
+    snapshot_tree,
+)
 
 DEFAULT_DATASET_ROOT: Final = Path(
     "/mnt/nas02/yz/starai/datasets/bourn117/"
@@ -444,6 +451,7 @@ def release_dataset(
     repo_root: str | Path,
     producer_identity: viola_handoff.RuntimeIdentity | None = None,
     evidence_logger: viola_handoff.EvidenceLogger | None = None,
+    identity_capture: Callable[[], viola_handoff.RuntimeIdentity] | None = None,
     validation: DatasetValidationResult | None = None,
     dataset_loader: DatasetLoader | None = None,
     video_decoder: VideoDecoder | None = None,
@@ -474,13 +482,17 @@ def release_dataset(
         raise ValidationError("dataset release requires a complete two-camera decode")
     if checked.inventory_sha256 != expected.inventory_sha256:
         raise ValidationError("validation inventory differs from the frozen release")
-    if viola_handoff.inventory_root(dataset_root) != expected.expected_inventory():
+    dataset_snapshot = snapshot_tree(dataset_root, label="validated dataset")
+    if dataset_snapshot.inventory != expected.expected_inventory():
         raise ValidationError("dataset changed after validation and before release")
 
-    identity_was_captured = producer_identity is None
+    capture_identity = identity_capture or (
+        lambda: viola_handoff.RuntimeIdentity.capture(
+            role="pc_a", repo_root=repository
+        )
+    )
     identity = _producer_identity(
-        producer_identity
-        or viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repository)
+        producer_identity or capture_identity()
     )
 
     material = _safe_output_directory(
@@ -495,10 +507,14 @@ def release_dataset(
     write_canonical_json(payload / "dataset_release.json", release_payload)
     write_text_once(payload / "SUMMARY.md", _release_summary(expected, checked))
 
-    if viola_handoff.inventory_root(dataset_root) != expected.expected_inventory():
-        raise ValidationError("dataset changed immediately before release sealing")
-    if identity_was_captured:
-        _require_same_runtime(identity, repo_root=repository)
+    publication = PublicationSnapshot(
+        payload=snapshot_tree(payload, label="dataset-release payload"),
+        artifacts=(("dataset", dataset_snapshot),),
+    )
+    publication.require_unchanged(boundary="immediately before release sealing")
+    require_same_runtime(
+        identity, capture=capture_identity, operation="dataset release"
+    )
 
     request = viola_handoff.SealRequest(
         root=handoff_base,
@@ -520,10 +536,26 @@ def release_dataset(
         payload_dir=payload,
         artifact_roots={"dataset": dataset_root},
     )
-    bundle = viola_handoff.seal_bundle(request, evidence_logger=evidence_logger)
-    signed = next(item for item in bundle.manifest["artifacts"] if item["name"] == "dataset")
-    if signed["inventory_sha256"] != checked.inventory_sha256:
-        raise ValidationError("sealed artifact inventory differs from validated dataset")
+    guarded_logger = GuardedEvidenceLogger(
+        delegate=evidence_logger or viola_handoff.WandbEvidenceLogger(),
+        snapshot=publication,
+        identity=identity,
+        identity_capture=capture_identity,
+        operation="dataset release",
+    )
+    bundle = viola_handoff.seal_bundle(request, evidence_logger=guarded_logger)
+    require_sealed_bundle_matches(
+        bundle,
+        request,
+        publication,
+        operation="dataset release",
+        permission="data_only",
+        consumer_role="pc_b",
+    )
+    require_same_runtime(
+        identity, capture=capture_identity, operation="dataset release"
+    )
+    publication.require_unchanged(boundary="after release sealing")
     return DatasetReleaseResult(
         bundle=bundle,
         validation=checked,
@@ -834,20 +866,6 @@ def _producer_identity(
     if identity.conda_environment != "lerobot":
         raise ValidationError("dataset releases require the lerobot Conda environment")
     return identity
-
-
-def _require_same_runtime(
-    original: viola_handoff.RuntimeIdentity,
-    *,
-    repo_root: Path,
-) -> None:
-    current = _producer_identity(
-        viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repo_root)
-    )
-    if current != original:
-        raise ValidationError(
-            "Repo-A commit or runtime identity changed before release sealing"
-        )
 
 
 def _require_lerobot_061() -> None:

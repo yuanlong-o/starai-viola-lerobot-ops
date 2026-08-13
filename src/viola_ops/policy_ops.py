@@ -8,6 +8,7 @@ LeRobot's public OpenCV camera API after every signed input has been checked.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -36,10 +37,21 @@ from .jsonutil import (
     write_canonical_json,
 )
 from .policies import CANONICAL_TASK, JOINT_NAMES
+from .publication_guard import (
+    FileSnapshot,
+    GuardedEvidenceLogger,
+    PublicationSnapshot,
+    TreeSnapshot,
+    require_sealed_bundle_matches,
+    snapshot_file,
+    snapshot_tree,
+)
 from .policy_runtime import (
     AcceptedPolicyCandidate,
     PolicyRuntime,
+    REPLAY_DATASET_ARTIFACT,
     RuntimeVerification,
+    _snapshot_candidate_runtime,
     build_runtime_terminal_lineage,
     build_runtime_terminal_payload,
     build_sync_receipt,
@@ -192,15 +204,8 @@ class ShadowEvidence:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _EvidenceRootSnapshot:
-    """Exact directory identity and bytes across one online publication."""
-
-    label: str
-    path: Path
-    device: int
-    inode: int
-    inventory: Mapping[str, Any]
+_EvidenceRootSnapshot = TreeSnapshot
+_InputFileSnapshot = FileSnapshot
 
 
 def verify_command(
@@ -243,13 +248,28 @@ def verify_command(
         operation="verification",
         attempt=attempt,
     )
-    observation = observation_loader(candidate)
-    result = verify_policy(
-        candidate,
-        observation,
-        runtime_factory=runtime_factory,
-        clock=clock,
-    )
+    replay_source = _snapshot_replay_source(candidate)
+
+    def validate_sources() -> None:
+        _require_policy_sources(
+            bundle,
+            candidate,
+            handoff_root=handoff_root,
+            repo_root=repo_root,
+            identity=identity,
+            root_snapshots=(replay_source,),
+        )
+
+    with _snapshot_candidate_runtime(candidate) as runtime_inputs:
+        observation = observation_loader(candidate)
+        result = verify_policy(
+            runtime_inputs.candidate,
+            observation,
+            runtime_factory=runtime_factory,
+            clock=clock,
+        )
+        runtime_inputs.verify()
+    validate_sources()
     seed = sha256_json(
         {
             "operation": "policy_verify",
@@ -271,7 +291,7 @@ def verify_command(
     verification_path = write_canonical_json(material / "verification.json", payload)
     evidence_sha256 = sha256_file(verification_path)
     publication_snapshot = _snapshot_evidence_roots({"verification payload": material})
-    _require_current_identity(repo_root, identity)
+    validate_sources()
     publisher(
         wandb,
         job_type="viola-policy-verify",
@@ -290,10 +310,13 @@ def verify_command(
         binding=verification_sync_binding(candidate, payload),
         synced_at=_utc(now()).isoformat(),
     )
-    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
-    _require_current_identity(repo_root, identity)
+    validate_sources()
     _require_evidence_snapshot(publication_snapshot)
     sync_path = write_canonical_json(material / "verification_WANDB_SYNCED.json", sync)
+    final_snapshot = _expect_added_files(
+        publication_snapshot,
+        {sync_path: viola_handoff.canonical_json_bytes(sync)},
+    )
 
     terminal_path: Path | None = None
     terminal_bundle: viola_handoff.VerifiedBundle | None = None
@@ -304,6 +327,10 @@ def verify_command(
             verification_sha256=evidence_sha256,
         )
         terminal_path = write_canonical_json(material / "shadow_evidence.json", terminal)
+        final_snapshot = _expect_added_files(
+            final_snapshot,
+            {terminal_path: viola_handoff.canonical_json_bytes(terminal)},
+        )
         lineage = build_runtime_terminal_lineage(
             candidate,
             terminal,
@@ -320,11 +347,17 @@ def verify_command(
             wandb_project=wandb_project,
             payload_dir=material,
         )
-        seal_snapshot = _snapshot_evidence_roots({"verification payload": material})
-        _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
-        _require_current_identity(repo_root, identity)
-        _require_evidence_snapshot(seal_snapshot)
-        terminal_bundle = _seal(request, bundle_evidence_logger)
+        terminal_bundle = _seal_guarded(
+            request,
+            evidence_logger=bundle_evidence_logger,
+            wandb_entity=wandb_entity,
+            snapshots=final_snapshot,
+            artifact_names={},
+            validate_sources=validate_sources,
+            repo_root=repo_root,
+        )
+    validate_sources()
+    _require_evidence_snapshot(final_snapshot)
     return VerificationEvidence(
         candidate,
         result,
@@ -374,11 +407,26 @@ def shadow_command(
     _require_external_root(handoff_root, repo_root=repo_root, label="handoff")
     _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
     repo = _repo_identity(identity)
-    verification, verification_source, verification_sync_source = _load_verification(
+    verification_source, verification_sync_source = _verification_source_paths(
+        verification_path
+    )
+    verification_inputs = _snapshot_input_files(
+        {
+            "runtime verification": verification_source,
+            "runtime verification W&B receipt": verification_sync_source,
+        }
+    )
+    verification, loaded_verification, loaded_verification_sync = _load_verification(
         candidate,
         verification_path,
         expected_repo=repo,
     )
+    if (loaded_verification, loaded_verification_sync) != (
+        verification_source,
+        verification_sync_source,
+    ):
+        raise ValidationError("runtime verification paths changed while loading")
+    _require_input_file_snapshots(verification_inputs)
     attempt = _attempt_id(attempt_id)
     material = _material_root(
         output_root,
@@ -387,7 +435,6 @@ def shadow_command(
         operation=mode,
         attempt=attempt,
     )
-    runtime = runtime_factory(candidate)
     payload_root = material / "payload"
     artifact_root = material / "shadow_record"
     payload_root.mkdir(parents=True, exist_ok=True)
@@ -399,6 +446,12 @@ def shadow_command(
         verification_sync_source,
         payload_root / "verification_WANDB_SYNCED.json",
     )
+    if (
+        sha256_file(copied_verification) != verification_inputs[0].sha256
+        or sha256_file(copied_verification_sync) != verification_inputs[1].sha256
+    ):
+        raise ValidationError("copied runtime verification differs from reviewed bytes")
+    _require_input_file_snapshots(verification_inputs)
 
     setup_hashes: dict[str, str] | None = None
     frozen_binding: dict[str, Any] | None = None
@@ -406,67 +459,138 @@ def shadow_command(
     frozen_files: tuple[Path, Path, Path] | None = None
     camera_owner: _OpenedCameras | None = None
     recorder: _VideoPairRecorder | None = None
-    try:
-        if mode == "replay":
-            if setup_path is not None or frozen_state_path is not None or cameras is not None:
-                raise ValidationError(
-                    "replay shadow does not accept setup, frozen state, or camera inputs"
+    replay_source: _EvidenceRootSnapshot | None = None
+    reviewed_roots: tuple[_EvidenceRootSnapshot, ...] = ()
+    reviewed_inputs: tuple[_InputFileSnapshot, ...] = verification_inputs
+
+    def validate_sources() -> None:
+        root_snapshots = (
+            (replay_source,) if replay_source is not None else reviewed_roots
+        )
+        _require_policy_sources(
+            bundle,
+            candidate,
+            handoff_root=handoff_root,
+            repo_root=repo_root,
+            identity=identity,
+            root_snapshots=root_snapshots,
+            input_files=reviewed_inputs,
+        )
+
+    validate_sources()
+    with _snapshot_candidate_runtime(candidate) as runtime_inputs:
+        runtime_candidate = runtime_inputs.candidate
+        runtime = runtime_factory(runtime_candidate)
+        try:
+            if mode == "replay":
+                if setup_path is not None or frozen_state_path is not None or cameras is not None:
+                    raise ValidationError(
+                        "replay shadow does not accept setup, frozen state, or camera inputs"
+                    )
+                replay_source = _snapshot_replay_source(candidate)
+                validate_sources()
+                run = run_replay(
+                    runtime_candidate,
+                    runtime,
+                    replay_loader(candidate),
+                    clock=clock,
                 )
-            run = run_replay(
-                candidate,
-                runtime,
-                replay_loader(candidate),
-                clock=clock,
-            )
-        else:
-            if setup_path is None or frozen_state_path is None:
-                raise ValidationError("live soak requires reviewed setup and frozen-state evidence")
-            setup = load_reviewed_setup(setup_path, now=_utc(now()))
-            if setup.executor["commit"] != identity.repository_commit:
-                raise ValidationError("live setup was reviewed for another Repo-A commit")
-            setup_hashes = _setup_hashes(setup)
-            state, frozen_binding, frozen_files = _load_frozen_state(
-                frozen_state_path,
-                expected_setup_id=setup.setup_id,
-                expected_operator=setup.estop["operator"],
-                expected_setup_hashes=setup_hashes,
-                expected_repo=repo,
-            )
-            active_cameras = cameras
-            if active_cameras is None:
-                camera_owner = _OpenedCameras.open(setup.cameras, clock=clock)
-                active_cameras = camera_owner.sources
-            recorder = _VideoPairRecorder(artifact_root / "videos")
-            run = run_live_soak(
-                candidate,
-                runtime,
-                active_cameras,
-                frozen_state=state,
-                limits=_reviewed_limits(setup),
-                clock=clock,
-                sleep=sleep,
-                frame_sink=recorder.record,
-            )
-            recorder.close()
-            videos = {
-                name: _video_metadata(
-                    artifact_root / "videos" / f"{name}.mp4",
-                    name=name,
-                    expected_frames=int(run.summary["captured_observations"]),
-                    passed=run.status == "passed",
+                _require_evidence_snapshot((replay_source,))
+            else:
+                if setup_path is None or frozen_state_path is None:
+                    raise ValidationError(
+                        "live soak requires reviewed setup and frozen-state evidence"
+                    )
+                setup_source = _snapshot_input_files(
+                    {"reviewed setup": Path(setup_path)}
                 )
-                for name in ("front", "up")
-            }
-    finally:
-        if recorder is not None:
-            recorder.close()
-        if camera_owner is not None:
-            camera_owner.close()
+                frozen_source = _snapshot_evidence_roots(
+                    {"frozen-state evidence": frozen_state_path}
+                )
+                reviewed_roots = frozen_source
+                setup = load_reviewed_setup(setup_path, now=_utc(now()))
+                _require_input_file_snapshots(setup_source)
+                if setup.executor["commit"] != identity.repository_commit:
+                    raise ValidationError("live setup was reviewed for another Repo-A commit")
+                dependent_inputs = _snapshot_input_files(
+                    {
+                        "reviewed calibration": setup.calibration_path,
+                        "reviewed reset protocol": setup.reset_protocol_path,
+                        "reviewed executor": setup.executor_entrypoint,
+                    }
+                )
+                # Reload after pinning dependent files.  This makes their
+                # snapshotted bytes reproduce the hashes attested by the setup
+                # JSON instead of adopting a change between load and snapshot.
+                if load_reviewed_setup(setup_path, now=_utc(now())) != setup:
+                    raise ValidationError("live setup changed while its files were pinned")
+                _require_input_file_snapshots((*setup_source, *dependent_inputs))
+                setup_hashes = _setup_hashes(setup)
+                if (
+                    dependent_inputs[0].sha256 != setup_hashes["calibration"]
+                    or dependent_inputs[1].sha256 != setup_hashes["reset"]
+                    or dependent_inputs[2].sha256
+                    != setup.executor["entrypoint_sha256"]
+                ):
+                    raise ValidationError(
+                        "reviewed setup files differ from their attested hashes"
+                    )
+                state, frozen_binding, frozen_files = _load_frozen_state(
+                    frozen_state_path,
+                    expected_setup_id=setup.setup_id,
+                    expected_operator=setup.estop["operator"],
+                    expected_setup_hashes=setup_hashes,
+                    expected_repo=repo,
+                )
+                reviewed_inputs = (
+                    *verification_inputs,
+                    *setup_source,
+                    *dependent_inputs,
+                )
+                _require_evidence_snapshot(frozen_source)
+                for source in frozen_files:
+                    copy_regular_file(source, payload_root / source.name)
+                _require_evidence_snapshot(frozen_source)
+                _require_input_file_snapshots(reviewed_inputs)
+                validate_sources()
+
+                active_cameras = cameras
+                if active_cameras is None:
+                    camera_owner = _OpenedCameras.open(setup.cameras, clock=clock)
+                    active_cameras = camera_owner.sources
+                recorder = _VideoPairRecorder(artifact_root / "videos")
+                run = run_live_soak(
+                    runtime_candidate,
+                    runtime,
+                    active_cameras,
+                    frozen_state=state,
+                    limits=_reviewed_limits(setup),
+                    clock=clock,
+                    sleep=sleep,
+                    frame_sink=recorder.record,
+                )
+                recorder.close()
+                _require_evidence_snapshot(frozen_source)
+                _require_input_file_snapshots(reviewed_inputs)
+                videos = {
+                    name: _video_metadata(
+                        artifact_root / "videos" / f"{name}.mp4",
+                        name=name,
+                        expected_frames=int(run.summary["captured_observations"]),
+                        passed=run.status == "passed",
+                    )
+                    for name in ("front", "up")
+                }
+            runtime_inputs.verify()
+        finally:
+            if recorder is not None:
+                recorder.close()
+            if camera_owner is not None:
+                camera_owner.close()
 
     trace_path = write_trace(artifact_root / "action_trace.jsonl", run)
-    if frozen_files is not None:
-        for source in frozen_files:
-            copy_regular_file(source, payload_root / source.name)
+
+    validate_sources()
 
     seed = sha256_json(
         {
@@ -501,7 +625,7 @@ def shadow_command(
             "shadow artifact": artifact_root,
         }
     )
-    _require_current_identity(repo_root, identity)
+    validate_sources()
     publisher(
         wandb,
         job_type="viola-policy-shadow",
@@ -535,11 +659,14 @@ def shadow_command(
         ),
         synced_at=_utc(now()).isoformat(),
     )
-    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
-    _require_current_identity(repo_root, identity)
+    validate_sources()
     _require_evidence_snapshot(publication_snapshot)
     shadow_sync_path = write_canonical_json(
         payload_root / "shadow_WANDB_SYNCED.json", shadow_sync
+    )
+    final_snapshot = _expect_added_files(
+        publication_snapshot,
+        {shadow_sync_path: viola_handoff.canonical_json_bytes(shadow_sync)},
     )
 
     frozen_state_file = payload_root / "frozen_state.json"
@@ -571,16 +698,17 @@ def shadow_command(
         payload_dir=payload_root,
         artifact_roots={"shadow_record": artifact_root},
     )
-    seal_snapshot = _snapshot_evidence_roots(
-        {
-            "shadow payload": payload_root,
-            "shadow artifact": artifact_root,
-        }
+    sealed = _seal_guarded(
+        request,
+        evidence_logger=bundle_evidence_logger,
+        wandb_entity=wandb_entity,
+        snapshots=final_snapshot,
+        artifact_names={"shadow artifact": "shadow_record"},
+        validate_sources=validate_sources,
+        repo_root=repo_root,
     )
-    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
-    _require_current_identity(repo_root, identity)
-    _require_evidence_snapshot(seal_snapshot)
-    sealed = _seal(request, bundle_evidence_logger)
+    validate_sources()
+    _require_evidence_snapshot(final_snapshot)
     return ShadowEvidence(candidate, run, material, payload_root, artifact_root, sealed)
 
 
@@ -590,9 +718,7 @@ def _load_verification(
     *,
     expected_repo: Mapping[str, Any],
 ) -> tuple[dict[str, Any], Path, Path]:
-    source = Path(path).expanduser().resolve()
-    if source.is_dir():
-        source /= "verification.json"
+    source, sync_path = _verification_source_paths(path)
     value = _read_canonical_object(source, label="runtime verification")
     require_exact_keys(value, _VERIFICATION_FIELDS, label="runtime verification")
     expected = {
@@ -647,7 +773,6 @@ def _load_verification(
     _wandb_identity(value["wandb"], "runtime verification")
     _utc_string(value["verified_at"], "runtime verification verified_at")
 
-    sync_path = source.with_name("verification_WANDB_SYNCED.json")
     sync = _read_canonical_object(sync_path, label="verification W&B sync receipt")
     require_exact_keys(sync, _SYNC_FIELDS, label="verification W&B sync receipt")
     if (
@@ -660,6 +785,15 @@ def _load_verification(
     ):
         raise ValidationError("verification W&B sync receipt is stale or mismatched")
     return value, source, sync_path
+
+
+def _verification_source_paths(path: str | Path) -> tuple[Path, Path]:
+    """Resolve the exact verification pair before either file is consumed."""
+
+    source = Path(path).expanduser().resolve()
+    if source.is_dir():
+        source /= "verification.json"
+    return source, source.with_name("verification_WANDB_SYNCED.json")
 
 
 def _load_frozen_state(
@@ -1175,32 +1309,7 @@ def _snapshot_evidence_roots(
 ) -> tuple[_EvidenceRootSnapshot, ...]:
     """Capture exact directory identities and inventories without following links."""
 
-    snapshots: list[_EvidenceRootSnapshot] = []
-    for label, raw_path in roots.items():
-        path = Path(os.path.abspath(os.path.expanduser(os.fspath(raw_path))))
-        try:
-            before = path.lstat()
-        except OSError as exc:
-            raise ValidationError(f"cannot inspect {label} root {path}: {exc}") from exc
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
-            raise ValidationError(f"{label} root must be a nonsymlink directory: {path}")
-        try:
-            inventory = viola_handoff.inventory_root(path)
-            after = path.lstat()
-        except (OSError, viola_handoff.HandoffError) as exc:
-            raise ValidationError(f"cannot inventory {label} root {path}: {exc}") from exc
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise ValidationError(f"{label} root changed while it was inventoried")
-        snapshots.append(
-            _EvidenceRootSnapshot(
-                label=label,
-                path=path,
-                device=before.st_dev,
-                inode=before.st_ino,
-                inventory=inventory,
-            )
-        )
-    return tuple(snapshots)
+    return tuple(snapshot_tree(path, label=label) for label, path in roots.items())
 
 
 def _require_evidence_snapshot(
@@ -1213,6 +1322,168 @@ def _require_evidence_snapshot(
     )
     if current != expected:
         raise ValidationError("policy evidence changed during online publication or sealing")
+
+
+def _snapshot_replay_source(
+    candidate: AcceptedPolicyCandidate,
+) -> _EvidenceRootSnapshot:
+    """Pin the accepted replay artifact without copying its large video payload."""
+
+    snapshots = _snapshot_evidence_roots(
+        {"accepted replay dataset": candidate.replay_dataset}
+    )
+    snapshot = snapshots[0]
+    artifact = next(
+        (
+            item
+            for item in candidate.bundle.manifest["artifacts"]
+            if item["name"] == REPLAY_DATASET_ARTIFACT
+        ),
+        None,
+    )
+    if artifact is None:
+        raise ValidationError("accepted policy candidate lacks its replay dataset artifact")
+    expected = {
+        key: artifact[key]
+        for key in ("directories", "files", "file_count", "byte_count", "inventory_sha256")
+    }
+    if dict(snapshot.inventory) != expected:
+        raise ValidationError("accepted replay dataset differs from signed candidate bytes")
+    return snapshot
+
+
+def _snapshot_input_files(
+    files: Mapping[str, str | Path],
+) -> tuple[_InputFileSnapshot, ...]:
+    """Hash reviewed files while retaining their exact filesystem identity."""
+
+    return tuple(snapshot_file(path, label=label) for label, path in files.items())
+
+
+def _require_input_file_snapshots(expected: tuple[_InputFileSnapshot, ...]) -> None:
+    current = _snapshot_input_files(
+        {snapshot.label: snapshot.path for snapshot in expected}
+    )
+    if current != expected:
+        raise ValidationError("reviewed policy input changed during shadow production")
+
+
+def _expect_added_files(
+    before: tuple[_EvidenceRootSnapshot, ...],
+    added: Mapping[Path, bytes],
+) -> tuple[_EvidenceRootSnapshot, ...]:
+    """Permit only named immutable files to join an already-pinned evidence tree."""
+
+    after = _snapshot_evidence_roots(
+        {snapshot.label: snapshot.path for snapshot in before}
+    )
+    additions_by_root: dict[Path, dict[str, dict[str, Any]]] = {
+        snapshot.path: {} for snapshot in before
+    }
+    for path, expected_bytes in added.items():
+        resolved = Path(os.path.abspath(os.fspath(path)))
+        owner = next(
+            (snapshot.path for snapshot in before if resolved.is_relative_to(snapshot.path)),
+            None,
+        )
+        if owner is None:
+            raise ValidationError(f"added policy evidence is outside its pinned roots: {resolved}")
+        relative = resolved.relative_to(owner).as_posix()
+        additions_by_root[owner][relative] = {
+            "path": relative,
+            "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+            "size_bytes": len(expected_bytes),
+        }
+
+    for old, new in zip(before, after, strict=True):
+        if (old.label, old.path, old.device, old.inode) != (
+            new.label,
+            new.path,
+            new.device,
+            new.inode,
+        ):
+            raise ValidationError("policy evidence root changed before handoff sealing")
+        if old.inventory["directories"] != new.inventory["directories"]:
+            raise ValidationError("policy evidence layout changed before handoff sealing")
+        old_files = {item["path"]: item for item in old.inventory["files"]}
+        new_files = {item["path"]: item for item in new.inventory["files"]}
+        expected_paths = set(old_files) | set(additions_by_root[old.path])
+        if set(new_files) != expected_paths:
+            raise ValidationError("unexpected policy evidence changed before handoff sealing")
+        for path, entry in old_files.items():
+            if new_files[path] != entry:
+                raise ValidationError("policy evidence bytes changed before handoff sealing")
+        for path, entry in additions_by_root[old.path].items():
+            if new_files[path] != entry:
+                raise ValidationError("added policy evidence differs from its exact bytes")
+    return after
+
+
+def _require_policy_sources(
+    bundle: str | Path,
+    candidate: AcceptedPolicyCandidate,
+    *,
+    handoff_root: str | Path,
+    repo_root: str | Path,
+    identity: viola_handoff.RuntimeIdentity,
+    root_snapshots: tuple[_EvidenceRootSnapshot, ...] = (),
+    input_files: tuple[_InputFileSnapshot, ...] = (),
+) -> None:
+    """Recheck every mutable source that remains authoritative for this result."""
+
+    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
+    _require_current_identity(repo_root, identity)
+    _require_evidence_snapshot(root_snapshots)
+    _require_input_file_snapshots(input_files)
+
+
+def _seal_guarded(
+    request: viola_handoff.SealRequest,
+    *,
+    evidence_logger: viola_handoff.EvidenceLogger | None,
+    wandb_entity: str,
+    snapshots: tuple[_EvidenceRootSnapshot, ...],
+    artifact_names: Mapping[str, str],
+    validate_sources: Callable[[], None],
+    repo_root: str | Path,
+) -> viola_handoff.VerifiedBundle:
+    """Seal only the exact evidence retained through the handoff W&B call."""
+
+    payload = next(
+        snapshot for snapshot in snapshots if snapshot.label not in artifact_names
+    )
+    publication = PublicationSnapshot(
+        payload=payload,
+        artifacts=tuple(
+            (artifact_names[snapshot.label], snapshot)
+            for snapshot in snapshots
+            if snapshot.label in artifact_names
+        ),
+    )
+    logger = GuardedEvidenceLogger(
+        delegate=evidence_logger or viola_handoff.WandbEvidenceLogger(entity=wandb_entity),
+        snapshot=publication,
+        identity=request.producer,
+        identity_capture=lambda: viola_handoff.RuntimeIdentity.capture(
+            role="pc_a", repo_root=repo_root
+        ),
+        operation="policy evidence",
+        source_validator=validate_sources,
+    )
+    validate_sources()
+    _require_evidence_snapshot(snapshots)
+    bundle = viola_handoff.seal_bundle(request, evidence_logger=logger)
+    require_sealed_bundle_matches(
+        bundle,
+        request,
+        publication,
+        operation="policy evidence",
+        permission="evidence_only",
+        consumer_role="pc_b",
+    )
+    validate_sources()
+    _require_evidence_snapshot(snapshots)
+    return bundle
 
 
 def _repo_identity(identity: viola_handoff.RuntimeIdentity) -> dict[str, Any]:
@@ -1243,15 +1514,6 @@ def _require_pc_a_identity(identity: viola_handoff.RuntimeIdentity) -> None:
             "policy evidence requires a complete Python 3.12 / LeRobot 0.6.1 "
             "lerobot-environment identity"
         )
-
-
-def _seal(
-    request: viola_handoff.SealRequest,
-    evidence_logger: viola_handoff.EvidenceLogger | None,
-) -> viola_handoff.VerifiedBundle:
-    if evidence_logger is None:
-        return viola_handoff.seal_bundle(request)
-    return viola_handoff.seal_bundle(request, evidence_logger=evidence_logger)
 
 
 def _utc(value: datetime) -> datetime:

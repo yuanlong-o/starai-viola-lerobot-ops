@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import viola_handoff
+import viola_ops.setup as setup_ops
 from viola_ops.errors import SafetyGateError, ValidationError
 from viola_ops.jsonutil import sha256_file, sha256_json
 from viola_ops.schemas import EXECUTOR_CAPABILITIES, VIOLA_JOINTS
@@ -259,6 +261,241 @@ def test_finished_publish_rejects_reviewed_source_changed_inside_publisher(
         )
 
     assert not (root / "frozen_state_capture_WANDB_SYNCED.json").exists()
+
+
+@pytest.mark.parametrize("upload_only", [False, True], ids=["fresh", "upload-only"])
+def test_publish_rejects_byte_identical_capture_root_replacement(
+    tmp_path, monkeypatch, upload_only: bool
+) -> None:
+    monkeypatch.setattr(
+        viola_handoff.RuntimeIdentity,
+        "capture",
+        classmethod(lambda cls, **kwargs: _identity()),
+    )
+    if upload_only:
+        setup, root, base = _leave_publishable_capture(tmp_path, monkeypatch)
+        now = lambda: base + timedelta(seconds=1)
+    else:
+        setup = _setup(tmp_path)
+        root = tmp_path / "capture"
+        base = datetime.now(UTC)
+        times = iter((base, base + timedelta(milliseconds=1), base + timedelta(seconds=1)))
+        now = lambda: next(times)
+
+    original_root = tmp_path / "original-capture"
+
+    def publish_then_replace_root(identity, **_kwargs):
+        root.rename(original_root)
+        shutil.copytree(original_root, root)
+        return identity
+
+    with pytest.raises(ValidationError, match="changed during W&B publication"):
+        capture_frozen_state(
+            setup,
+            output_root=root,
+            operator="operator",
+            repo_root=_repo_root(tmp_path),
+            wandb_entity="entity",
+            confirm=(None if upload_only else lambda _challenge: True),
+            port_factory=(
+                (lambda _path, _baud: pytest.fail("port constructed"))
+                if upload_only
+                else (lambda _path, _baud: _ReadOnlyPort())
+            ),
+            publisher=publish_then_replace_root,
+            now=now,
+            upload_only=upload_only,
+        )
+
+    assert not (root / "frozen_state_capture_WANDB_SYNCED.json").exists()
+
+
+def test_fresh_reservation_identity_is_continuously_pinned(
+    tmp_path, monkeypatch
+) -> None:
+    setup = _setup(tmp_path)
+    monkeypatch.setattr(
+        viola_handoff.RuntimeIdentity,
+        "capture",
+        classmethod(lambda cls, **kwargs: _identity()),
+    )
+    root = tmp_path / "capture"
+    original_root = tmp_path / "original-capture"
+    original_pin = setup_ops._pin_capture_root
+    replaced = False
+
+    def replace_while_acquiring_publication_pin(path, expected=None):
+        nonlocal replaced
+        if expected is not None and not replaced:
+            replaced = True
+            root.rename(original_root)
+            shutil.copytree(original_root, root)
+        return original_pin(path, expected)
+
+    monkeypatch.setattr(
+        setup_ops,
+        "_pin_capture_root",
+        replace_while_acquiring_publication_pin,
+    )
+    base = datetime.now(UTC)
+    times = iter((base, base + timedelta(milliseconds=1)))
+
+    with pytest.raises(ValidationError, match="no longer names the reserved directory"):
+        capture_frozen_state(
+            setup,
+            output_root=root,
+            operator="operator",
+            repo_root=_repo_root(tmp_path),
+            wandb_entity="entity",
+            confirm=lambda _challenge: True,
+            port_factory=lambda _path, _baud: _ReadOnlyPort(),
+            publisher=lambda *_args, **_kwargs: pytest.fail("publisher called"),
+            now=lambda: next(times),
+        )
+
+
+@pytest.mark.parametrize("damage", ["root", "identity"])
+def test_final_snapshot_rechecks_root_and_identity_after_reading(
+    tmp_path, monkeypatch, damage: str
+) -> None:
+    setup = _setup(tmp_path)
+    checkout_dirty = False
+
+    def capture_identity(cls, **_kwargs):
+        return _identity(clean=not checkout_dirty)
+
+    monkeypatch.setattr(
+        viola_handoff.RuntimeIdentity,
+        "capture",
+        classmethod(capture_identity),
+    )
+    root = tmp_path / "capture"
+    original_root = tmp_path / "original-capture"
+    original_snapshot = setup_ops._publication_snapshot
+    snapshot_calls = 0
+
+    def snapshot_then_damage(*args, **kwargs):
+        nonlocal checkout_dirty, snapshot_calls
+        snapshot_calls += 1
+        snapshot = original_snapshot(*args, **kwargs)
+        if snapshot_calls == 3:
+            if damage == "root":
+                root.rename(original_root)
+                shutil.copytree(original_root, root)
+            else:
+                checkout_dirty = True
+        return snapshot
+
+    monkeypatch.setattr(setup_ops, "_publication_snapshot", snapshot_then_damage)
+    base = datetime.now(UTC)
+    times = iter((base, base + timedelta(milliseconds=1), base + timedelta(seconds=1)))
+
+    with pytest.raises(ValidationError, match="writing the W&B sync receipt"):
+        capture_frozen_state(
+            setup,
+            output_root=root,
+            operator="operator",
+            repo_root=_repo_root(tmp_path),
+            wandb_entity="entity",
+            confirm=lambda _challenge: True,
+            port_factory=lambda _path, _baud: _ReadOnlyPort(),
+            publisher=lambda identity, **_kwargs: identity,
+            now=lambda: next(times),
+        )
+
+
+def test_upload_only_rechecks_change_after_publish_before_sync(tmp_path, monkeypatch) -> None:
+    setup, root, base = _leave_publishable_capture(tmp_path, monkeypatch)
+    published = False
+
+    def publish(identity, **_kwargs):
+        nonlocal published
+        published = True
+        return identity
+
+    def mutate_before_sync() -> datetime:
+        assert published is True
+        state_path = root / "frozen_state.json"
+        state_path.chmod(0o644)
+        state_path.write_bytes(state_path.read_bytes() + b"\n")
+        state_path.chmod(0o444)
+        return base + timedelta(seconds=1)
+
+    with pytest.raises(ValidationError, match="writing the W&B sync receipt"):
+        capture_frozen_state(
+            setup,
+            output_root=root,
+            operator="operator",
+            repo_root=_repo_root(tmp_path),
+            wandb_entity="entity",
+            upload_only=True,
+            confirm=lambda _challenge: pytest.fail("confirmation called"),
+            port_factory=lambda _path, _baud: pytest.fail("port constructed"),
+            publisher=publish,
+            now=mutate_before_sync,
+        )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["capture-bytes", "layout", "reviewed-source", "root-replacement", "dirty-checkout"],
+)
+def test_final_sync_revalidation_rejects_change_during_receipt_write(
+    tmp_path, monkeypatch, damage: str
+) -> None:
+    setup = _setup(tmp_path)
+    checkout_dirty = False
+
+    def capture_identity(cls, **_kwargs):
+        return _identity(clean=not checkout_dirty)
+
+    monkeypatch.setattr(
+        viola_handoff.RuntimeIdentity,
+        "capture",
+        classmethod(capture_identity),
+    )
+    root = tmp_path / "capture"
+    original_root = tmp_path / "original-capture"
+    original_writer = setup_ops.write_canonical_json
+
+    def write_then_damage(path, payload):
+        nonlocal checkout_dirty
+        written = original_writer(path, payload)
+        if Path(path).name != "frozen_state_capture_WANDB_SYNCED.json":
+            return written
+        if damage == "capture-bytes":
+            state_path = root / "frozen_state.json"
+            state_path.chmod(0o644)
+            state_path.write_bytes(state_path.read_bytes() + b"\n")
+            state_path.chmod(0o444)
+        elif damage == "layout":
+            (root / "unexpected.json").write_text("{}\n", encoding="utf-8")
+        elif damage == "reviewed-source":
+            with setup.open("ab") as handle:
+                handle.write(b"\n")
+        elif damage == "root-replacement":
+            root.rename(original_root)
+            shutil.copytree(original_root, root)
+        else:
+            checkout_dirty = True
+        return written
+
+    monkeypatch.setattr(setup_ops, "write_canonical_json", write_then_damage)
+    base = datetime.now(UTC)
+    times = iter((base, base + timedelta(milliseconds=1), base + timedelta(seconds=1)))
+
+    with pytest.raises(ValidationError, match="writing the W&B sync receipt"):
+        capture_frozen_state(
+            setup,
+            output_root=root,
+            operator="operator",
+            repo_root=_repo_root(tmp_path),
+            wandb_entity="entity",
+            confirm=lambda _challenge: True,
+            port_factory=lambda _path, _baud: _ReadOnlyPort(),
+            publisher=lambda identity, **_kwargs: identity,
+            now=lambda: next(times),
+        )
 
 
 def test_capture_refuses_without_operator_action_before_port_factory(tmp_path, monkeypatch) -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -10,10 +12,11 @@ import numpy as np
 import pytest
 
 import viola_handoff
+import viola_ops.policy_ops as policy_ops
 from viola_handoff import RuntimeIdentity, inspect_bundle
 from viola_ops.errors import ValidationError
 from viola_ops.jsonutil import sha256_file, sha256_json, write_canonical_json
-from viola_ops.policies import CANONICAL_TASK, get_policy_spec
+from viola_ops.policies import CANONICAL_TASK, POLICY_TOKENS, get_policy_spec
 from viola_ops.policy_ops import (
     ShadowEvidence,
     _load_frozen_state,
@@ -21,6 +24,9 @@ from viola_ops.policy_ops import (
     verify_command,
 )
 from viola_ops.policy_runtime import AcceptedPolicyCandidate
+
+
+_REAL_SNAPSHOT_REPLAY_SOURCE = policy_ops._snapshot_replay_source
 
 
 class FakeEvidence:
@@ -110,6 +116,25 @@ def _stable_runtime_identity(monkeypatch: Any) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _small_policy_input_snapshots(tmp_path: Path, monkeypatch: Any) -> None:
+    """Keep orchestration tests small; policy_runtime tests cover the real copier."""
+
+    replay = tmp_path / "accepted-replay"
+    replay.mkdir()
+    replay.joinpath("frame.bin").write_bytes(b"accepted replay")
+    replay_snapshot = policy_ops._snapshot_evidence_roots(
+        {"accepted replay dataset": replay}
+    )[0]
+
+    @contextmanager
+    def passthrough(candidate: AcceptedPolicyCandidate):
+        yield SimpleNamespace(candidate=candidate, verify=lambda: None)
+
+    monkeypatch.setattr(policy_ops, "_snapshot_candidate_runtime", passthrough)
+    monkeypatch.setattr(policy_ops, "_snapshot_replay_source", lambda _candidate: replay_snapshot)
+
+
 def _repo_root(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir(exist_ok=True)
@@ -160,6 +185,82 @@ def _eligible_verification_for_shadow(
         producer_identity=_identity(),
         clock=FastClock(),
         attempt_id="verification-for-shadow",
+    )
+
+
+def _install_live_shadow_fixture(tmp_path: Path, monkeypatch: Any) -> SimpleNamespace:
+    """Install small reviewed setup/frozen-state fakes without opening devices."""
+
+    setup_path = tmp_path / "reviewed-setup.json"
+    setup_path.write_text("{}\n", encoding="utf-8")
+    calibration = tmp_path / "calibration.json"
+    reset = tmp_path / "reset.md"
+    entrypoint = tmp_path / "executor.py"
+    for path in (calibration, reset, entrypoint):
+        path.write_text(f"reviewed {path.name}\n", encoding="utf-8")
+    setup = SimpleNamespace(
+        source_path=setup_path,
+        setup_id="setup-one",
+        cameras={},
+        calibration_path=calibration,
+        reset_protocol_path=reset,
+        executor_entrypoint=entrypoint,
+        executor={
+            "commit": _identity().repository_commit,
+            "entrypoint_sha256": sha256_file(entrypoint),
+        },
+        estop={"operator": "operator"},
+        robot_port="/dev/never-opened",
+        joint_limits={
+            name: ([0.0, 1.0] if name == "gripper" else [-1.0, 1.0])
+            for name in policy_ops.JOINT_NAMES
+        },
+        max_step_deltas={name: 0.1 for name in policy_ops.JOINT_NAMES},
+        speed_scale=1.0,
+    )
+    monkeypatch.setattr(policy_ops, "load_reviewed_setup", lambda *_args, **_kwargs: setup)
+
+    frozen_root = tmp_path / "frozen-state"
+    frozen_root.mkdir()
+    frozen_files = tuple(
+        frozen_root.joinpath(name)
+        for name in (
+            "frozen_state.json",
+            "frozen_state_capture.json",
+            "frozen_state_capture_WANDB_SYNCED.json",
+        )
+    )
+    for path in frozen_files:
+        path.write_text(f"signed {path.name}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        policy_ops,
+        "_load_frozen_state",
+        lambda *_args, **_kwargs: (
+            (0.0,) * 7,
+            {"setup_id": "setup-one"},
+            frozen_files,
+        ),
+    )
+
+    class Recorder:
+        def __init__(self, _root: Path) -> None:
+            pass
+
+        def record(self, _frames: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(policy_ops, "_VideoPairRecorder", Recorder)
+    return SimpleNamespace(
+        setup=setup,
+        setup_path=setup_path,
+        frozen_root=frozen_root,
+        frozen_files=frozen_files,
+        calibration=calibration,
+        reset=reset,
+        entrypoint=entrypoint,
     )
 
 
@@ -232,18 +333,35 @@ def _frozen_state_material(tmp_path: Path) -> tuple[Path, dict[str, str], dict[s
     return root, setup_hashes, repo
 
 
+@pytest.mark.parametrize("token", POLICY_TOKENS)
 def test_verify_command_records_online_sidecar_without_hardware(
-    tmp_path: Path, monkeypatch: Any
+    tmp_path: Path, monkeypatch: Any, token: str
 ) -> None:
-    candidate = _candidate("pi0_fast")
+    candidate = _candidate(token)
     monkeypatch.setattr("viola_ops.policy_ops.inspect_candidate", lambda _path: candidate)
+    private_checkpoint = tmp_path / "private-runtime-checkpoint"
+    private_checkpoint.mkdir()
+    runtime_candidates: list[AcceptedPolicyCandidate] = []
+
+    @contextmanager
+    def private_runtime_inputs(source: AcceptedPolicyCandidate):
+        yield SimpleNamespace(
+            candidate=replace(source, checkpoint=private_checkpoint),
+            verify=lambda: None,
+        )
+
+    def runtime_factory(source: AcceptedPolicyCandidate) -> FakeRuntime:
+        runtime_candidates.append(source)
+        return FakeRuntime()
+
+    monkeypatch.setattr(policy_ops, "_snapshot_candidate_runtime", private_runtime_inputs)
     calls, publisher = _publisher_calls()
     evidence = verify_command(
         "/accepted/candidate",
         tmp_path / "output",
         _repo_root(tmp_path),
         wandb_entity="test",
-        runtime_factory=lambda _candidate: FakeRuntime(),
+        runtime_factory=runtime_factory,
         observation_loader=lambda _candidate: _observation(),
         publisher=publisher,
         producer_identity=_identity(),
@@ -255,8 +373,9 @@ def test_verify_command_records_online_sidecar_without_hardware(
     assert evidence.sync_path.is_file()
     assert evidence.terminal_bundle is None
     assert calls[0]["config"]["operation"] == "policy_verify"
-    assert calls[0]["config"]["policy"] == "pi0_fast"
+    assert calls[0]["config"]["policy"] == token
     assert calls[0]["summary"]["latency_trials"] == 200
+    assert [source.checkpoint for source in runtime_candidates] == [private_checkpoint]
 
 
 def test_verify_command_seals_a_typed_runtime_terminal(
@@ -290,10 +409,58 @@ def test_verify_command_seals_a_typed_runtime_terminal(
     }
 
 
-def test_replay_shadow_command_publishes_and_seals_repo_b_shape(
-    tmp_path: Path, monkeypatch: Any
+@pytest.mark.parametrize("mutation", ("evidence", "canonical-source"))
+def test_ineligible_verify_guards_the_handoff_wandb_boundary(
+    tmp_path: Path, monkeypatch: Any, mutation: str
 ) -> None:
     candidate = _candidate()
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    output = tmp_path / "output"
+    revoked = False
+
+    def canonical(accepted: Any, **_kwargs: Any) -> Any:
+        if revoked:
+            raise viola_handoff.BundleValidationError("candidate was revoked")
+        return accepted
+
+    monkeypatch.setattr(viola_handoff, "require_active_canonical_source", canonical)
+
+    class BoundaryLogger:
+        def record(self, **kwargs: Any) -> str:
+            nonlocal revoked
+            if mutation == "evidence":
+                next(output.rglob("shadow_evidence.json")).parent.joinpath(
+                    "unexpected.txt"
+                ).write_text("changed\n", encoding="utf-8")
+            else:
+                revoked = True
+            return f"https://wandb.ai/test/{kwargs['project']}/runs/{kwargs['run_id']}"
+
+    with pytest.raises(ValidationError):
+        verify_command(
+            "/accepted/candidate",
+            output,
+            _repo_root(tmp_path),
+            handoff_root=tmp_path / "handoffs",
+            wandb_entity="test",
+            runtime_factory=lambda _candidate: FakeRuntime([0.0] * 6 + [float("nan")]),
+            observation_loader=lambda _candidate: _observation(),
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=BoundaryLogger(),
+            attempt_id=f"guard-{mutation}",
+        )
+
+    bundles = list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
+    assert len(bundles) == 1
+    assert not (bundles[0] / "READY.json").exists()
+
+
+@pytest.mark.parametrize("token", POLICY_TOKENS)
+def test_replay_shadow_command_publishes_and_seals_repo_b_shape(
+    tmp_path: Path, monkeypatch: Any, token: str
+) -> None:
+    candidate = _candidate(token)
     monkeypatch.setattr("viola_ops.policy_ops.inspect_candidate", lambda _path: candidate)
     calls, publisher = _publisher_calls()
     verification = verify_command(
@@ -416,7 +583,7 @@ def test_shadow_rejects_revocation_during_online_publication(
 
     assert freshness_checks == 2
     attempt = next((tmp_path / "output").rglob("revoked-during-shadow-publish"))
-    assert (attempt / "payload" / "shadow_evidence.json").is_file()
+    assert not (attempt / "payload" / "shadow_evidence.json").exists()
     assert not (attempt / "payload" / "shadow_WANDB_SYNCED.json").exists()
     assert not list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
 
@@ -458,6 +625,290 @@ def test_shadow_rejects_artifact_mutation_during_online_publication(
     assert not list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
 
 
+def test_replay_shadow_rejects_accepted_dataset_drift_during_the_run(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    replay = tmp_path / "accepted-dataset"
+    replay.mkdir()
+    replay_file = replay / "heldout.bin"
+    replay_file.write_bytes(b"signed replay bytes")
+    replay_inventory = viola_handoff.inventory_root(replay)
+    base = _candidate()
+    candidate = replace(
+        base,
+        replay_dataset=replay,
+        bundle=SimpleNamespace(
+            bundle_id=base.bundle_id,
+            content_id=base.content_id,
+            manifest={
+                "experiment": "viola-test",
+                "artifacts": [
+                    {
+                        "name": "replay_dataset",
+                        "root": str(replay),
+                        **replay_inventory,
+                    }
+                ],
+            },
+        ),
+    )
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    repository = _repo_root(tmp_path)
+    verification = _eligible_verification_for_shadow(tmp_path, repository)
+    monkeypatch.setattr(policy_ops, "_snapshot_replay_source", _REAL_SNAPSHOT_REPLAY_SOURCE)
+
+    def changed_replay(_candidate: Any) -> list[dict[str, Any]]:
+        replay_file.write_bytes(b"changed replay bytes")
+        return _frames()
+
+    with pytest.raises(ValidationError, match="policy evidence changed"):
+        shadow_command(
+            "/accepted/candidate",
+            "replay",
+            verification.verification_path,
+            tmp_path / "output",
+            repository,
+            tmp_path / "handoffs",
+            wandb_entity="test",
+            runtime_factory=lambda _candidate: FakeRuntime(),
+            replay_loader=changed_replay,
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=FakeEvidence(),
+            clock=FastClock(),
+            attempt_id="changed-accepted-replay",
+        )
+
+    assert not list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
+
+
+def test_shadow_guards_artifacts_across_handoff_wandb(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    repository = _repo_root(tmp_path)
+    verification = _eligible_verification_for_shadow(tmp_path, repository)
+    output = tmp_path / "output"
+
+    class MutatingLogger:
+        def record(self, **kwargs: Any) -> str:
+            next(output.rglob("shadow_record")).joinpath("unexpected.txt").write_text(
+                "changed\n", encoding="utf-8"
+            )
+            return f"https://wandb.ai/test/{kwargs['project']}/runs/{kwargs['run_id']}"
+
+    with pytest.raises(ValidationError, match="shadow artifact bytes changed"):
+        shadow_command(
+            "/accepted/candidate",
+            "replay",
+            verification.verification_path,
+            output,
+            repository,
+            tmp_path / "handoffs",
+            wandb_entity="test",
+            runtime_factory=lambda _candidate: FakeRuntime(),
+            replay_loader=lambda _candidate: _frames(),
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=MutatingLogger(),
+            clock=FastClock(),
+            attempt_id="mutated-during-handoff-wandb",
+        )
+
+    bundle = next((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
+    assert not (bundle / "READY.json").exists()
+
+
+@pytest.mark.parametrize("source_name", ("verification", "sync"))
+def test_shadow_rejects_verification_changed_between_load_and_copy(
+    tmp_path: Path,
+    monkeypatch: Any,
+    source_name: str,
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    repository = _repo_root(tmp_path)
+    verification = _eligible_verification_for_shadow(tmp_path, repository)
+    verification_path = verification.verification_path
+    sync_path = verification.sync_path
+    target = verification_path if source_name == "verification" else sync_path
+    original_copy = policy_ops.copy_regular_file
+    mutated = False
+
+    def mutate_then_copy(source: Path, destination: Path) -> Path:
+        nonlocal mutated
+        if Path(source) == target and not mutated:
+            mutated = True
+            target.chmod(0o644)
+            target.write_bytes(target.read_bytes() + b"\n")
+        return original_copy(source, destination)
+
+    monkeypatch.setattr(policy_ops, "copy_regular_file", mutate_then_copy)
+    with pytest.raises(
+        ValidationError,
+        match="copied runtime verification differs|reviewed policy input changed",
+    ):
+        shadow_command(
+            "/accepted/candidate",
+            "replay",
+            verification_path,
+            tmp_path / "output",
+            repository,
+            tmp_path / "handoffs",
+            wandb_entity="test",
+            runtime_factory=lambda _candidate: FakeRuntime(),
+            replay_loader=lambda _candidate: _frames(),
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=FakeEvidence(),
+            clock=FastClock(),
+            attempt_id=f"changed-{source_name}-before-copy",
+        )
+
+    assert mutated is True
+    assert not list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
+
+
+@pytest.mark.parametrize("mutation", ("setup", "frozen-state"))
+def test_live_soak_rechecks_reviewed_inputs_after_the_long_run(
+    tmp_path: Path, monkeypatch: Any, mutation: str
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    repository = _repo_root(tmp_path)
+    verification = _eligible_verification_for_shadow(tmp_path, repository)
+    live = _install_live_shadow_fixture(tmp_path, monkeypatch)
+
+    def mutate_reviewed_source(*_args: Any, **_kwargs: Any) -> Any:
+        target = live.setup_path if mutation == "setup" else live.frozen_files[0]
+        target.write_text("changed during soak\n", encoding="utf-8")
+        return SimpleNamespace(status="passed", summary={"captured_observations": 0})
+
+    monkeypatch.setattr(policy_ops, "run_live_soak", mutate_reviewed_source)
+    with pytest.raises(ValidationError, match="changed during shadow|policy evidence changed"):
+        shadow_command(
+            "/accepted/candidate",
+            "live-soak",
+            verification.verification_path,
+            tmp_path / "output",
+            repository,
+            tmp_path / "handoffs",
+            setup_path=live.setup_path,
+            frozen_state_path=live.frozen_root,
+            wandb_entity="test",
+            cameras={"front": object(), "up": object()},
+            runtime_factory=lambda _candidate: FakeRuntime(),
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=FakeEvidence(),
+            attempt_id=f"changed-live-{mutation}",
+        )
+
+    assert not list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
+
+
+@pytest.mark.parametrize("source_name", ("calibration", "reset", "entrypoint"))
+def test_live_soak_rejects_setup_file_changed_while_being_pinned(
+    tmp_path: Path,
+    monkeypatch: Any,
+    source_name: str,
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    repository = _repo_root(tmp_path)
+    verification = _eligible_verification_for_shadow(tmp_path, repository)
+    live = _install_live_shadow_fixture(tmp_path, monkeypatch)
+    target = getattr(live, source_name)
+    loads = 0
+
+    def mutate_on_reload(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal loads
+        loads += 1
+        if loads == 2:
+            target.write_text("changed while pinning\n", encoding="utf-8")
+        return live.setup
+
+    monkeypatch.setattr(policy_ops, "load_reviewed_setup", mutate_on_reload)
+    camera_calls: list[object] = []
+    monkeypatch.setattr(
+        policy_ops._OpenedCameras,
+        "open",
+        classmethod(lambda cls, *_args, **_kwargs: camera_calls.append(object())),
+    )
+
+    with pytest.raises(ValidationError, match="reviewed policy input changed"):
+        shadow_command(
+            "/accepted/candidate",
+            "live-soak",
+            verification.verification_path,
+            tmp_path / "output",
+            repository,
+            tmp_path / "handoffs",
+            setup_path=live.setup_path,
+            frozen_state_path=live.frozen_root,
+            wandb_entity="test",
+            runtime_factory=lambda _candidate: FakeRuntime(),
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=FakeEvidence(),
+            attempt_id=f"changed-{source_name}-while-pinning",
+        )
+
+    assert camera_calls == []
+
+
+def test_live_soak_rechecks_canonical_candidate_before_camera_open(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    candidate = _candidate()
+    monkeypatch.setattr(policy_ops, "inspect_candidate", lambda _path: candidate)
+    repository = _repo_root(tmp_path)
+    verification = _eligible_verification_for_shadow(tmp_path, repository)
+    live = _install_live_shadow_fixture(tmp_path, monkeypatch)
+    freshness_checks = 0
+
+    def revoke_on_final_pre_camera_check(accepted: Any, **_kwargs: Any) -> Any:
+        nonlocal freshness_checks
+        freshness_checks += 1
+        if freshness_checks == 3:
+            raise viola_handoff.BundleValidationError("candidate revoked")
+        return accepted
+
+    monkeypatch.setattr(
+        viola_handoff,
+        "require_active_canonical_source",
+        revoke_on_final_pre_camera_check,
+    )
+    camera_calls: list[object] = []
+    monkeypatch.setattr(
+        policy_ops._OpenedCameras,
+        "open",
+        classmethod(lambda cls, *_args, **_kwargs: camera_calls.append(object())),
+    )
+
+    with pytest.raises(ValidationError, match="canonical policy candidate"):
+        shadow_command(
+            "/accepted/candidate",
+            "live-soak",
+            verification.verification_path,
+            tmp_path / "output",
+            repository,
+            tmp_path / "handoffs",
+            setup_path=live.setup_path,
+            frozen_state_path=live.frozen_root,
+            wandb_entity="test",
+            runtime_factory=lambda _candidate: FakeRuntime(),
+            publisher=lambda identity, **_kwargs: identity,
+            producer_identity=_identity(),
+            bundle_evidence_logger=FakeEvidence(),
+            attempt_id="revoked-before-camera-open",
+        )
+
+    assert camera_calls == []
+
+
 def test_shadow_rechecks_evidence_immediately_before_sealing(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -471,8 +922,9 @@ def test_shadow_rechecks_evidence_immediately_before_sealing(
     def mutate_during_final_freshness(accepted: Any, **_kwargs: Any) -> Any:
         nonlocal freshness_checks
         freshness_checks += 1
-        if freshness_checks == 3:
-            trace = next(output.rglob("action_trace.jsonl"))
+        traces = list(output.rglob("action_trace.jsonl"))
+        if traces:
+            trace = traces[0]
             trace.write_bytes(trace.read_bytes() + b"{}\n")
         return accepted
 
@@ -499,8 +951,22 @@ def test_shadow_rechecks_evidence_immediately_before_sealing(
             attempt_id="mutated-before-shadow-seal",
         )
 
-    assert freshness_checks == 3
+    assert freshness_checks >= 4
     assert not list((tmp_path / "handoffs" / "shadow_evidence").glob("*"))
+
+
+def test_sync_receipt_is_the_only_exact_change_allowed_after_publication(
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    payload.joinpath("verification.json").write_bytes(b"verified")
+    before = policy_ops._snapshot_evidence_roots({"verification payload": payload})
+    receipt = payload / "verification_WANDB_SYNCED.json"
+    receipt.write_bytes(b"wrong receipt")
+
+    with pytest.raises(ValidationError, match="differs from its exact bytes"):
+        policy_ops._expect_added_files(before, {receipt: b"expected receipt"})
 
 
 def test_unsafe_shadow_summary_never_says_passed(tmp_path: Path) -> None:
@@ -844,7 +1310,7 @@ def test_verify_rejects_revocation_during_online_publication(
 
     assert freshness_checks == 2
     attempt = next((tmp_path / "output").rglob("revoked-during-publish"))
-    assert (attempt / "verification.json").is_file()
+    assert not (attempt / "verification.json").exists()
     assert not (attempt / "verification_WANDB_SYNCED.json").exists()
 
 

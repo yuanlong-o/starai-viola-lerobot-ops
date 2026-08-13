@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -21,6 +23,7 @@ from viola_ops.dataset import (
     TASK,
     TRAIN_EPISODES,
     DatasetSpec,
+    DatasetValidationResult,
     release_dataset,
     validate_dataset,
 )
@@ -75,6 +78,15 @@ class FakeEvidence:
         return f"https://wandb.ai/tester/{event['project']}/runs/{event['run_id']}"
 
 
+@dataclass
+class MutatingEvidence:
+    mutation: Callable[[], None]
+
+    def record(self, **event: Any) -> str:
+        self.mutation()
+        return f"https://wandb.ai/tester/{event['project']}/runs/{event['run_id']}"
+
+
 def _identity() -> viola_handoff.RuntimeIdentity:
     return viola_handoff.RuntimeIdentity(
         role="pc_a",
@@ -91,6 +103,12 @@ def _repo_root(tmp_path: Path) -> Path:
     repository = tmp_path / "repo-a"
     repository.mkdir()
     return repository
+
+
+def _replace_tree_with_same_bytes(path: Path) -> None:
+    old = path.with_name(f"{path.name}-old")
+    path.rename(old)
+    shutil.copytree(old, path)
 
 
 def _dataset_fixture(tmp_path: Path) -> tuple[Path, DatasetSpec, FakeDataset]:
@@ -191,6 +209,19 @@ def _dataset_fixture(tmp_path: Path) -> tuple[Path, DatasetSpec, FakeDataset]:
     return root, spec, FakeDataset(spec)
 
 
+def _validated_release_fixture(
+    tmp_path: Path,
+) -> tuple[Path, DatasetSpec, DatasetValidationResult]:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    return root, spec, validation
+
+
 def test_current_v1_facts_are_locked() -> None:
     assert len(ACCEPTED_SOURCE_EPISODES) == 34
     assert ACCEPTED_SOURCE_EPISODES[-7:] == (71, 72, 73, 74, 75, 76, 77)
@@ -265,6 +296,7 @@ def test_release_seals_repo_b_v1_payload_without_nas_or_wandb(tmp_path: Path) ->
         wandb_project="viola-test",
         repo_root=_repo_root(tmp_path),
         producer_identity=_identity(),
+        identity_capture=_identity,
         evidence_logger=evidence,
         validation=validation,
         spec=spec,
@@ -324,6 +356,7 @@ def test_wandb_failure_never_publishes_a_ready_dataset_release(tmp_path: Path) -
             material_root=tmp_path / "materials",
             repo_root=_repo_root(tmp_path),
             producer_identity=_identity(),
+            identity_capture=_identity,
             evidence_logger=FakeEvidence(fail=True),
             validation=validation,
             spec=spec,
@@ -497,7 +530,7 @@ def test_release_recaptures_the_clean_runtime_before_sealing(
     )
     evidence = FakeEvidence()
 
-    with pytest.raises(ValidationError, match="changed before release sealing"):
+    with pytest.raises(ValidationError, match="changed before dataset release sealing"):
         release_dataset(
             root,
             experiment="test",
@@ -550,3 +583,155 @@ def test_release_rechecks_dataset_inventory_immediately_before_sealing(
 
     assert evidence.events == []
     assert not (tmp_path / "handoffs").exists()
+
+
+@pytest.mark.parametrize("target", ["payload", "dataset"])
+def test_release_rejects_tree_replacement_during_handoff_publication(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    root, spec, validation = _validated_release_fixture(tmp_path)
+    material_root = tmp_path / "materials"
+    handoff_root = tmp_path / "handoffs"
+
+    def replace_tree() -> None:
+        path = root if target == "dataset" else next(material_root.rglob("payload"))
+        _replace_tree_with_same_bytes(path)
+
+    with pytest.raises(ValidationError, match="changed during handoff W&B publication"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=handoff_root,
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=_identity,
+            evidence_logger=MutatingEvidence(replace_tree),
+            validation=validation,
+            spec=spec,
+        )
+
+    assert not list(handoff_root.rglob("READY.json"))
+
+
+def test_release_rejects_dataset_replacement_between_caller_and_sealer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, validation = _validated_release_fixture(tmp_path)
+    handoff_root = tmp_path / "handoffs"
+    real_seal = viola_handoff.seal_bundle
+
+    def replace_then_seal(request: Any, **kwargs: Any) -> viola_handoff.VerifiedBundle:
+        _replace_tree_with_same_bytes(root)
+        return real_seal(request, **kwargs)
+
+    monkeypatch.setattr(viola_handoff, "seal_bundle", replace_then_seal)
+    with pytest.raises(ValidationError, match="validated dataset changed before"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=handoff_root,
+            material_root=tmp_path / "materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=_identity,
+            evidence_logger=FakeEvidence(),
+            validation=validation,
+            spec=spec,
+        )
+
+    assert not list(handoff_root.rglob("READY.json"))
+
+
+def test_release_rejects_checkout_dirtiness_during_handoff_publication(
+    tmp_path: Path,
+) -> None:
+    root, spec, validation = _validated_release_fixture(tmp_path)
+    handoff_root = tmp_path / "handoffs"
+    dirty = False
+
+    def capture_identity() -> viola_handoff.RuntimeIdentity:
+        return replace(_identity(), repository_clean=False) if dirty else _identity()
+
+    def dirty_checkout() -> None:
+        nonlocal dirty
+        dirty = True
+
+    with pytest.raises(ValidationError, match="runtime identity changed"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=handoff_root,
+            material_root=tmp_path / "materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=capture_identity,
+            evidence_logger=MutatingEvidence(dirty_checkout),
+            validation=validation,
+            spec=spec,
+        )
+
+    assert not list(handoff_root.rglob("READY.json"))
+
+
+def test_release_recaptures_even_with_an_injected_starting_identity(
+    tmp_path: Path,
+) -> None:
+    root, spec, validation = _validated_release_fixture(tmp_path)
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="runtime identity changed"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=tmp_path / "handoffs",
+            material_root=tmp_path / "materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=lambda: replace(_identity(), repository_commit="b" * 40),
+            evidence_logger=evidence,
+            validation=validation,
+            spec=spec,
+        )
+
+    assert evidence.events == []
+    assert not list((tmp_path / "handoffs").rglob("READY.json"))
+
+
+def test_release_rejects_an_existing_ready_inventory_mismatch(tmp_path: Path) -> None:
+    root, spec, validation = _validated_release_fixture(tmp_path)
+    handoff_root = tmp_path / "handoffs"
+    repository = _repo_root(tmp_path)
+    first = release_dataset(
+        root,
+        experiment="test",
+        handoff_root=handoff_root,
+        material_root=tmp_path / "materials",
+        repo_root=repository,
+        producer_identity=_identity(),
+        identity_capture=_identity,
+        evidence_logger=FakeEvidence(),
+        validation=validation,
+        spec=spec,
+    )
+    ready_path = first.bundle.path / "READY.json"
+    ready = json.loads(ready_path.read_text())
+    ready["inventory_sha256"] = "0" * 64
+    os.chmod(ready_path, 0o644)
+    ready_path.write_bytes(viola_handoff.canonical_json_bytes(ready))
+
+    with pytest.raises(viola_handoff.BundleValidationError):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=handoff_root,
+            material_root=tmp_path / "materials",
+            repo_root=repository,
+            producer_identity=_identity(),
+            identity_capture=_identity,
+            evidence_logger=FakeEvidence(),
+            validation=validation,
+            spec=spec,
+        )

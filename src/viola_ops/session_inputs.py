@@ -10,7 +10,7 @@ import math
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,6 +26,14 @@ from .jsonutil import (
     sha256_file,
     sha256_json,
     write_canonical_json,
+)
+from .publication_guard import (
+    GuardedEvidenceLogger,
+    PublicationSnapshot,
+    require_same_runtime,
+    require_sealed_bundle_matches,
+    snapshot_file,
+    snapshot_tree,
 )
 from .schemas import EXECUTOR_CAPABILITIES, ReviewedSetup, VIOLA_CAMERAS, VIOLA_JOINTS
 
@@ -97,6 +105,7 @@ def seal_session_inputs(
     repo_root: str | Path,
     producer_identity: viola_handoff.RuntimeIdentity | None = None,
     evidence_logger: viola_handoff.EvidenceLogger | None = None,
+    identity_capture: Callable[[], viola_handoff.RuntimeIdentity] | None = None,
     now: datetime | None = None,
 ) -> SessionInputsRelease:
     """Validate reviewed setup evidence and seal a planning-only bundle.
@@ -119,17 +128,30 @@ def seal_session_inputs(
     handoff_base = _external_output_root(
         handoff_root, repository=repository, label="handoff root"
     )
-    identity_was_captured = producer_identity is None
+    capture_identity = identity_capture or (
+        lambda: viola_handoff.RuntimeIdentity.capture(
+            role="pc_a", repo_root=repository
+        )
+    )
     identity = _producer_identity(
-        producer_identity
-        or viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repository)
+        producer_identity or capture_identity()
     )
     if identity.repository_commit != setup.executor["commit"]:
         raise ValidationError(
             "reviewed executor commit differs from the clean Repo-A producer revision"
         )
 
+    source_snapshots = (
+        snapshot_file(setup.source_path, label="reviewed setup"),
+        snapshot_file(setup.calibration_path, label="reviewed calibration"),
+        snapshot_file(setup.reset_protocol_path, label="reviewed reset protocol"),
+        snapshot_file(setup.executor_entrypoint, label="reviewed executor entrypoint"),
+    )
     source_hashes = _setup_source_hashes(setup)
+    if tuple(source_hashes.values()) != tuple(
+        snapshot.sha256 for snapshot in source_snapshots
+    ):
+        raise ValidationError("reviewed setup source hashes changed during capture")
     material_key = sha256_json(
         {
             "setup_id": setup.setup_id,
@@ -163,7 +185,8 @@ def seal_session_inputs(
     }
     hardware_setup = _hardware_payload(setup, setup_hashes)
     executor = _executor_payload(setup.executor, entrypoint)
-    setup_record_inventory = viola_handoff.inventory_root(artifact)
+    setup_record_snapshot = snapshot_tree(artifact, label="setup-record inventory")
+    setup_record_inventory = setup_record_snapshot.inventory
     session_inputs = {
         "schema_version": 1,
         "setup_id": setup.setup_id,
@@ -178,18 +201,21 @@ def seal_session_inputs(
     }
     write_canonical_json(payload / "hardware_setup.json", hardware_setup)
     write_canonical_json(payload / "session_inputs.json", session_inputs)
-    payload_inventory = viola_handoff.inventory_root(payload)
+    payload_snapshot = snapshot_tree(payload, label="session-input payload")
 
     revalidation_time = current_time if now is not None else _utc_now(None)
     current_setup = load_reviewed_setup(setup.source_path, now=revalidation_time)
     if current_setup != setup or _setup_source_hashes(current_setup) != source_hashes:
         raise ValidationError("reviewed setup changed immediately before bundle sealing")
-    if viola_handoff.inventory_root(artifact) != setup_record_inventory:
-        raise ValidationError("setup-record inventory changed before bundle sealing")
-    if viola_handoff.inventory_root(payload) != payload_inventory:
-        raise ValidationError("session-input payload changed before bundle sealing")
-    if identity_was_captured:
-        _require_same_runtime(identity, repo_root=repository)
+    publication = PublicationSnapshot(
+        payload=payload_snapshot,
+        artifacts=(("setup_record", setup_record_snapshot),),
+        sources=source_snapshots,
+    )
+    publication.require_unchanged(boundary="immediately before bundle sealing")
+    require_same_runtime(
+        identity, capture=capture_identity, operation="session-input"
+    )
 
     request = viola_handoff.SealRequest(
         root=handoff_base,
@@ -202,12 +228,37 @@ def seal_session_inputs(
         payload_dir=payload,
         artifact_roots={"setup_record": artifact},
     )
-    # The no-keyword form intentionally remains compatible with Repo B's
-    # filesystem-only cross-repository probe, which replaces this public call.
-    if evidence_logger is None:
+    # Repo B's byte-parity probe replaces ``seal_bundle`` with a one-argument
+    # filesystem sink and forces offline mode.  Real writes are online and use
+    # the guarded logger below; an unpatched offline call still fails inside
+    # the shared mandatory logger and cannot create READY.
+    offline_probe = (
+        evidence_logger is None
+        and os.environ.get("WANDB_MODE", "online").lower() != "online"
+    )
+    if offline_probe:
         bundle = viola_handoff.seal_bundle(request)
     else:
-        bundle = viola_handoff.seal_bundle(request, evidence_logger=evidence_logger)
+        guarded_logger = GuardedEvidenceLogger(
+            delegate=evidence_logger or viola_handoff.WandbEvidenceLogger(),
+            snapshot=publication,
+            identity=identity,
+            identity_capture=capture_identity,
+            operation="session-input",
+        )
+        bundle = viola_handoff.seal_bundle(request, evidence_logger=guarded_logger)
+    require_sealed_bundle_matches(
+        bundle,
+        request,
+        publication,
+        operation="session-input",
+        permission="planning_only",
+        consumer_role="pc_b",
+    )
+    require_same_runtime(
+        identity, capture=capture_identity, operation="session-input"
+    )
+    publication.require_unchanged(boundary="after bundle sealing")
     return SessionInputsRelease(
         bundle=bundle,
         material_root=material,
@@ -519,20 +570,6 @@ def _producer_identity(
     if identity.conda_environment != "lerobot":
         raise ValidationError("session-input production requires the lerobot Conda environment")
     return identity
-
-
-def _require_same_runtime(
-    original: viola_handoff.RuntimeIdentity,
-    *,
-    repo_root: Path,
-) -> None:
-    current = _producer_identity(
-        viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repo_root)
-    )
-    if current != original:
-        raise ValidationError(
-            "Repo-A commit or runtime identity changed before session-input sealing"
-        )
 
 
 def _utc_now(value: datetime | None) -> datetime:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -158,17 +158,29 @@ def capture_frozen_state(
     _require_external_root(root, repo_root)
 
     if upload_only:
-        material = _load_capture(root, setup, operator, identity, wandb_entity, wandb_project)
-        return _publish_and_sync(
-            root,
-            setup,
-            identity,
-            material,
-            publisher=publisher,
-            now=now,
-            upload_only=True,
-            repo_root=repo_root,
-        )
+        pinned_root = _pin_capture_root(root)
+        try:
+            material = _load_capture(
+                root,
+                setup,
+                operator,
+                identity,
+                wandb_entity,
+                wandb_project,
+            )
+            return _publish_and_sync(
+                root,
+                pinned_root,
+                setup,
+                identity,
+                material,
+                publisher=publisher,
+                now=now,
+                upload_only=True,
+                repo_root=repo_root,
+            )
+        finally:
+            pinned_root.close()
 
     # The leaf mkdir is the atomic reservation for one fresh capture.  It is
     # deliberately complete before confirmation or serial-port construction.
@@ -198,22 +210,29 @@ def capture_frozen_state(
                 wandb_entity,
                 wandb_project,
             )
+            # Acquire the publication pin while the reservation descriptor is
+            # still open, so no close/reopen gap exists for this directory.
+            pinned_root = _pin_capture_root(root, reservation.identity)
         except BaseException as exc:
             _clean_incomplete_capture(reservation, exc)
             raise
     finally:
         reservation.close()
 
-    return _publish_and_sync(
-        root,
-        setup,
-        identity,
-        material,
-        publisher=publisher,
-        now=now,
-        upload_only=False,
-        repo_root=repo_root,
-    )
+    try:
+        return _publish_and_sync(
+            root,
+            pinned_root,
+            setup,
+            identity,
+            material,
+            publisher=publisher,
+            now=now,
+            upload_only=False,
+            repo_root=repo_root,
+        )
+    finally:
+        pinned_root.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +245,12 @@ class _CaptureMaterial:
     disconnected_at: datetime
     wandb: WandbRunIdentity
     existing_sync: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectoryIdentity:
+    device: int
+    inode: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +272,18 @@ class _PublicationSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class _PinnedCaptureRoot:
+    """An open descriptor that pins one capture directory during publication."""
+
+    path: Path
+    descriptor: int
+    identity: _DirectoryIdentity
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True, slots=True)
 class _CaptureReservation:
     """Open handles that keep cleanup bound to the directory we created."""
 
@@ -255,6 +292,10 @@ class _CaptureReservation:
     directory_fd: int
     device: int
     inode: int
+
+    @property
+    def identity(self) -> _DirectoryIdentity:
+        return _DirectoryIdentity(self.device, self.inode)
 
     def close(self) -> None:
         os.close(self.directory_fd)
@@ -377,6 +418,7 @@ def _write_capture(
 
 def _publish_and_sync(
     root: Path,
+    pinned_root: _PinnedCaptureRoot,
     setup: Any,
     identity: RuntimeIdentity,
     material: _CaptureMaterial,
@@ -388,7 +430,20 @@ def _publish_and_sync(
 ) -> FrozenStateCapture:
     """Publish the deterministic run, then create or reuse its exact receipt."""
 
-    snapshot = _publication_snapshot(root, setup, identity, material)
+    publication_changed = (
+        "capture evidence or reviewed setup changed during W&B publication"
+    )
+    sync_changed = (
+        "capture evidence, reviewed setup, or Repo-A identity changed while "
+        "writing the W&B sync receipt"
+    )
+    snapshot = _publication_snapshot(
+        root,
+        setup,
+        identity,
+        material,
+        expected_sync=material.existing_sync,
+    )
     setup_hashes = snapshot.setup_hash_mapping()
     config = {
         "operation": "frozen_state_capture",
@@ -401,6 +456,7 @@ def _publish_and_sync(
         "frozen_state_sha256": snapshot.frozen_state_sha256,
         "state_sha256": snapshot.state_sha256,
     }
+    _require_capture_root(pinned_root)
     _require_identity_unchanged(identity, repo_root)
     try:
         published = publisher(
@@ -418,8 +474,18 @@ def _publish_and_sync(
         raise
 
     try:
-        _require_identity_unchanged(identity, repo_root)
-        _require_publication_unchanged(snapshot, root, setup, identity, material)
+        current = _revalidate_publication(
+            root,
+            pinned_root,
+            setup,
+            identity,
+            material,
+            repo_root,
+            expected_sync=material.existing_sync,
+            failure_message=publication_changed,
+        )
+        if current != snapshot:
+            raise ValidationError(publication_changed)
         if material.existing_sync is None:
             synced_at = _utc(now())
             if synced_at < material.disconnected_at:
@@ -437,11 +503,30 @@ def _publish_and_sync(
         else:
             sync = material.existing_sync
         sync_path = write_canonical_json(material.sync_path, sync)
+
+        expected_final = replace(
+            snapshot,
+            layout=snapshot.layout | {_SYNC_FILE},
+            sync_file_sha256=sha256_json(sync),
+        )
+        current = _revalidate_publication(
+            root,
+            pinned_root,
+            setup,
+            identity,
+            material,
+            repo_root,
+            expected_sync=sync,
+            failure_message=sync_changed,
+        )
+        if current != expected_final:
+            raise ValidationError(sync_changed)
     except BaseException as exc:
         exc.add_note(
             f"The finished run has no reusable local receipt at {root}; retry --upload-only."
         )
         raise
+
     return FrozenStateCapture(
         root,
         material.state_path,
@@ -570,6 +655,8 @@ def _publication_snapshot(
     setup: Any,
     identity: RuntimeIdentity,
     material: _CaptureMaterial,
+    *,
+    expected_sync: Mapping[str, Any] | None,
 ) -> _PublicationSnapshot:
     """Read the exact local inputs that a finished W&B run will describe."""
 
@@ -586,7 +673,7 @@ def _publication_snapshot(
         raise ValidationError("frozen-state material paths do not match the capture directory")
 
     expected_layout = {_STATE_FILE, _CAPTURE_FILE}
-    if material.existing_sync is not None:
+    if expected_sync is not None:
         expected_layout.add(_SYNC_FILE)
     _require_existing_directory(root)
     if _directory_names(root) != expected_layout:
@@ -621,9 +708,9 @@ def _publication_snapshot(
         raise ValidationError("frozen-state capture binding changed before publication")
 
     sync_file_sha256: str | None = None
-    if material.existing_sync is not None:
+    if expected_sync is not None:
         sync = _read_immutable_json(material.sync_path, "frozen-state W&B sync receipt")
-        if sync != material.existing_sync:
+        if sync != expected_sync:
             raise ValidationError("frozen-state W&B sync receipt changed before publication")
         sync_file_sha256 = sha256_file(material.sync_path)
 
@@ -640,26 +727,40 @@ def _publication_snapshot(
     )
 
 
-def _require_publication_unchanged(
-    expected: _PublicationSnapshot,
+def _revalidate_publication(
     root: Path,
+    pinned_root: _PinnedCaptureRoot,
     setup: Any,
     identity: RuntimeIdentity,
     material: _CaptureMaterial,
-) -> None:
-    """Revalidate setup and capture bytes after the W&B call returns."""
+    repo_root: str | Path,
+    *,
+    expected_sync: Mapping[str, Any] | None,
+    failure_message: str,
+) -> _PublicationSnapshot:
+    """Recapture every local input while the original output root stays pinned."""
 
     try:
+        _require_identity_unchanged(identity, repo_root)
+        _require_capture_root(pinned_root)
         current_setup = load_reviewed_setup(setup.source_path)
-        current = _publication_snapshot(root, current_setup, identity, material)
-    except ValidationError as exc:
-        raise ValidationError(
-            "capture evidence or reviewed setup changed during W&B publication"
-        ) from exc
-    if current_setup != setup or current != expected:
-        raise ValidationError(
-            "capture evidence or reviewed setup changed during W&B publication"
+        if current_setup != setup:
+            raise ValidationError("reviewed setup changed")
+        snapshot = _publication_snapshot(
+            root,
+            current_setup,
+            identity,
+            material,
+            expected_sync=expected_sync,
         )
+        # Snapshot construction performs several filesystem reads.  Pin and
+        # identity checks on both sides keep its result tied to this checkout
+        # and this exact output directory.
+        _require_capture_root(pinned_root)
+        _require_identity_unchanged(identity, repo_root)
+        return snapshot
+    except ValidationError as exc:
+        raise ValidationError(failure_message) from exc
 
 
 def _reviewed_setup_source_hashes(setup: Any) -> tuple[tuple[str, str], ...]:
@@ -743,6 +844,57 @@ def _repo_binding(identity: RuntimeIdentity) -> dict[str, Any]:
         "hostname": identity.hostname,
         "python": identity.python_version,
     }
+
+
+def _pin_capture_root(
+    root: Path,
+    expected: _DirectoryIdentity | None = None,
+) -> _PinnedCaptureRoot:
+    """Keep one output directory open and verify its pathname still names it."""
+
+    _require_existing_directory(root)
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise ValidationError(f"cannot safely open capture output_root {root}: {exc}") from exc
+
+    opened = os.fstat(descriptor)
+    identity = _DirectoryIdentity(opened.st_dev, opened.st_ino)
+    pinned = _PinnedCaptureRoot(root, descriptor, identity)
+    try:
+        _require_capture_root(pinned)
+        if expected is not None and identity != expected:
+            raise ValidationError(
+                "capture output_root no longer names the reserved directory"
+            )
+    except BaseException:
+        pinned.close()
+        raise
+    return pinned
+
+
+def _require_capture_root(pinned: _PinnedCaptureRoot) -> None:
+    """Require the path and open descriptor to identify the same directory."""
+
+    try:
+        opened = os.fstat(pinned.descriptor)
+        current = pinned.path.lstat()
+    except OSError as exc:
+        raise ValidationError(
+            f"capture output_root changed during publication: {pinned.path}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or _DirectoryIdentity(opened.st_dev, opened.st_ino) != pinned.identity
+        or _DirectoryIdentity(current.st_dev, current.st_ino) != pinned.identity
+    ):
+        raise ValidationError(
+            f"capture output_root changed during publication: {pinned.path}"
+        )
 
 
 def _create_capture_directory(root: Path) -> _CaptureReservation:

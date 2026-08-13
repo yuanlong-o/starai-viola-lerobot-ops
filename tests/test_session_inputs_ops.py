@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -27,6 +28,15 @@ class FakeEvidence:
         return f"https://wandb.ai/tester/{event['project']}/runs/{event['run_id']}"
 
 
+@dataclass
+class MutatingEvidence:
+    mutation: Callable[[], None]
+
+    def record(self, **event: Any) -> str:
+        self.mutation()
+        return f"https://wandb.ai/tester/{event['project']}/runs/{event['run_id']}"
+
+
 def _identity() -> viola_handoff.RuntimeIdentity:
     return viola_handoff.RuntimeIdentity(
         role="pc_a",
@@ -43,6 +53,18 @@ def _repo_root(tmp_path: Path) -> Path:
     repository = tmp_path / "repo-a"
     repository.mkdir()
     return repository
+
+
+def _replace_tree_with_same_bytes(path: Path) -> None:
+    old = path.with_name(f"{path.name}-old")
+    path.rename(old)
+    shutil.copytree(old, path)
+
+
+def _replace_file_with_same_bytes(path: Path) -> None:
+    replacement = path.with_name(f"{path.name}.replacement")
+    replacement.write_bytes(path.read_bytes())
+    os.replace(replacement, path)
 
 
 def _write_setup(tmp_path: Path, *, tested_at: datetime | None = None) -> Path:
@@ -131,6 +153,7 @@ def test_session_inputs_are_readable_and_repo_b_compatible(tmp_path: Path) -> No
         wandb_project="viola-interop-test",
         repo_root=_repo_root(tmp_path),
         producer_identity=_identity(),
+        identity_capture=_identity,
         evidence_logger=evidence,
     )
 
@@ -171,6 +194,7 @@ def test_cross_repo_probe_can_replace_capture_and_seal_calls(
         "capture",
         classmethod(lambda cls, **kwargs: identity),
     )
+    monkeypatch.setenv("WANDB_MODE", "offline")
     real_seal = viola_handoff.seal_bundle
     monkeypatch.setattr(
         viola_handoff,
@@ -441,7 +465,7 @@ def test_session_inputs_recheck_setup_record_inventory_before_sealing(
     )
     evidence = FakeEvidence()
 
-    with pytest.raises(ValidationError, match="setup-record inventory changed"):
+    with pytest.raises(ValidationError, match="setup-record inventory bytes changed"):
         seal_session_inputs(
             setup_path,
             experiment="test",
@@ -455,3 +479,155 @@ def test_session_inputs_recheck_setup_record_inventory_before_sealing(
 
     assert evidence.events == []
     assert not (tmp_path / "handoffs").exists()
+
+
+@pytest.mark.parametrize("target", ["payload", "artifact", "reviewed_source"])
+def test_session_inputs_reject_replacement_during_handoff_publication(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    setup = json.loads(setup_path.read_text())
+    material_root = tmp_path / "producer-materials"
+    handoff_root = tmp_path / "handoffs"
+
+    def replace_material() -> None:
+        if target == "reviewed_source":
+            _replace_file_with_same_bytes(Path(setup["calibration_path"]))
+            return
+        name = "payload" if target == "payload" else "setup_record"
+        _replace_tree_with_same_bytes(next(material_root.rglob(name)))
+
+    with pytest.raises(ValidationError, match="changed during handoff W&B publication"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=handoff_root,
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=_identity,
+            evidence_logger=MutatingEvidence(replace_material),
+        )
+
+    assert not list(handoff_root.rglob("READY.json"))
+
+
+def test_session_inputs_reject_payload_replacement_between_caller_and_sealer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    handoff_root = tmp_path / "handoffs"
+    real_seal = viola_handoff.seal_bundle
+
+    def replace_then_seal(request: Any, **kwargs: Any) -> viola_handoff.VerifiedBundle:
+        _replace_tree_with_same_bytes(Path(request.payload_dir))
+        return real_seal(request, **kwargs)
+
+    monkeypatch.setattr(viola_handoff, "seal_bundle", replace_then_seal)
+    with pytest.raises(ValidationError, match="session-input payload changed before"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=handoff_root,
+            material_root=tmp_path / "producer-materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=_identity,
+            evidence_logger=FakeEvidence(),
+        )
+
+    assert not list(handoff_root.rglob("READY.json"))
+
+
+def test_session_inputs_reject_checkout_dirtiness_during_handoff_publication(
+    tmp_path: Path,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    handoff_root = tmp_path / "handoffs"
+    dirty = False
+
+    def capture_identity() -> viola_handoff.RuntimeIdentity:
+        return replace(_identity(), repository_clean=False) if dirty else _identity()
+
+    def dirty_checkout() -> None:
+        nonlocal dirty
+        dirty = True
+
+    with pytest.raises(ValidationError, match="runtime identity changed"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=handoff_root,
+            material_root=tmp_path / "producer-materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=capture_identity,
+            evidence_logger=MutatingEvidence(dirty_checkout),
+        )
+
+    assert not list(handoff_root.rglob("READY.json"))
+
+
+def test_session_inputs_recapture_even_with_an_injected_starting_identity(
+    tmp_path: Path,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="runtime identity changed"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=tmp_path / "handoffs",
+            material_root=tmp_path / "producer-materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            identity_capture=lambda: replace(_identity(), repository_commit="b" * 40),
+            evidence_logger=evidence,
+        )
+
+    assert evidence.events == []
+    assert not list((tmp_path / "handoffs").rglob("READY.json"))
+
+
+def test_session_inputs_reject_an_existing_ready_inventory_mismatch(
+    tmp_path: Path,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    handoff_root = tmp_path / "handoffs"
+    repository = _repo_root(tmp_path)
+    first = seal_session_inputs(
+        setup_path,
+        experiment="test",
+        subject="cross-repo-setup-v1",
+        handoff_root=handoff_root,
+        material_root=tmp_path / "producer-materials",
+        repo_root=repository,
+        producer_identity=_identity(),
+        identity_capture=_identity,
+        evidence_logger=FakeEvidence(),
+    )
+    ready_path = first.bundle.path / "READY.json"
+    ready = json.loads(ready_path.read_text())
+    ready["inventory_sha256"] = "0" * 64
+    os.chmod(ready_path, 0o644)
+    ready_path.write_bytes(viola_handoff.canonical_json_bytes(ready))
+
+    with pytest.raises(viola_handoff.BundleValidationError):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=handoff_root,
+            material_root=tmp_path / "producer-materials",
+            repo_root=repository,
+            producer_identity=_identity(),
+            identity_capture=_identity,
+            evidence_logger=FakeEvidence(),
+        )
