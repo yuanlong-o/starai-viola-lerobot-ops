@@ -124,10 +124,13 @@ def _limits() -> ReviewedLimits:
     )
 
 
-def test_full_replay_meets_repo_b_minimums_and_resets_at_episode_boundaries() -> None:
+@pytest.mark.parametrize("token", POLICY_TOKENS)
+def test_full_replay_meets_repo_b_minimums_and_resets_at_episode_boundaries(
+    token: str,
+) -> None:
     runtime = FakeRuntime()
     run = run_replay(
-        _candidate(),
+        _candidate(token),
         runtime,
         _replay_frames(),
         clock=IncrementingClock(),
@@ -144,6 +147,10 @@ def test_full_replay_meets_repo_b_minimums_and_resets_at_episode_boundaries() ->
     assert run.rows[10]["replan"] is True
     assert run.rows[6_079]["repeat"] == 1
     assert run.trace_file_sha256 == __import__("hashlib").sha256(run.trace_bytes()).hexdigest()
+    if token == "vqbet":
+        assert "observation.images.up" not in runtime.observation_keys
+    else:
+        assert "observation.images.up" in runtime.observation_keys
 
 
 @pytest.mark.parametrize("token", POLICY_TOKENS)
@@ -196,13 +203,16 @@ def test_live_soak_runtime_exception_becomes_typed_unsafe_evidence() -> None:
     assert run.rows[-1]["event"] == "malformed_action"
 
 
-def test_live_soak_records_both_cameras_with_frozen_state_and_no_robot() -> None:
+@pytest.mark.parametrize("token", POLICY_TOKENS)
+def test_live_soak_records_both_cameras_with_frozen_state_and_no_robot(
+    token: str,
+) -> None:
     clock = ScheduledClock()
     cameras = {"front": FakeCamera(clock, 1), "up": FakeCamera(clock, 2)}
     runtime = FakeRuntime()
     state = (0.0,) * 7
     run = run_live_soak(
-        _candidate("vqbet"),
+        _candidate(token),
         runtime,
         cameras,
         frozen_state=state,
@@ -216,7 +226,10 @@ def test_live_soak_records_both_cameras_with_frozen_state_and_no_robot() -> None
     assert run.summary["frozen_state_sha256"] == state_vector_sha256(state)
     assert cameras["front"].reads == cameras["up"].reads == 9_000
     assert runtime.resets == 1
-    assert "observation.images.up" not in runtime.observation_keys
+    if token == "vqbet":
+        assert "observation.images.up" not in runtime.observation_keys
+    else:
+        assert "observation.images.up" in runtime.observation_keys
     assert all(row["up_sha256"] for row in run.rows)
 
 
