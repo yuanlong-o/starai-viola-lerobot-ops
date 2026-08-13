@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import viola_ops.rollout_evidence as rollout_evidence
-from viola_handoff import canonical_json_bytes
+from viola_handoff import RuntimeIdentity, canonical_json_bytes, inventory_root
 from viola_ops.errors import ValidationError
 from viola_ops.evidence import PhaseEvidenceFactory
 from viola_ops.execution import ACTION_KEYS, PhaseResult, TrialOutcome, TrialResult
@@ -60,6 +61,102 @@ UNSAFE_TERMINAL_TRACE_KEYS = {
     "limit_check",
     "timing",
 }
+
+
+def _repo_a_identity(commit: str = "d" * 40) -> RuntimeIdentity:
+    return RuntimeIdentity(
+        role="pc_a",
+        repository_commit=commit,
+        repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.13",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
+    )
+
+
+def _finalizer_context(
+    tmp_path: Path,
+    *,
+    identity: RuntimeIdentity | None = None,
+) -> tuple[object, object, RuntimeIdentity, object]:
+    """Build the smallest typed lineage used by finalizer-only tests."""
+
+    producer = identity or _repo_a_identity()
+    session_payload = {
+        "session_id": "session-1",
+        "policy_bundle_id": "b" * 64,
+        "operator": "operator",
+        "executor": {"repository_commit": producer.repository_commit},
+    }
+    session_path = tmp_path / "rollout_session.json"
+    session_path.write_bytes(canonical_json_bytes(session_payload))
+    session = SimpleNamespace(
+        bundle_id="a" * 64,
+        content_id="1" * 64,
+        manifest={
+            "experiment": "viola-eight-policy-v1",
+            "lineage": {
+                "policy": "act",
+                "session_manifest_sha256": "e" * 64,
+            },
+        },
+        payload_file=lambda name: session_path,
+    )
+    candidate_bundle = SimpleNamespace(
+        bundle_id="b" * 64,
+        content_id="2" * 64,
+        manifest={"experiment": "viola-eight-policy-v1"},
+    )
+    candidate = SimpleNamespace(
+        bundle=candidate_bundle,
+        bundle_id=candidate_bundle.bundle_id,
+        content_id=candidate_bundle.content_id,
+        payload={
+            "evaluation_sha256": "f" * 64,
+            "checkpoint_inventory_sha256": "0" * 64,
+            "dataset_release_id": "dataset-release-1",
+        },
+    )
+    hold = SimpleNamespace(bundle_id="c" * 64, content_id="3" * 64)
+    return session, candidate, producer, hold
+
+
+def _completed_hold_result() -> PhaseResult:
+    held = {key: (50.0 if key == "gripper.pos" else 0.0) for key in ACTION_KEYS}
+    return PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="hold",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=1.0,
+        held_action=held,
+        trials=(),
+        terminal_event=None,
+        terminal_reason=None,
+    )
+
+
+def _fake_sealed_bundle(request, path: Path) -> SimpleNamespace:
+    """Return the verified manifest surface used by finalizer unit tests."""
+
+    artifacts = [
+        {
+            "name": name,
+            "root": str(Path(root).resolve()),
+            **inventory_root(root),
+        }
+        for name, root in sorted(request.artifact_roots.items())
+    ]
+    return SimpleNamespace(
+        path=path,
+        bundle_id="4" * 64,
+        manifest={
+            "payload": inventory_root(request.payload_dir),
+            "artifacts": artifacts,
+        },
+    )
 
 
 def _trial() -> tuple[PhaseResult, TrialResult]:
@@ -657,61 +754,17 @@ def test_unsafe_shakedown_seals_as_terminal_evidence_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     phase, motion = _unsafe_material(tmp_path)
-    session_payload = {
-        "session_id": "session-1",
-        "policy_bundle_id": "b" * 64,
-        "operator": "operator",
-        "executor": {"repository_commit": "d" * 40},
-    }
-    session_path = tmp_path / "rollout_session.json"
-    session_path.write_bytes(canonical_json_bytes(session_payload))
-
-    class Session:
-        bundle_id = "a" * 64
-        content_id = "1" * 64
-        manifest = {
-            "experiment": "viola-eight-policy-v1",
-            "lineage": {
-                "policy": "act",
-                "session_manifest_sha256": "e" * 64,
-            },
-        }
-
-        def payload_file(self, name: str) -> Path:
-            assert name == "rollout_session.json"
-            return session_path
-
-    candidate_bundle = SimpleNamespace(
-        bundle_id="b" * 64,
-        content_id="2" * 64,
-        manifest={"experiment": "viola-eight-policy-v1"},
-    )
-    candidate = SimpleNamespace(
-        bundle=candidate_bundle,
-        bundle_id=candidate_bundle.bundle_id,
-        content_id=candidate_bundle.content_id,
-        payload={
-            "evaluation_sha256": "f" * 64,
-            "checkpoint_inventory_sha256": "0" * 64,
-            "dataset_release_id": "dataset-release-1",
-        },
-    )
-    identity = SimpleNamespace(
-        role="pc_a",
-        repository_clean=True,
-        repository_commit="d" * 40,
-        hostname="pc-a",
-        python_version="3.12.13",
-    )
-    hold = SimpleNamespace(bundle_id="c" * 64, content_id="3" * 64)
-    sealed_bundle = SimpleNamespace(path=tmp_path / "sealed", bundle_id="4" * 64)
+    session, candidate, identity, hold = _finalizer_context(tmp_path)
+    sealed_bundles = []
     requests = []
     published = []
 
     def capture_seal(request, *, evidence_logger):
         assert evidence_logger is not None
         requests.append(request)
-        return sealed_bundle
+        bundle = _fake_sealed_bundle(request, tmp_path / "sealed")
+        sealed_bundles.append(bundle)
+        return bundle
 
     def publish(run, **kwargs):
         published.append((run, kwargs))
@@ -720,7 +773,7 @@ def test_unsafe_shakedown_seals_as_terminal_evidence_only(
     monkeypatch.setattr(rollout_evidence, "seal_bundle", capture_seal)
     sealed = seal_unsafe_phase(
         phase,
-        session=Session(),
+        session=session,
         candidate=candidate,
         identity=identity,
         experiment="viola-eight-policy-v1",
@@ -732,9 +785,10 @@ def test_unsafe_shakedown_seals_as_terminal_evidence_only(
         prior_hold=hold,
         publisher=publish,
         handoff_logger=object(),
+        identity_capture=lambda: identity,
     )
 
-    assert sealed.bundle is sealed_bundle
+    assert sealed.bundle is sealed_bundles[0]
     assert len(requests) == 1
     request = requests[0]
     assert request.kind == "rollout_evidence"
@@ -791,78 +845,8 @@ def test_unsafe_scored_phase_stays_non_ready_before_publish(tmp_path: Path) -> N
 def test_completed_hold_finalization_retries_without_replacing_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    session_payload = {
-        "session_id": "session-1",
-        "policy_bundle_id": "b" * 64,
-        "operator": "operator",
-        "executor": {"repository_commit": "d" * 40},
-    }
-    session_path = tmp_path / "rollout_session.json"
-    session_path.write_bytes(canonical_json_bytes(session_payload))
-
-    class Session:
-        bundle_id = "a" * 64
-        content_id = "a" * 64
-        manifest = {
-            "producer": {"repository_commit": "c" * 40},
-            "experiment": "viola-eight-policy-v1",
-            "lineage": {
-                "policy": "act",
-                "session_manifest_sha256": "e" * 64,
-            },
-        }
-
-        def payload_file(self, name: str) -> Path:
-            assert name == "rollout_session.json"
-            return session_path
-
-    candidate_bundle = type(
-        "CandidateBundle",
-        (),
-        {
-            "bundle_id": "b" * 64,
-            "content_id": "b" * 64,
-            "manifest": {"experiment": "viola-eight-policy-v1"},
-        },
-    )()
-    candidate = type(
-        "Candidate",
-        (),
-        {
-            "bundle": candidate_bundle,
-            "bundle_id": "b" * 64,
-            "content_id": "b" * 64,
-            "payload": {
-                "evaluation_sha256": "f" * 64,
-                "checkpoint_inventory_sha256": "0" * 64,
-                "dataset_release_id": "dataset-release-1",
-            },
-        },
-    )()
-    identity = type(
-        "Identity",
-        (),
-        {
-            "role": "pc_a",
-            "repository_clean": True,
-            "repository_commit": "d" * 40,
-            "hostname": "pc-a",
-            "python_version": "3.12.13",
-        },
-    )()
-    held = {key: (50.0 if key == "gripper.pos" else 0.0) for key in ACTION_KEYS}
-    result = PhaseResult(
-        session_id="session-1",
-        policy="act",
-        phase="hold",
-        started_at="2026-08-13T01:00:00+00:00",
-        completed_at="2026-08-13T01:00:01+00:00",
-        speed_scale=1.0,
-        held_action=held,
-        trials=(),
-        terminal_event=None,
-        terminal_reason=None,
-    )
+    session, candidate, identity, _hold = _finalizer_context(tmp_path)
+    result = _completed_hold_result()
     material = tmp_path / "material"
     calls: list[str] = []
 
@@ -873,7 +857,7 @@ def test_completed_hold_finalization_retries_without_replacing_evidence(
     with pytest.raises(ValidationError, match="W&B outage"):
         seal_completed_phase(
             result,
-            session=Session(),
+            session=session,
             candidate=candidate,
             identity=identity,
             experiment="viola-eight-policy-v1",
@@ -884,23 +868,27 @@ def test_completed_hold_finalization_retries_without_replacing_evidence(
             evidence_factory=None,
             publisher=fail_publish,
             handoff_logger=object(),
+            identity_capture=lambda: identity,
         )
     payload_before = (material / "payload" / "rollout_evidence.json").read_bytes()
     assert not (material / "payload" / "WANDB_SYNCED.json").exists()
 
-    fake_bundle = object()
-    monkeypatch.setattr(
-        rollout_evidence,
-        "seal_bundle",
-        lambda request, evidence_logger: calls.append("seal") or fake_bundle,
-    )
+    fake_bundles = []
+
+    def seal_fake(request, evidence_logger):
+        calls.append("seal")
+        bundle = _fake_sealed_bundle(request, tmp_path / "sealed")
+        fake_bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(rollout_evidence, "seal_bundle", seal_fake)
 
     def finish_publish(*_args, **_kwargs):
         calls.append("finished-publish")
 
     sealed = seal_completed_phase(
         result,
-        session=Session(),
+        session=session,
         candidate=candidate,
         identity=identity,
         experiment="viola-eight-policy-v1",
@@ -911,14 +899,15 @@ def test_completed_hold_finalization_retries_without_replacing_evidence(
         evidence_factory=None,
         publisher=finish_publish,
         handoff_logger=object(),
+        identity_capture=lambda: identity,
     )
-    assert sealed.bundle is fake_bundle
+    assert sealed.bundle is fake_bundles[0]
     assert sealed.payload_path.read_bytes() == payload_before
     sync_before = sealed.sync_path.read_bytes()
 
     again = seal_completed_phase(
         result,
-        session=Session(),
+        session=session,
         candidate=candidate,
         identity=identity,
         experiment="viola-eight-policy-v1",
@@ -929,6 +918,7 @@ def test_completed_hold_finalization_retries_without_replacing_evidence(
         evidence_factory=None,
         publisher=finish_publish,
         handoff_logger=object(),
+        identity_capture=lambda: identity,
     )
     assert again.sync_path.read_bytes() == sync_before
     assert calls == [
@@ -938,3 +928,406 @@ def test_completed_hold_finalization_retries_without_replacing_evidence(
         "finished-publish",
         "seal",
     ]
+
+
+@pytest.mark.parametrize("mutation", ("payload_bytes", "payload_root"))
+def test_completed_finalizer_rejects_payload_changes_during_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    session, candidate, identity, _hold = _finalizer_context(tmp_path)
+    material = tmp_path / "completed-material"
+    handoff = tmp_path / "handoffs"
+    seal_calls: list[object] = []
+
+    def mutate_published_evidence(run, **_kwargs):
+        payload_root = material / "payload"
+        if mutation == "payload_bytes":
+            evidence = payload_root / "rollout_evidence.json"
+            evidence.chmod(0o644)
+            evidence.write_bytes(canonical_json_bytes({"tampered": True}))
+        else:
+            original = material / "replaced-payload"
+            payload_root.rename(original)
+            shutil.copytree(original, payload_root)
+        return run
+
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_bundle",
+        lambda request, evidence_logger: seal_calls.append(request),
+    )
+    with pytest.raises(ValidationError, match="rollout payload changed during W&B publication"):
+        seal_completed_phase(
+            _completed_hold_result(),
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=material,
+            handoff_root=handoff,
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=None,
+            publisher=mutate_published_evidence,
+            handoff_logger=object(),
+            identity_capture=lambda: identity,
+        )
+
+    assert seal_calls == []
+    assert not (material / "payload" / "WANDB_SYNCED.json").exists()
+    assert not list(handoff.rglob("READY.json"))
+
+
+def test_completed_finalizer_rejects_checkout_dirtied_during_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_repo = tmp_path / "runtime-repo"
+    runtime_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=runtime_repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "viola-tests@example.invalid"],
+        cwd=runtime_repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Viola Tests"],
+        cwd=runtime_repo,
+        check=True,
+    )
+    (runtime_repo / "tracked.txt").write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=runtime_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "reviewed"], cwd=runtime_repo, check=True)
+    identity = RuntimeIdentity.capture(role="pc_a", repo_root=runtime_repo)
+    session, candidate, identity, _hold = _finalizer_context(
+        tmp_path,
+        identity=identity,
+    )
+    material = tmp_path / "dirty-material"
+    handoff = tmp_path / "handoffs"
+    seal_calls: list[object] = []
+
+    def dirty_checkout(run, **_kwargs):
+        (runtime_repo / "unreviewed.txt").write_text("dirty\n", encoding="utf-8")
+        return run
+
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_bundle",
+        lambda request, evidence_logger: seal_calls.append(request),
+    )
+    with pytest.raises(ValidationError, match="cannot recapture the clean Repo-A runtime"):
+        seal_completed_phase(
+            _completed_hold_result(),
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=material,
+            handoff_root=handoff,
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=None,
+            publisher=dirty_checkout,
+            handoff_logger=object(),
+            identity_capture=lambda: RuntimeIdentity.capture(
+                role="pc_a", repo_root=runtime_repo
+            ),
+        )
+
+    assert seal_calls == []
+    assert not (material / "payload" / "WANDB_SYNCED.json").exists()
+    assert not list(handoff.rglob("READY.json"))
+
+
+def test_completed_finalizer_rechecks_bytes_immediately_before_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, candidate, identity, _hold = _finalizer_context(tmp_path)
+    material = tmp_path / "final-boundary-material"
+    handoff = tmp_path / "handoffs"
+    captures = 0
+    seal_calls: list[object] = []
+
+    def capture_identity() -> RuntimeIdentity:
+        nonlocal captures
+        captures += 1
+        if captures == 2:
+            evidence = material / "payload" / "rollout_evidence.json"
+            evidence.chmod(0o644)
+            evidence.write_bytes(canonical_json_bytes({"late_tamper": True}))
+        return identity
+
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_bundle",
+        lambda request, evidence_logger: seal_calls.append(request),
+    )
+    with pytest.raises(ValidationError, match="rollout payload changed before handoff sealing"):
+        seal_completed_phase(
+            _completed_hold_result(),
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=material,
+            handoff_root=handoff,
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=None,
+            publisher=lambda run, **_kwargs: run,
+            handoff_logger=object(),
+            identity_capture=capture_identity,
+        )
+
+    assert captures == 2
+    assert seal_calls == []
+    assert not list(handoff.rglob("READY.json"))
+
+
+@pytest.mark.parametrize("mutation", ("trace", "video", "motion_root"))
+def test_unsafe_finalizer_rejects_motion_changes_during_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    phase, motion = _unsafe_material(tmp_path)
+    session, candidate, identity, hold = _finalizer_context(tmp_path)
+    handoff = tmp_path / "handoffs"
+    seal_calls: list[object] = []
+
+    def mutate_published_evidence(run, **_kwargs):
+        if mutation == "trace":
+            trace = motion / "safety_traces" / "trial-00.jsonl"
+            with trace.open("ab") as handle:
+                handle.write(b"{}\n")
+        elif mutation == "video":
+            video = motion / "videos" / "trial-00-front.mp4"
+            with video.open("ab") as handle:
+                handle.write(b"tampered")
+        else:
+            original = tmp_path / "replaced-motion-record"
+            motion.rename(original)
+            shutil.copytree(original, motion)
+        return run
+
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_bundle",
+        lambda request, evidence_logger: seal_calls.append(request),
+    )
+    with pytest.raises(ValidationError, match="motion record changed during W&B publication"):
+        seal_unsafe_phase(
+            phase,
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=tmp_path,
+            handoff_root=handoff,
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=PhaseEvidenceFactory.reopen_completed(motion),
+            prior_hold=hold,
+            publisher=mutate_published_evidence,
+            handoff_logger=object(),
+            identity_capture=lambda: identity,
+        )
+
+    assert seal_calls == []
+    assert not (tmp_path / "payload" / "WANDB_SYNCED.json").exists()
+    assert not list(handoff.rglob("READY.json"))
+
+
+@pytest.mark.parametrize("target", ("payload", "motion"))
+def test_rollout_finalizer_rejects_changes_during_handoff_wandb(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    phase, motion = _unsafe_material(tmp_path)
+    session, candidate, identity, hold = _finalizer_context(tmp_path)
+    handoff = tmp_path / "handoffs"
+
+    class MutatingLogger:
+        def record(self, *, project, run_id, event, metadata):
+            assert event == "sealed"
+            assert metadata["inventory_sha256"]
+            if target == "payload":
+                evidence = tmp_path / "payload" / "rollout_evidence.json"
+                evidence.chmod(0o644)
+                evidence.write_bytes(canonical_json_bytes({"tampered": True}))
+            else:
+                trace = motion / "safety_traces" / "trial-00.jsonl"
+                with trace.open("ab") as handle:
+                    handle.write(b"{}\n")
+            return f"https://wandb.ai/entity/{project}/runs/{run_id}"
+
+    with pytest.raises(ValidationError, match="changed during handoff W&B publication"):
+        seal_unsafe_phase(
+            phase,
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=tmp_path,
+            handoff_root=handoff,
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=PhaseEvidenceFactory.reopen_completed(motion),
+            prior_hold=hold,
+            publisher=lambda run, **_kwargs: run,
+            handoff_logger=MutatingLogger(),
+            identity_capture=lambda: identity,
+        )
+
+    assert list(handoff.rglob("manifest.json"))
+    assert not list(handoff.rglob("READY.json"))
+
+
+def test_completed_finalizer_rejects_checkout_dirtied_during_handoff_wandb(
+    tmp_path: Path,
+) -> None:
+    runtime_repo = tmp_path / "handoff-runtime-repo"
+    runtime_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=runtime_repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "viola-tests@example.invalid"],
+        cwd=runtime_repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Viola Tests"],
+        cwd=runtime_repo,
+        check=True,
+    )
+    (runtime_repo / "tracked.txt").write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=runtime_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "reviewed"], cwd=runtime_repo, check=True)
+    identity = RuntimeIdentity.capture(role="pc_a", repo_root=runtime_repo)
+    session, candidate, identity, _hold = _finalizer_context(tmp_path, identity=identity)
+    material = tmp_path / "handoff-dirty-material"
+    handoff = tmp_path / "handoffs"
+
+    class DirtyingLogger:
+        def record(self, *, project, run_id, event, metadata):
+            assert event == "sealed"
+            assert metadata["inventory_sha256"]
+            (runtime_repo / "unreviewed.txt").write_text("dirty\n", encoding="utf-8")
+            return f"https://wandb.ai/entity/{project}/runs/{run_id}"
+
+    with pytest.raises(ValidationError, match="cannot recapture the clean Repo-A runtime"):
+        seal_completed_phase(
+            _completed_hold_result(),
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=material,
+            handoff_root=handoff,
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=None,
+            publisher=lambda run, **_kwargs: run,
+            handoff_logger=DirtyingLogger(),
+            identity_capture=lambda: RuntimeIdentity.capture(
+                role="pc_a", repo_root=runtime_repo
+            ),
+        )
+
+    assert list(handoff.rglob("manifest.json"))
+    assert not list(handoff.rglob("READY.json"))
+
+
+def test_rollout_guard_rejects_shared_sealer_inventory_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, candidate, identity, _hold = _finalizer_context(tmp_path)
+    delegate_calls = 0
+
+    class Delegate:
+        def record(self, **_kwargs):
+            nonlocal delegate_calls
+            delegate_calls += 1
+            return "https://wandb.ai/entity/project/runs/unexpected"
+
+    def seal_with_wrong_inventory(request, *, evidence_logger):
+        return evidence_logger.record(
+            project=request.wandb_project,
+            run_id="ho-wrong",
+            event="sealed",
+            metadata={"inventory_sha256": "0" * 64},
+        )
+
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_bundle",
+        seal_with_wrong_inventory,
+    )
+    with pytest.raises(
+        ValidationError,
+        match="handoff sealer inventoried different rollout evidence",
+    ):
+        seal_completed_phase(
+            _completed_hold_result(),
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=tmp_path / "wrong-inventory-material",
+            handoff_root=tmp_path / "handoffs",
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=None,
+            publisher=lambda run, **_kwargs: run,
+            handoff_logger=Delegate(),
+            identity_capture=lambda: identity,
+        )
+
+    assert delegate_calls == 0
+
+
+def test_rollout_finalizer_rejects_mismatched_existing_ready_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, candidate, identity, _hold = _finalizer_context(tmp_path)
+    delegate_calls = 0
+
+    class Delegate:
+        def record(self, **_kwargs):
+            nonlocal delegate_calls
+            delegate_calls += 1
+            return "https://wandb.ai/entity/project/runs/unexpected"
+
+    def existing_ready(_request, *, evidence_logger):
+        assert evidence_logger is not None
+        return SimpleNamespace(
+            manifest={"payload": {"different": True}, "artifacts": []}
+        )
+
+    monkeypatch.setattr(rollout_evidence, "seal_bundle", existing_ready)
+    with pytest.raises(
+        ValidationError,
+        match="sealed rollout payload differs from validated evidence",
+    ):
+        seal_completed_phase(
+            _completed_hold_result(),
+            session=session,
+            candidate=candidate,
+            identity=identity,
+            experiment="viola-eight-policy-v1",
+            material_root=tmp_path / "existing-ready-material",
+            handoff_root=tmp_path / "handoffs",
+            wandb_entity="entity",
+            wandb_project="project",
+            evidence_factory=None,
+            publisher=lambda run, **_kwargs: run,
+            handoff_logger=Delegate(),
+            identity_capture=lambda: identity,
+        )
+
+    assert delegate_calls == 0

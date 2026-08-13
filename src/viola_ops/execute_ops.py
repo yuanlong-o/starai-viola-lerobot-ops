@@ -422,6 +422,11 @@ def _execute_authorized_command(
     prior_shakedown_bundle = gate_request.prior_shakedown_bundle
     identity = RuntimeIdentity.capture(role="pc_a", repo_root=repository)
 
+    def capture_current_identity() -> RuntimeIdentity:
+        """Recapture the exact reviewed checkout for final evidence boundaries."""
+
+        return RuntimeIdentity.capture(role="pc_a", repo_root=repository)
+
     # Semantic inspection and a finished online intent run still happen before
     # importing any camera, serial, robot, or motor implementation.
     from .policy_runtime import inspect_candidate
@@ -789,6 +794,7 @@ def _execute_authorized_command(
                 prior_hold=hold,
                 prior_shakedown=None,
                 publisher=intent_publisher,
+                identity_capture=capture_current_identity,
             )
             require_material_root("after unsafe-evidence finalization")
         except UnsafeTerminalVideoUnavailableError:
@@ -862,6 +868,7 @@ def _execute_authorized_command(
         evidence_factory=factory,
         prior_hold=hold,
         prior_shakedown=shakedown,
+        identity_capture=capture_current_identity,
     )
     require_material_root("after completed-evidence finalization")
     return ExecutionOutcome(

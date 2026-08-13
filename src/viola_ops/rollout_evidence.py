@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from viola_handoff import (
     VerifiedBundle,
     WandbEvidenceLogger,
     canonical_json_bytes,
+    inventory_root,
     seal_bundle,
 )
 
@@ -59,6 +61,52 @@ class SealedRolloutEvidence:
 
 class UnsafeTerminalVideoUnavailableError(ValidationError):
     """The terminal happened before either reviewed camera frame was retained."""
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceTreeSnapshot:
+    """One evidence directory's identity and exact byte inventory."""
+
+    label: str
+    path: Path
+    device: int
+    inode: int
+    inventory: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardedEvidenceLogger:
+    """Keep validated rollout material stable across the handoff W&B call."""
+
+    delegate: EvidenceLogger
+    snapshots: tuple[_EvidenceTreeSnapshot, ...]
+    identity: RuntimeIdentity
+    identity_capture: Callable[[], RuntimeIdentity] | None
+    inventory_sha256: str
+
+    def record(
+        self,
+        *,
+        project: str,
+        run_id: str,
+        event: str,
+        metadata: Mapping[str, str | int | float | bool | None],
+    ) -> str:
+        if metadata.get("inventory_sha256") != self.inventory_sha256:
+            raise ValidationError(
+                "handoff sealer inventoried different rollout evidence"
+            )
+        _require_current_identity(self.identity, self.identity_capture)
+        _require_evidence_unchanged(self.snapshots, "before handoff W&B publication")
+        url = self.delegate.record(
+            project=project,
+            run_id=run_id,
+            event=event,
+            metadata=metadata,
+        )
+        _require_current_identity(self.identity, self.identity_capture)
+        _require_evidence_unchanged(self.snapshots, "during handoff W&B publication")
+        return url
 
 
 _JOINTS = tuple(key.removesuffix(".pos") for key in ACTION_KEYS)
@@ -123,6 +171,7 @@ def seal_completed_phase(
     prior_shakedown: VerifiedBundle | None = None,
     publisher: Callable[..., WandbRunIdentity] = publish_finished_run,
     handoff_logger: EvidenceLogger | None = None,
+    identity_capture: Callable[[], RuntimeIdentity] | None = None,
 ) -> SealedRolloutEvidence:
     """Publish and seal one completed hold, shakedown, or scored phase."""
 
@@ -214,6 +263,7 @@ def seal_completed_phase(
         "wandb": wandb.binding(),
     }
     payload_path = write_canonical_json(payload_root / "rollout_evidence.json", payload)
+    publication_snapshot = _snapshot_evidence_trees(payload_root, motion_record)
     publisher(
         wandb,
         job_type="viola-policy-execute",
@@ -235,6 +285,8 @@ def seal_completed_phase(
             "safety_event_count": 0,
         },
     )
+    _require_current_identity(identity, identity_capture)
+    _require_evidence_unchanged(publication_snapshot, "during W&B publication")
     sync = {
         "schema_version": 1,
         "operation": "policy_execute",
@@ -267,6 +319,7 @@ def seal_completed_phase(
             raise ValidationError("existing rollout W&B sync receipt differs from this phase")
     else:
         write_canonical_json(sync_path, sync)
+    sealing_snapshot = _snapshot_after_sync(publication_snapshot, sync_path)
     lineage = _lineage(payload, wandb.run_id, prior)
     request = SealRequest(
         root=handoff_root,
@@ -279,8 +332,18 @@ def seal_completed_phase(
         payload_dir=payload_root,
         artifact_roots={} if motion_record is None else {"motion_record": motion_record},
     )
-    logger = handoff_logger or WandbEvidenceLogger(entity=wandb_entity)
+    logger = _guarded_evidence_logger(
+        handoff_logger or WandbEvidenceLogger(entity=wandb_entity),
+        sealing_snapshot,
+        identity,
+        identity_capture,
+    )
+    _require_current_identity(identity, identity_capture)
+    _require_evidence_unchanged(sealing_snapshot, "before handoff sealing")
     bundle = seal_bundle(request, evidence_logger=logger)
+    _require_sealed_bundle_matches(bundle, sealing_snapshot)
+    _require_current_identity(identity, identity_capture)
+    _require_evidence_unchanged(sealing_snapshot, "after handoff sealing")
     return SealedRolloutEvidence(bundle, payload_path, sync_path, root, motion_record)
 
 
@@ -300,6 +363,7 @@ def seal_unsafe_phase(
     prior_shakedown: VerifiedBundle | None = None,
     publisher: Callable[..., WandbRunIdentity] = publish_finished_run,
     handoff_logger: EvidenceLogger | None = None,
+    identity_capture: Callable[[], RuntimeIdentity] | None = None,
 ) -> SealedRolloutEvidence:
     """Publish one aborted shakedown as terminal evidence.
 
@@ -393,6 +457,7 @@ def seal_unsafe_phase(
     payload_path = write_canonical_json(
         payload_root / "rollout_evidence.json", payload
     )
+    publication_snapshot = _snapshot_evidence_trees(payload_root, motion_record)
     publisher(
         wandb,
         job_type="viola-policy-execute",
@@ -415,6 +480,8 @@ def seal_unsafe_phase(
             "terminal_event": result.terminal_event,
         },
     )
+    _require_current_identity(identity, identity_capture)
+    _require_evidence_unchanged(publication_snapshot, "during W&B publication")
     sync = {
         "schema_version": 1,
         "operation": "policy_execute",
@@ -447,6 +514,7 @@ def seal_unsafe_phase(
             raise ValidationError("existing unsafe W&B sync receipt differs from this phase")
     else:
         write_canonical_json(sync_path, sync)
+    sealing_snapshot = _snapshot_after_sync(publication_snapshot, sync_path)
     request = SealRequest(
         root=handoff_root,
         kind="rollout_evidence",
@@ -459,8 +527,18 @@ def seal_unsafe_phase(
         artifact_roots={"motion_record": motion_record},
         permission="evidence_only",
     )
-    logger = handoff_logger or WandbEvidenceLogger(entity=wandb_entity)
+    logger = _guarded_evidence_logger(
+        handoff_logger or WandbEvidenceLogger(entity=wandb_entity),
+        sealing_snapshot,
+        identity,
+        identity_capture,
+    )
+    _require_current_identity(identity, identity_capture)
+    _require_evidence_unchanged(sealing_snapshot, "before handoff sealing")
     bundle = seal_bundle(request, evidence_logger=logger)
+    _require_sealed_bundle_matches(bundle, sealing_snapshot)
+    _require_current_identity(identity, identity_capture)
+    _require_evidence_unchanged(sealing_snapshot, "after handoff sealing")
     return SealedRolloutEvidence(bundle, payload_path, sync_path, root, motion_record)
 
 
@@ -1443,6 +1521,186 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _snapshot_evidence_trees(
+    payload_root: Path,
+    motion_record: Path | None,
+) -> tuple[_EvidenceTreeSnapshot, ...]:
+    """Capture exact evidence bytes and the directories that own them."""
+
+    trees = [("rollout payload", payload_root)]
+    if motion_record is not None:
+        trees.append(("motion record", motion_record))
+    return tuple(_snapshot_evidence_tree(label, path) for label, path in trees)
+
+
+def _snapshot_evidence_tree(label: str, path: Path) -> _EvidenceTreeSnapshot:
+    """Inventory one stable, nonsymlinked directory."""
+
+    root = Path(os.path.abspath(os.fspath(path)))
+    try:
+        before = root.lstat()
+        if not stat.S_ISDIR(before.st_mode) or root.resolve() != root:
+            raise ValidationError(f"{label} must be a nonsymlinked directory")
+        inventory = inventory_root(root)
+        after = root.lstat()
+    except (HandoffError, OSError) as exc:
+        raise ValidationError(f"cannot snapshot {label}: {exc}") from exc
+    before_identity = (before.st_dev, before.st_ino)
+    after_identity = (after.st_dev, after.st_ino)
+    if before_identity != after_identity:
+        raise ValidationError(f"{label} changed while its evidence was inventoried")
+    return _EvidenceTreeSnapshot(
+        label=label,
+        path=root,
+        device=after.st_dev,
+        inode=after.st_ino,
+        inventory=inventory,
+    )
+
+
+def _require_evidence_unchanged(
+    expected: Sequence[_EvidenceTreeSnapshot],
+    boundary: str,
+) -> None:
+    """Reject byte changes or directory replacement at a trust boundary."""
+
+    for snapshot in expected:
+        current = _snapshot_evidence_tree(snapshot.label, snapshot.path)
+        if current != snapshot:
+            raise ValidationError(f"{snapshot.label} changed {boundary}")
+
+
+def _snapshot_after_sync(
+    publication_snapshot: Sequence[_EvidenceTreeSnapshot],
+    sync_path: Path,
+) -> tuple[_EvidenceTreeSnapshot, ...]:
+    """Allow only the deterministic W&B receipt to join validated evidence."""
+
+    current = tuple(
+        _snapshot_evidence_tree(snapshot.label, snapshot.path)
+        for snapshot in publication_snapshot
+    )
+    for before, after in zip(publication_snapshot, current, strict=True):
+        if before.label != "rollout payload":
+            if after != before:
+                raise ValidationError(f"{before.label} changed before handoff sealing")
+            continue
+        if (before.path, before.device, before.inode) != (
+            after.path,
+            after.device,
+            after.inode,
+        ):
+            raise ValidationError("rollout payload directory changed before handoff sealing")
+        if before.inventory["directories"] != after.inventory["directories"]:
+            raise ValidationError("rollout payload layout changed before handoff sealing")
+
+        relative_sync = sync_path.relative_to(before.path).as_posix()
+        before_files = list(before.inventory["files"])
+        after_files = list(after.inventory["files"])
+        before_paths = {entry["path"] for entry in before_files}
+        if relative_sync in before_paths:
+            expected_files = before_files
+        else:
+            sync_entries = [
+                entry for entry in after_files if entry["path"] == relative_sync
+            ]
+            if len(sync_entries) != 1:
+                raise ValidationError("rollout payload lacks its exact W&B sync receipt")
+            expected_files = sorted(
+                [*before_files, sync_entries[0]],
+                key=lambda entry: entry["path"],
+            )
+        if after_files != expected_files:
+            raise ValidationError("rollout payload bytes changed before handoff sealing")
+    return current
+
+
+def _guarded_evidence_logger(
+    delegate: EvidenceLogger,
+    snapshots: tuple[_EvidenceTreeSnapshot, ...],
+    identity: RuntimeIdentity,
+    identity_capture: Callable[[], RuntimeIdentity] | None,
+) -> _GuardedEvidenceLogger:
+    """Bind the shared sealer's inventory to the material already validated here."""
+
+    payload = next(
+        snapshot for snapshot in snapshots if snapshot.label == "rollout payload"
+    )
+    artifacts = [
+        {
+            "name": "motion_record",
+            "inventory_sha256": snapshot.inventory["inventory_sha256"],
+        }
+        for snapshot in snapshots
+        if snapshot.label == "motion record"
+    ]
+    aggregate = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "payload": payload.inventory["inventory_sha256"],
+                "artifacts": artifacts,
+            }
+        )
+    ).hexdigest()
+    return _GuardedEvidenceLogger(
+        delegate=delegate,
+        snapshots=snapshots,
+        identity=identity,
+        identity_capture=identity_capture,
+        inventory_sha256=aggregate,
+    )
+
+
+def _require_sealed_bundle_matches(
+    bundle: VerifiedBundle,
+    snapshots: tuple[_EvidenceTreeSnapshot, ...],
+) -> None:
+    """Reject an idempotent READY result for different evidence material."""
+
+    manifest = getattr(bundle, "manifest", None)
+    if not isinstance(manifest, Mapping):
+        raise ValidationError("handoff sealer returned no verified rollout manifest")
+    payload = next(
+        snapshot for snapshot in snapshots if snapshot.label == "rollout payload"
+    )
+    if manifest.get("payload") != payload.inventory:
+        raise ValidationError("sealed rollout payload differs from validated evidence")
+    expected_artifacts = [
+        {
+            "name": "motion_record",
+            "root": str(snapshot.path),
+            **snapshot.inventory,
+        }
+        for snapshot in snapshots
+        if snapshot.label == "motion record"
+    ]
+    if manifest.get("artifacts") != expected_artifacts:
+        raise ValidationError("sealed rollout artifacts differ from validated evidence")
+
+
+def _require_current_identity(
+    expected: RuntimeIdentity,
+    capture: Callable[[], RuntimeIdentity] | None,
+) -> None:
+    """Recapture the clean Repo-A runtime immediately before trusted writes."""
+
+    if not isinstance(expected, RuntimeIdentity):
+        raise ValidationError("rollout evidence requires a captured Repo-A runtime identity")
+    try:
+        current = (
+            capture()
+            if capture is not None
+            else RuntimeIdentity.capture(
+                role="pc_a",
+                repo_root=Path(__file__).resolve().parents[2],
+            )
+        )
+    except HandoffError as exc:
+        raise ValidationError(f"cannot recapture the clean Repo-A runtime: {exc}") from exc
+    if not isinstance(current, RuntimeIdentity) or current != expected:
+        raise ValidationError("Repo-A runtime identity changed before rollout evidence sealing")
 
 
 def _write_bytes_once(path: Path, payload: bytes) -> None:

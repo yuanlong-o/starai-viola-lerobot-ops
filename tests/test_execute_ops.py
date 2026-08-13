@@ -1072,6 +1072,7 @@ def test_completed_local_result_retries_finalization_without_hardware_import(
         order.append("seal")
         assert local_result == result
         assert kwargs["evidence_factory"] is None
+        assert callable(kwargs["identity_capture"])
         return SimpleNamespace(bundle=bundle)
 
     monkeypatch.setattr(rollout_evidence, "seal_completed_phase", seal)
@@ -1171,6 +1172,7 @@ def test_unsafe_shakedown_result_seals_without_hardware_import(
         assert local_result == result
         assert kwargs["evidence_factory"].root == material / "motion_record"
         assert kwargs["prior_hold"] is not None
+        assert callable(kwargs["identity_capture"])
         return SimpleNamespace(bundle=bundle)
 
     monkeypatch.setattr(rollout_evidence, "seal_unsafe_phase", seal_unsafe)
