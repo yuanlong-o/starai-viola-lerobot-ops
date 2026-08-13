@@ -1,4 +1,4 @@
-# Unified operation/inference environment validated on 2026-08-09.
+# Exact Repo-A operation and evidence environment.
 # Python 3.12 is required. Training dependencies and training code are excluded.
 
 lerobot==0.6.1

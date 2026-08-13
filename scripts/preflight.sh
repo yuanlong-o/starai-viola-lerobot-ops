@@ -3,106 +3,195 @@ set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-readonly CONFIG_FILE="${VIOLA_OPERATION_CONFIG:-${REPO_DIR}/config/operation.env}"
-[[ -f "${CONFIG_FILE}" ]] && source "${CONFIG_FILE}"
-
 readonly ENV_NAME="${LEROBOT_ENV_NAME:-lerobot}"
-readonly ROBOT_PORT="${VIOLA_ROBOT_PORT:-/dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0}"
-readonly TELEOP_PORT="${VIOLA_TELEOP_PORT:-/dev/serial/by-path/pci-0000:00:14.0-usb-0:11:1.0-port0}"
-readonly FRONT_CAMERA="${VIOLA_FRONT_CAMERA:-/dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0}"
-readonly UP_CAMERA="${VIOLA_UP_CAMERA:-/dev/v4l/by-id/usb-046d_0825_A8E49440-video-index0}"
-readonly POLICY_DIR="${VIOLA_POLICY_DIR:-${HOME}/models/act_viola_val20_step080000}"
-readonly CALIBRATION_ROOT="${HF_LEROBOT_CALIBRATION:-${HF_HOME:-${HOME}/.cache/huggingface}/lerobot/calibration}"
-readonly ROBOT_CALIBRATION="${CALIBRATION_ROOT}/robots/starai_viola/my_awesome_staraiviola_arm.json"
-readonly TELEOP_CALIBRATION="${CALIBRATION_ROOT}/teleoperators/starai_violin/my_awesome_staraiviolin_arm.json"
-readonly ROBOT_CALIBRATION_SHA256="7e580ce32f1f4b9a37367d42ff1563edccd4d9130ea4e122febd0558517d30ac"
-readonly TELEOP_CALIBRATION_SHA256="31d9cbe5471219df2087f4bd104dada86d3279965cee0666837c9dd880764fe7"
-readonly MODEL_SHA256="1093aaeddfb902e7e596425d87676baba58cb8ab617a52c954ec11940726b886"
-
-if [[ -n "${LEROBOT_PYTHON_BIN:-}" ]]; then
-  python_bin="${LEROBOT_PYTHON_BIN}"
-elif command -v conda >/dev/null 2>&1; then
-  env_prefix="$(conda env list --json | python -c 'import json,sys; data=json.load(sys.stdin); name=sys.argv[1]; print(next((p for p in data["envs"] if p.rsplit("/",1)[-1] == name), ""))' "${ENV_NAME}")"
-  python_bin="${env_prefix}/bin/python"
-else
-  python_bin="${HOME}/anaconda3/envs/${ENV_NAME}/bin/python"
-fi
+readonly REQUIREMENTS_FILE="${REPO_DIR}/requirements-validated.txt"
 
 errors=0
 fail() { echo "FAIL: $*" >&2; errors=$((errors + 1)); }
-pass() { echo " OK : $*"; }
-check_exists() { [[ -e "$2" ]] && pass "$1: $2 -> $(readlink -f -- "$2")" || fail "$1 is missing: $2"; }
-check_rw() { [[ ! -e "$2" ]] || { [[ -r "$2" && -w "$2" ]] && pass "$1 is readable/writable" || fail "$1 is not readable/writable: $2"; }; }
-check_hash() {
-  [[ ! -f "$2" ]] || {
-    actual="$(sha256sum -- "$2" | awk '{print $1}')"
-    [[ "${actual}" == "$3" ]] && pass "$1 checksum matches" || fail "$1 checksum ${actual}; expected $3"
-  }
-}
+pass() { echo "PASS: $*"; }
 
-echo "StarAI Viola operation/inference read-only preflight"
-echo "No camera, serial port, motor, or policy inference will be opened."
+echo "StarAI Viola Repo-A software and contract preflight"
+echo "Checks: repository identity, clean revision, Python, pinned packages, editable install, and shared schemas."
+echo "Not checked: devices, cameras, motors, calibration, checkpoints, W&B connectivity, or physical behavior."
+echo "IMPORTANT: passing this audit is not motion authorization."
 echo
-check_exists "Operations repository" "${REPO_DIR}"
-check_exists "Python" "${python_bin}"
-check_exists "Viola follower port" "${ROBOT_PORT}"
-check_exists "Violin teacher port" "${TELEOP_PORT}"
-check_exists "front camera" "${FRONT_CAMERA}"
-check_exists "up camera" "${UP_CAMERA}"
-check_exists "Viola calibration" "${ROBOT_CALIBRATION}"
-check_exists "Violin calibration" "${TELEOP_CALIBRATION}"
-check_exists "ACT checkpoint" "${POLICY_DIR}/model.safetensors"
-check_rw "Viola follower port" "${ROBOT_PORT}"
-check_rw "Violin teacher port" "${TELEOP_PORT}"
-check_rw "front camera" "${FRONT_CAMERA}"
-check_rw "up camera" "${UP_CAMERA}"
-check_hash "Viola calibration" "${ROBOT_CALIBRATION}" "${ROBOT_CALIBRATION_SHA256}"
-check_hash "Violin calibration" "${TELEOP_CALIBRATION}" "${TELEOP_CALIBRATION_SHA256}"
-check_hash "ACT model" "${POLICY_DIR}/model.safetensors" "${MODEL_SHA256}"
 
-if [[ -x "${python_bin}" ]]; then
-  if "${python_bin}" - <<'PY'
+if command -v git >/dev/null 2>&1 && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  revision="$(git -C "${REPO_DIR}" rev-parse HEAD)"
+  branch="$(git -C "${REPO_DIR}" branch --show-current)"
+  pass "repository ${REPO_DIR}"
+  pass "branch ${branch:-detached HEAD}; revision ${revision}"
+
+  mapfile -t worktree_changes < <(git -C "${REPO_DIR}" status --short --untracked-files=all)
+  if (( ${#worktree_changes[@]} == 0 )); then
+    pass "worktree is clean"
+  else
+    fail "worktree has ${#worktree_changes[@]} tracked or untracked change(s)"
+    printf '      %s\n' "${worktree_changes[@]:0:10}" >&2
+    if (( ${#worktree_changes[@]} > 10 )); then
+      echo "      ... and $((${#worktree_changes[@]} - 10)) more" >&2
+    fi
+  fi
+else
+  fail "${REPO_DIR} is not an inspectable Git worktree"
+fi
+
+if [[ -n "${LEROBOT_PYTHON_BIN:-}" ]]; then
+  python_command=("${LEROBOT_PYTHON_BIN}")
+elif command -v conda >/dev/null 2>&1; then
+  python_command=(conda run --no-capture-output --name "${ENV_NAME}" python)
+else
+  python_command=()
+  fail "Conda is unavailable and LEROBOT_PYTHON_BIN was not provided"
+fi
+
+if (( ${#python_command[@]} > 0 )); then
+  if "${python_command[@]}" - "${REPO_DIR}" "${REQUIREMENTS_FILE}" "${ENV_NAME}" <<'PY'
+from __future__ import annotations
+
+import hashlib
 import importlib
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution, entry_points, version
+import json
+import os
+from pathlib import Path
 import sys
+from urllib.parse import unquote, urlsplit
 
-expected = {
-    "fashionstar_uart_sdk": "1.3.12",
-    "huggingface-hub": "1.27.0",
-    "lerobot": "0.6.1",
-    "lerobot_motor_starai": "0.0.4",
-    "lerobot_robot_viola": "0.0.4",
-    "lerobot_teleoperator_violin": "0.0.4",
-    "rerun-sdk": "0.26.2",
-    "torch": "2.7.1",
-    "transformers": "5.5.4",
-    "wandb": "0.27.2",
-}
-errors = []
-for package, wanted in expected.items():
+
+repo = Path(sys.argv[1]).resolve()
+requirements_path = Path(sys.argv[2])
+expected_environment = sys.argv[3]
+problems: list[str] = []
+
+if sys.version_info[:2] != (3, 12):
+    problems.append(f"Python {sys.version_info.major}.{sys.version_info.minor} is active; expected 3.12")
+
+active_environment = os.environ.get("CONDA_DEFAULT_ENV")
+if active_environment != expected_environment:
+    problems.append(
+        f"Conda environment is {active_environment or 'unset'}; expected {expected_environment}"
+    )
+
+expected_packages: dict[str, str] = {}
+try:
+    requirement_lines = requirements_path.read_text(encoding="utf-8").splitlines()
+except OSError as error:
+    problems.append(f"cannot read {requirements_path}: {error}")
+    requirement_lines = []
+for line in requirement_lines:
+    clean = line.strip()
+    if not clean or clean.startswith("#"):
+        continue
+    if clean.count("==") != 1:
+        problems.append(f"requirement is not exactly pinned: {clean}")
+        continue
+    package, wanted = clean.split("==", 1)
+    expected_packages[package] = wanted
+
+for package, wanted in expected_packages.items():
     try:
         actual = version(package)
     except PackageNotFoundError:
-        errors.append(f"{package} is not installed")
+        problems.append(f"{package} is not installed")
         continue
     if actual != wanted:
-        errors.append(f"{package}=={actual}, expected {wanted}")
-for module in ("cv2", "lerobot", "lerobot_robot_viola", "rerun", "torch", "transformers"):
+        problems.append(f"{package}=={actual}; expected {wanted}")
+
+try:
+    repo_distribution = distribution("starai-viola-lerobot-ops")
+except PackageNotFoundError:
+    problems.append("starai-viola-lerobot-ops is not installed")
+else:
+    direct_url_text = repo_distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        problems.append("starai-viola-lerobot-ops is not an editable install")
+    else:
+        try:
+            direct_url = json.loads(direct_url_text)
+            installed_url = direct_url["url"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            problems.append(f"editable-install metadata is invalid: {error}")
+        else:
+            installed_path = Path(unquote(urlsplit(installed_url).path)).resolve()
+            if direct_url.get("dir_info", {}).get("editable") is not True:
+                problems.append("starai-viola-lerobot-ops install is not marked editable")
+            if installed_path != repo:
+                problems.append(f"editable install points to {installed_path}; expected {repo}")
+
+console_scripts = {item.name: item.value for item in entry_points(group="console_scripts")}
+expected_scripts = {
+    "viola-handoff": "viola_handoff.cli:main",
+    "viola-ops": "viola_ops.cli:main",
+}
+for name, target in expected_scripts.items():
+    if console_scripts.get(name) != target:
+        problems.append(f"console command {name} does not resolve to {target}")
+
+for module_name in ("viola_handoff.cli", "viola_ops.cli"):
     try:
-        importlib.import_module(module)
+        importlib.import_module(module_name)
     except Exception as error:
-        errors.append(f"cannot import {module}: {error}")
-if errors:
-    print("; ".join(errors), file=sys.stderr)
+        problems.append(f"cannot import {module_name}: {error}")
+
+try:
+    from viola_handoff.contract import CONTRACT_SHA256
+except Exception as error:
+    problems.append(f"cannot import the shared handoff contract: {error}")
+else:
+    expected_contract = "fbfef2f214ff320f03891f9694056a4377c1405e0362bb5e9cf226ef1b82e99e"
+    if CONTRACT_SHA256 != expected_contract:
+        problems.append(f"handoff contract hash is {CONTRACT_SHA256}; expected {expected_contract}")
+
+expected_schemas = {
+    "dataset_release_v2.schema.json": "64e1c1fdea32117c6b1a26b93f8cc2825c05a202de36e958b46c3198944df6db",
+    "rollout_evidence.schema.json": "f39530be3a279c893941d0fb2dcf7721bc16fd1e6c9880db7375ca9ab577f9ba",
+    "rollout_session.schema.json": "31c24505b03fcb75acdd649e0ed3492795cf8246267915879ce3e0708b6f80e5",
+    "shadow_evidence.schema.json": "778a3cbb73355764626a2f1b2bf915d347951d118287cc846e7a30e9a09cfd90",
+}
+for name, wanted in expected_schemas.items():
+    schema_path = repo / "contracts" / name
+    try:
+        raw_schema = schema_path.read_bytes()
+        json.loads(raw_schema)
+    except (OSError, json.JSONDecodeError) as error:
+        problems.append(f"cannot read valid schema {name}: {error}")
+        continue
+    actual = hashlib.sha256(raw_schema).hexdigest()
+    if actual != wanted:
+        problems.append(f"schema {name} hash is {actual}; expected {wanted}")
+
+if problems:
+    for problem in problems:
+        print(f"      {problem}", file=sys.stderr)
     raise SystemExit(1)
-print("Python operation/inference package versions match")
+
+print(f"      Python {sys.version.split()[0]} in Conda environment {active_environment}")
+print(f"      {len(expected_packages)} exact package pins match")
+print("      Repo-A editable install and both console commands match")
+print("      Shared handoff contract and four schema hashes match")
 PY
-  then pass "Python imports and critical versions"; else fail "Python environment mismatch"; fi
+  then
+    pass "Python environment and shared contract"
+  else
+    fail "Python environment or shared contract mismatch"
+  fi
 fi
+
+case "${WANDB_MODE:-online}" in
+  online|ONLINE|Online)
+    pass "W&B mode permits online evidence publishing; connectivity was not tested"
+    ;;
+  *)
+    fail "WANDB_MODE=${WANDB_MODE} prevents required online evidence publishing"
+    ;;
+esac
 
 echo
 if (( errors > 0 )); then
-  echo "Preflight failed with ${errors} problem(s)." >&2
+  echo "Software/contract preflight failed with ${errors} problem(s)." >&2
+  echo "No hardware was inspected or opened. This audit never authorizes motion." >&2
   exit 1
 fi
-echo "Preflight passed. Hardware was not opened."
+echo "Software/contract preflight passed."
+echo "No hardware was inspected or opened, and this result is not motion authorization."

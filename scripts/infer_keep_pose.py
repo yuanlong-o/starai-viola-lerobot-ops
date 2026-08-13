@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
-"""Run LeRobot policy inference with keep-pose startup and bounded motor writes."""
+"""Retired inference launcher with two retained, pure calculation helpers."""
 
 from __future__ import annotations
 
 import argparse
-import logging
-import os
 import sys
-from pathlib import Path
 from typing import Any
 
 
+EXIT_RETIRED = 64
+MIGRATION_MESSAGE = """\
+Legacy inference is disabled.
+
+Inference may run only through the unified live-session safety gate. It requires
+an accepted, blocker-free rollout_session, reviewed setup, current E-stop
+evidence, and explicit operator actions.
+
+Start with:
+  viola-ops policy execute --help
+"""
+
+
 def _extract_safety_args(argv: list[str]) -> tuple[float, list[str]]:
+    """Parse the retired wrapper's numeric option without touching hardware."""
+
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--max_step", type=float, default=3.0)
     known, remaining = parser.parse_known_args(argv)
@@ -26,6 +38,8 @@ def _bounded_goal(
     action_features: dict[str, Any],
     max_step: float,
 ) -> dict[str, float]:
+    """Return the historical bounded target as a side-effect-free calculation."""
+
     bounded: dict[str, float] = {}
     for action_key in action_features:
         motor = action_key.removesuffix(".pos")
@@ -41,56 +55,11 @@ def _bounded_goal(
     return bounded
 
 
-def install_inference_safety_patch(max_step: float) -> None:
-    from lerobot.utils.errors import DeviceNotConnectedError
-    from lerobot_robot_viola.starai_viola import StaraiViola
-
-    logger = logging.getLogger("viola_inference_safety")
-    write_count = 0
-
-    def hold_at_current_pose(self: Any) -> dict[str, float]:
-        current = self.get_action()
-        goal = {
-            key.removesuffix(".pos"): float(value)
-            for key, value in current.items()
-            if key.endswith(".pos")
-        }
-        self.bus.sync_write("Goal_Position", goal, motion_time=100)
-        return current
-
-    def send_bounded_action(self: Any, action: dict[str, Any]) -> dict[str, float]:
-        nonlocal write_count
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected")
-        present = self.bus.sync_read("Present_Position")
-        bounded = _bounded_goal(action, present, self.action_features, max_step)
-        self.bus.sync_write("Goal_Position", bounded)
-        write_count += 1
-        if write_count == 1:
-            requested = {key: round(float(action[key]), 4) for key in self.action_features}
-            sent = {f"{motor}.pos": round(value, 4) for motor, value in bounded.items()}
-            logger.info("First policy target: %s", requested)
-            logger.info("First bounded motor command (max_step=%s): %s", max_step, sent)
-        elif write_count % 25 == 0:
-            logger.info("Bounded policy motor writes completed: %d", write_count)
-        return {f"{motor}.pos": value for motor, value in bounded.items()}
-
-    StaraiViola.move_to_initial_position = hold_at_current_pose
-    StaraiViola.send_action = send_bounded_action
-
-
 def main() -> None:
-    max_step, rollout_args = _extract_safety_args(sys.argv[1:])
-    python_bin = str(Path(sys.executable).resolve().parent)
-    os.environ["PATH"] = python_bin + os.pathsep + os.environ.get("PATH", "")
+    """Refuse the retired path before importing or inspecting any device API."""
 
-    from lerobot.scripts.lerobot_rollout import main as rollout_main
-    from lerobot.utils.import_utils import register_third_party_plugins
-
-    register_third_party_plugins()
-    install_inference_safety_patch(max_step)
-    sys.argv = [sys.argv[0], *rollout_args]
-    rollout_main()
+    print(MIGRATION_MESSAGE, file=sys.stderr, end="")
+    raise SystemExit(EXIT_RETIRED)
 
 
 if __name__ == "__main__":

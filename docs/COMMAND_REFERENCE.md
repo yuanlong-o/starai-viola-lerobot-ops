@@ -1,103 +1,122 @@
-# Operation command reference
+# Viola command reference
 
-Run commands from the repository root after completing
-[new-PC setup](SETUP_AND_PORTS.md). Paths and IDs come from
-`config/operation.env`.
+Run from the Repo-A root in the `lerobot` Conda environment. Evidence-producing
+commands require authenticated online W&B. Use each command's `--help` for its
+full path options.
 
-## Read-only preflight
-
-```bash
-conda activate lerobot
-./scripts/preflight.sh
-```
-
-## Displayed ACT inference
+## Immutable handoffs
 
 ```bash
-./scripts/run_viola_inference.sh 10
+viola-handoff inspect <bundle>
+viola-handoff accept <bundle>
+viola-handoff ack --status rejected <bundle>
+viola-handoff ack --status revoked <bundle>
 ```
 
-The argument is the positive inference duration in seconds. Rerun displays
-both cameras throughout the policy-control phase.
+`inspect` is read-only. `accept` creates a receiver-local verified artifact
+copy and appends an accepted receipt. `ack` never accepts; it records rejection
+or revocation. Prefer typed `viola-ops` producers over raw `seal`.
 
-## Keep-pose leader/follower teleoperation
+External artifacts are not embedded in the small handoff payload. Their source
+roots must stay on shared storage mounted at the same path on PCs A and B until
+PC B accepts and checksum-copies them locally. Repo-A producer material defaults
+to `/mnt/nas02/yz/starai/producer-materials/v1`; policy evidence defaults to
+`/mnt/nas02/yz/starai/evidence/v1`.
+
+## Dataset
 
 ```bash
-./scripts/run_viola_teleoperation.sh
+viola-ops dataset validate
+viola-ops dataset release --wandb-project starai-viola-policy-benchmark
 ```
 
-Press Ctrl-C to stop. The wrapper measures both startup poses and bounds each
-follower command by `VIOLA_MAX_STEP` (default `3.0`).
+`--numeric-only` is diagnostic and is insufficient for release.
 
-## Preview both cameras without motors
+## Session inputs and frozen state
 
 ```bash
-conda run --no-capture-output -n lerobot \
-  python scripts/dual_camera_view.py --devices \
-  "${VIOLA_FRONT_CAMERA}" "${VIOLA_UP_CAMERA}"
+viola-ops session-inputs produce \
+  --setup /path/to/reviewed-setup.json --subject <setup-id> \
+  --material-root /mnt/nas02/yz/starai/producer-materials/v1
+
+viola-ops setup capture-frozen-state \
+  --setup /path/to/reviewed-setup.json \
+  --output-root /path/to/new/evidence \
+  --operator <estop-owner> --wandb-entity <entity>
 ```
 
-If the shell variables are not exported, copy the two values from
-`config/operation.env`. Press Q or Esc before starting another camera process.
+Session inputs are planning-only. Frozen-state capture reads positions and
+sends no motor command.
 
-## Calibration snapshots
+## Policy verification and shadow
 
 ```bash
-./scripts/install_calibrations.sh --check
+viola-ops policy verify \
+  --bundle ~/.local/share/viola/handoffs/v1/policy_candidate/<id> \
+  --wandb-entity <entity>
+
+viola-ops policy shadow \
+  --mode replay \
+  --bundle ~/.local/share/viola/handoffs/v1/policy_candidate/<id> \
+  --verification /path/to/verification.json \
+  --output-root /mnt/nas02/yz/starai/evidence/v1 \
+  --wandb-entity <entity>
+
+viola-ops policy shadow \
+  --mode live-soak \
+  --bundle ~/.local/share/viola/handoffs/v1/policy_candidate/<id> \
+  --verification /path/to/verification.json \
+  --setup /path/to/reviewed-setup.json \
+  --frozen-state /path/to/frozen-state-evidence \
+  --output-root /mnt/nas02/yz/starai/evidence/v1 \
+  --wandb-entity <entity>
 ```
 
-Use `--install` only when the destination is absent. Use `--replace` only after
-confirming these are the same physical arms; existing files are backed up.
+Verification and replay are hardware-inert. Live soak is camera-only; it has no
+robot or motor construction path. Both modes seal an external `shadow_record`;
+its output root must remain visible to PC B until acceptance.
 
-## Interactive calibration
+## Supervised inference
 
 ```bash
-./scripts/run_viola_calibration.sh violin
-./scripts/run_viola_calibration.sh viola
+viola-ops policy execute \
+  --session ~/.local/share/viola/handoffs/v1/rollout_session/<session-id> \
+  --candidate ~/.local/share/viola/handoffs/v1/policy_candidate/<candidate-id> \
+  --phase hold --trial commissioning-hold \
+  --evidence-root /mnt/nas02/yz/starai/evidence/v1/rollout \
+  --wandb-entity <entity>
 ```
 
-Run only the arm that actually needs calibration. These commands can move the
-arm during connection; follow the safety checklist in the calibration guide.
+Later phases additionally require accepted predecessor evidence. Run
+`viola-ops policy execute --help`. There is no valid motion command before a
+blocker-free accepted live session, reviewed setup/current E-stop evidence,
+online intent receipt, and exact interactive operator action all pass.
+ACT is checked first. Every non-ACT session requires Repo B to bind either a
+scored, accepted ACT rollout as `shared_infrastructure_proven`, or a reviewed
+`policy_specific_act_blocker` attestation proving that the ACT failure does not
+implicate any shared hardware, control, safety, evidence, and W&B component.
+Repo A verifies the attached outcome and attestation bytes before authorization.
 
-## Five-minute two-camera video
+The rollout evidence root is required and must be shared NAS storage outside
+the Git worktree. Shakedown and scored bundles inventory-bind their motion
+traces and videos there so PC B can copy and verify them during acceptance.
+
+## Report
 
 ```bash
-./scripts/run_dual_camera_view.sh
-./scripts/run_dual_camera_record.sh 300
+viola-ops report inspect \
+  --bundle ~/.local/share/viola/handoffs/v1/report/<id>
 ```
 
-Both commands display both cameras for the entire process. Close either viewer
-with Q or Esc before starting teleoperation, episode recording, or inference.
-
-## Local LeRobot episode recording
+## Disconnected tests
 
 ```bash
-./scripts/run_viola_episode_recording.sh right-to-left --check
-./scripts/run_viola_episode_recording.sh right-to-left
-
-./scripts/run_viola_episode_recording.sh left-to-right --check
-./scripts/run_viola_episode_recording.sh left-to-right
+python -m pytest -q
+git diff --check
 ```
 
-The recorder displays both cameras in Rerun throughout capture. Datasets remain
-local under `VIOLA_DATASET_DIR`; no Hub upload or model training is performed.
+## Retired commands
 
-## Refresh or verify the policy
-
-```bash
-./scripts/sync_policy.sh
-```
-
-Set `VIOLA_POLICY_SOURCE` when the NAS path differs.
-
-## No-hardware tests
-
-```bash
-conda run --no-capture-output -n lerobot python -m pytest -q
-```
-
-## Optional ROS 2 / MoveIt
-
-The ROS 2 workflow is isolated from LeRobot. Follow
-[ROS 2 / MoveIt](ROS2_MOVEIT.md); do not run ROS and LeRobot hardware control
-simultaneously.
+The old inference, calibration, teleoperation, episode-recording, and ROS
+hardware launchers deliberately exit with code 64 before device access. They
+must not be restored as alternate motion paths.

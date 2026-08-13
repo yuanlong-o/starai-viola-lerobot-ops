@@ -1,305 +1,236 @@
-# StarAI Viola operations and inference
+# StarAI Viola — PC-A operations
 
-Private, self-contained operating package for the StarAI Viola follower,
-StarAI Violin leader, calibration, two-camera preview/video, teleoperation,
-LeRobot episode recording, and ACT policy inference. This repository contains
-**no model-training code**.
+This repository is the PC-A half of the eight-policy Viola benchmark. It owns
+the reviewed dataset release, immutable cross-PC handoffs, disconnected policy
+verification, replay and camera-only shadow runs, supervised robot execution,
+evidence capture, and read-only report inspection. Training and canonical
+ranking belong to Repo B.
 
-Validated runtime:
+The supported runtime is the `lerobot` Conda environment with Python 3.12,
+LeRobot 0.6.1, and W&B 0.27.2 in online mode. Nothing in this README is a
+readiness claim. A clean revision, accepted evidence, and the live gate must
+pass at the time of use.
 
-- Python 3.12 and LeRobot 0.6.1
-- StarAI Viola, Violin, and motor plugins 0.0.4
-- Logitech `front` and `up` cameras at 640×480
-- ACT step-80,000 deployment checkpoint
-- keep-current-pose startup and a `3.0` normalized per-write bound
-- Rerun display of both cameras throughout inference
+## Safety boundary
 
-> Physical robots can injure people or damage equipment. Clear the workspace,
-> secure the base, keep the physical power cutoff accessible, and run the
-> read-only preflight before every session. Software bounds are not an E-stop.
+A policy candidate permits disconnected work only. It cannot move the robot.
+Motion is possible only through `viola-ops policy execute`, after all of these
+conditions pass:
 
-## Migrate to a new PC: complete procedure
+- Repo A has locally accepted the exact policy candidate and Repo-B-produced
+  `rollout_session`.
+- The session permission is `live_session` and its blocker list is exactly
+  empty.
+- The current Repo-A commit and clean worktree match the reviewed executor.
+- Calibration, camera mapping, reset protocol, seven-axis absolute/rate limits,
+  and setup hashes match the reviewed session inputs.
+- E-stop evidence belongs to the operator and is still less than 24 hours old.
+- Required hold/shakedown evidence has been accepted for later phases.
+- Canonical NAS bundles and receipts remain active and unchanged.
+- A pre-hardware online W&B intent run finishes successfully.
+- The named operator uses a real TTY to type the session-specific `ARM ...`
+  challenge and explicitly starts every trial.
 
-The Git repository contains the operating code, pinned dependency list, and
-calibration snapshots. It deliberately does **not** contain the model checkpoint,
-datasets, recordings, logs, credentials, or the machine-local
-`config/operation.env`. Copy any of those that you want to keep separately.
+There is no `--yes`, environment-variable bypass, checkpoint override, task
+override, or piped-input arming path. The old inference, calibration,
+teleoperation, recording, and ROS hardware launchers are retired and exit before
+opening a device. Software is not an E-stop.
 
-### 1. Prepare access and the new Linux PC
+## Install the Repo-A commands
 
-Before disconnecting the old PC, confirm that the new PC can access:
-
-- the private GitHub repository `yuanlong-o/starai-viola-lerobot-ops`;
-- the complete seven-file ACT checkpoint on NAS, an external disk, or the old PC;
-- this exact physical Viola/Violin pair if the tracked calibrations will be used.
-
-Install an NVIDIA driver compatible with PyTorch 2.7.1, Conda (Miniconda or
-Anaconda), GitHub CLI, Git, `rsync`, `v4l2-ctl`, and FFmpeg. On Ubuntu, the
-ordinary system utilities can be installed with:
-
-```bash
-sudo apt update
-sudo apt install -y git rsync v4l-utils ffmpeg
-gh auth login
-gh auth status
-```
-
-Do not copy the old Conda environment directory. The bootstrap recreates the
-validated Python 3.12 environment from the pinned requirements.
-
-### 2. Clone the private operations repository
-
-The validated operations code is on the default `main` branch:
+From this repository:
 
 ```bash
-cd "${HOME}"
-gh repo clone yuanlong-o/starai-viola-lerobot-ops
-cd "${HOME}/starai-viola-lerobot-ops"
-git status
-```
-
-`git status` should report a clean worktree on `main`.
-
-### 3. Recreate the unified operation environment
-
-```bash
-./scripts/bootstrap_new_pc.sh
 conda activate lerobot
 python --version
-python -m pip check
+python -c 'import lerobot, wandb; print(lerobot.__version__, wandb.__version__)'
+python -m pip install --no-deps -e .
+viola-handoff --help
+viola-ops --help
 ```
 
-The bootstrap creates the `lerobot` Conda environment and installs LeRobot
-0.6.1, the three StarAI plugins, camera/video support, Rerun, and inference
-dependencies. Training code and training dependencies are not installed.
+`--no-deps` preserves the pinned environment. Do not edit installed LeRobot or
+plugin source. Repo-owned adapters use public LeRobot and FashionStar APIs.
 
-### 4. Grant serial and camera permissions
+## What each command does
+
+### `viola-handoff seal|inspect|accept|ack`
+
+- `seal` validates content, records online W&B lineage, writes a unique partial
+  bundle, verifies it, and atomically publishes an immutable `READY` bundle.
+  It is the low-level transport command; typed Repo-A operations are preferred.
+  Generic sealing cannot create a live rollout session.
+- `inspect` is read-only. It checks the manifest, contract hash, canonical JSON,
+  inventory, `READY`, receipts, and optionally every external artifact byte.
+- `accept` checksum-copies every artifact into receiver-local storage, verifies
+  it again, finishes online W&B evidence, atomically accepts it, and appends the
+  receiver's `accepted` receipt. Runtime code consumes only this local copy.
+- `ack` appends an immutable `rejected` or `revoked` receipt. Acceptance uses
+  `accept`, not `ack`.
+
+Bundle source layout:
+
+```text
+/mnt/nas02/yz/starai/handoffs/v1/<kind>/<content-id>/
+  manifest.json
+  payload/
+  READY.json
+  receipts/
+```
+
+Large artifacts are inventory-bound external roots, not copies inside the
+small `READY` bundle. Keep each producer root on storage mounted at the same
+path on PCs A and B until PC B accepts the bundle and makes its verified local
+copy. Repo-A commands therefore default producer material to
+`/mnt/nas02/yz/starai/producer-materials/v1` and policy evidence to
+`/mnt/nas02/yz/starai/evidence/v1`; do not replace those with a PC-A-only path
+such as `~/.local` for a cross-PC handoff.
+
+### `viola-ops dataset validate|release`
+
+- `validate` checks the exact frozen 34-episode release, all 28,306 finite 7-D
+  state/action rows, split and provenance, file inventory, and—unless
+  `--numeric-only` is used—fully decodes every `front` and `up` frame.
+- `release` always performs the full validation, records online W&B lineage,
+  and seals a `dataset_release` bundle for PC B. It never trains a model and
+  never changes the source dataset.
 
 ```bash
-sudo usermod -aG dialout,video "$USER"
+viola-ops dataset validate
+viola-ops dataset release \
+  --wandb-project starai-viola-policy-benchmark
 ```
 
-Log out of the entire graphical desktop session and log back in; opening only a
-new terminal is insufficient. Then verify:
+### `viola-ops session-inputs produce`
+
+Validates reviewed setup artifacts, current clean executor identity, exact
+seven-axis limits, camera mapping, reset protocol, and current operator-owned
+E-stop evidence. It seals a planning-only `session_inputs` bundle for Repo B.
+It does not authorize motion; Repo B alone may turn accepted inputs into a typed
+rollout session.
 
 ```bash
-id -nG
+viola-ops session-inputs produce \
+  --setup /path/to/reviewed-setup.json \
+  --subject <setup-id> \
+  --material-root /mnt/nas02/yz/starai/producer-materials/v1
 ```
 
-Both `dialout` and `video` must appear. Do not run robot programs with `sudo`,
-use `chmod 777`, or create broad device permissions.
+The material root retains the signed `setup_record` external artifact where PC
+B can checksum-copy it during acceptance.
 
-### 5. Connect and identify the hardware
+### `viola-ops setup capture-frozen-state`
 
-Connect the arms and cameras, preferably to USB sockets that will remain fixed.
-The two CH340 arm adapters do not expose unique serial IDs, so identify them by
-unplugging one arm at a time:
+After an exact TTY confirmation, reads seven positions through the public SDK,
+closes the serial connection, and only then publishes evidence to online W&B.
+It has no motor-write or torque API. The result is an input for a camera-only
+live soak.
 
 ```bash
-ls -l /dev/serial/by-path/
+viola-ops setup capture-frozen-state \
+  --setup /path/to/reviewed-setup.json \
+  --output-root /path/to/new/frozen-state-evidence \
+  --operator <estop-owner> \
+  --wandb-entity <entity>
 ```
 
-Record which path disappears for the Viola follower and which disappears for
-the Violin leader. Then list the cameras:
+### `viola-ops policy verify|shadow|execute`
+
+- `verify` loads an accepted candidate and its processors/dependencies from
+  receiver-local bytes, verifies exact policy/config/camera/action contracts,
+  produces a finite 7-D sample, then runs 20 warmups and 200 timed calls. No
+  hardware package is constructed.
+- `shadow --mode replay` runs at least 9,000 proposed actions over the complete
+  signed held-out set and resets policy/queue state at episode boundaries.
+- `shadow --mode live-soak` opens only both reviewed cameras, uses a signed
+  frozen seven-axis state, records both videos, and proposes at least 9,000
+  actions over at least 300 wall seconds. It never constructs a robot or motor.
+- `execute` is the sole policy-motion entrypoint. It validates every gate before
+  hardware-capable imports, records a finished online intent run, requires TTY
+  operator actions, executes only the canonical hold → two 25%-rate shakedowns
+  → ten scored trials, and retains complete action traces plus both encoded
+  camera videos.
+
+All eight policy tokens share this path:
+
+```text
+act  diffusion  vqbet  smolvla  pi0  pi0_fast  pi05  groot
+```
+
+An accepted candidate is verified like this:
 
 ```bash
-ls -l /dev/v4l/by-id/
+viola-ops policy verify \
+  --bundle ~/.local/share/viola/handoffs/v1/policy_candidate/<id> \
+  --wandb-entity <entity>
 ```
 
-Use each Logitech camera's `video-index0` path. The camera serial IDs normally
-follow the cameras to the new PC, but the arm `by-path` values will commonly
-change. Never assume the old PC's port 10/port 11 mapping is still correct.
+Both shadow modes default `--output-root` to the shared
+`/mnt/nas02/yz/starai/evidence/v1`. Their `shadow_record` traces and videos must
+remain readable from PC B until acceptance; a PC-A-local override is not a
+portable handoff.
 
-### 6. Create the machine-local configuration
+### `viola-ops report inspect`
 
-The bootstrap normally creates this file. The guarded copy command also works
-if setup was performed manually:
+Read-only validation of an accepted Repo-B `report` bundle. It checks complete
+lineage, exact eight-policy ordering, recomputed metrics, CSV/Markdown/JSON
+agreement, hashes, receipts, and the finished W&B report run. It prints terminal
+outcomes; it does not rank, rewrite, publish, or declare the robot ready.
 
 ```bash
-cd "${HOME}/starai-viola-lerobot-ops"
-test -f config/operation.env || \
-  cp config/operation.env.example config/operation.env
-${EDITOR:-nano} config/operation.env
+viola-ops report inspect \
+  --bundle ~/.local/share/viola/handoffs/v1/report/<id>
 ```
 
-At minimum, verify or change these entries:
+## Inference command after the evidence chain exists
+
+First activate the environment so the interactive TTY is preserved:
 
 ```bash
-LEROBOT_ENV_NAME=lerobot
-VIOLA_ROBOT_PORT=/dev/serial/by-path/REPLACE_WITH_VIOLA_FOLLOWER_PATH
-VIOLA_TELEOP_PORT=/dev/serial/by-path/REPLACE_WITH_VIOLIN_LEADER_PATH
-VIOLA_FRONT_CAMERA=/dev/v4l/by-id/REPLACE_WITH_FRONT-video-index0
-VIOLA_UP_CAMERA=/dev/v4l/by-id/REPLACE_WITH_UP-video-index0
-VIOLA_ROBOT_ID=my_awesome_staraiviola_arm
-VIOLA_TELEOP_ID=my_awesome_staraiviolin_arm
-VIOLA_POLICY_DIR=${HOME}/models/act_viola_val20_step080000
-VIOLA_MAX_STEP=3.0
+conda activate lerobot
+export WANDB_MODE=online
+viola-ops policy execute \
+  --session ~/.local/share/viola/handoffs/v1/rollout_session/<session-id> \
+  --candidate ~/.local/share/viola/handoffs/v1/policy_candidate/<candidate-id> \
+  --phase hold \
+  --trial commissioning-hold \
+  --evidence-root /mnt/nas02/yz/starai/evidence/v1/rollout \
+  --handoff-root /mnt/nas02/yz/starai/handoffs/v1 \
+  --wandb-entity <entity>
 ```
 
-`config/operation.env` is intentionally ignored by Git because device and local
-storage paths differ between PCs.
+That is intentionally a hold-only commissioning command. It does not accept a
+checkpoint path, duration, task, or speed override. After Repo B accepts the
+hold evidence, run `--phase shakedown --prior-hold <accepted-hold-bundle>`.
+After Repo B accepts the two shakedowns, run `--phase scored` with both
+`--prior-hold` and `--prior-shakedown`. Each phase requires a fresh operator
+challenge, and each physical trial requires an explicit `START ...` action.
 
-### 7. Verify both camera identities and framing
+ACT is the infrastructure-clearance policy. A non-ACT live session is invalid
+until Repo B binds either a scored, accepted ACT rollout as
+`shared_infrastructure_proven`, or a reviewed `policy_specific_act_blocker`
+attestation. The latter is allowed only when it proves that the ACT failure is
+policy-specific and explicitly excludes every shared hardware, control,
+safety, evidence, and W&B component. Repo A verifies the attached outcome and
+attestation bytes before it can issue a permit.
 
-Close all other camera applications, then run:
+If an accepted blocker-free rollout session does not yet exist, there is no
+valid inference command that moves the robot.
 
-```bash
-./scripts/run_dual_camera_view.sh
-```
-
-Confirm `front` is the task-wide view and `up` is the overhead view. Both must
-show 640×480 images continuously. Press Q or Esc to close both windows before
-starting another workflow. If the views are reversed, swap only
-`VIOLA_FRONT_CAMERA` and `VIOLA_UP_CAMERA` in `config/operation.env` and repeat.
-
-### 8. Restore calibration for this exact arm pair
-
-First inspect the destination:
-
-```bash
-./scripts/install_calibrations.sh --check || true
-```
-
-On a fresh PC, install the tracked snapshots:
-
-```bash
-./scripts/install_calibrations.sh --install
-./scripts/install_calibrations.sh --check
-```
-
-Use `--replace` only when files already exist and you have confirmed that these
-are the same physical arms; the script backs up replaced files. Recalibrate
-instead of restoring snapshots after a motor replacement, joint reassembly, ID
-change, or mechanical alignment change.
-
-### 9. Transfer and verify the inference checkpoint
-
-If the original NAS path is mounted at the same location:
-
-```bash
-./scripts/sync_policy.sh
-```
-
-If the checkpoint is on another mount, external disk, or copied from the old PC,
-point to the directory containing all seven `pretrained_model` files:
-
-```bash
-VIOLA_POLICY_SOURCE=/path/to/pretrained_model \
-  ./scripts/sync_policy.sh
-```
-
-The script copies the bundle to `VIOLA_POLICY_DIR` and refuses it unless all
-seven files exist and `model.safetensors` matches SHA-256
-`1093aaeddfb902e7e596425d87676baba58cb8ab617a52c954ec11940726b886`.
-
-### 10. Run the read-only migration gate
+## Disconnected verification
 
 ```bash
 conda activate lerobot
 python -m pytest -q
-./scripts/preflight.sh
+git diff --check
 ```
 
-Do not continue until the tests pass and preflight prints:
+The disconnected test matrix covers the shared transport, dataset and setup
+contracts, every policy token, replay and fake-camera live soak, motion-gate
+truth tables, fake public hardware, evidence backpressure, phase ordering,
+report inspection, and refusal by every retired launcher. Fixture coverage is
+not a substitute for loading the eight real accepted Repo-B candidates when
+training and handoff are complete.
 
-```text
-Preflight passed. Hardware was not opened.
-```
-
-This checks the environment versions, imports, stable device paths,
-read/write permissions, both calibration hashes, and the policy hash without
-opening a serial port or camera.
-
-### 11. Test operation in increasing-risk order
-
-Clear the full arm workspace, secure both bases, support the follower, and keep
-the physical power cutoff reachable. Close every other camera and robot process.
-Then test in this order:
-
-```bash
-# Cameras only; press Q or Esc after confirming both live views.
-./scripts/run_dual_camera_view.sh
-
-# Leader/follower control with both cameras displayed in Rerun; Ctrl-C stops.
-./scripts/run_viola_teleoperation.sh
-
-# Ten-second ACT rollout with both cameras displayed throughout.
-./scripts/run_viola_inference.sh 10
-```
-
-Start teleoperation with small leader movements. Stop immediately if the arm
-roles are reversed, a joint direction is wrong, the follower jumps, either
-camera freezes, or Rerun does not show both views. Software bounds are not an
-E-stop.
-
-### 12. Optional: migrate local datasets and recordings
-
-This is unnecessary for operating or inference. If the old data is needed,
-copy it separately after the software migration, preserving directory contents:
-
-```bash
-rsync -a --info=progress2 \
-  OLD_PC_OR_DISK:/path/to/lerobot-data/ "${HOME}/lerobot-data/"
-```
-
-Update `VIOLA_DATASET_DIR` in `config/operation.env`, then inspect existing
-datasets before resuming them. Never append new episodes if either calibration
-changed. MP4 recordings, LeRobot datasets, logs, and checkpoints remain ignored
-by Git.
-
-Rerun opens before robot connection for teleoperation and inference. The
-launchers use MJPG for `front` and YUYV for `up`; both decode to 640×480 RGB,
-while YUYV avoids the observed intermittent MJPEG stall on the up camera.
-
-## Model bundle
-
-Weights are deliberately excluded from Git. `scripts/sync_policy.sh` copies the
-complete seven-file checkpoint bundle and verifies the deployment model hash:
-
-```text
-1093aaeddfb902e7e596425d87676baba58cb8ab617a52c954ec11940726b886
-```
-
-Default source and destination:
-
-```text
-/mnt/nas02/yz/starai/outputs/act_viola_right_to_left_blue_then_red_val20_v1/checkpoints/080000/pretrained_model
-~/models/act_viola_val20_step080000
-```
-
-Override the source with `VIOLA_POLICY_SOURCE=/path/to/pretrained_model`.
-
-## Other operating workflows
-
-| Goal | Guide |
-|---|---|
-| Copy/paste repeat-use commands | [Command reference](docs/COMMAND_REFERENCE.md) |
-| Identify USB devices and migrate PCs | [Setup and ports](docs/SETUP_AND_PORTS.md) |
-| Understand physical and software guards | [Safety](docs/SAFETY.md) |
-| Keep-pose leader/follower operation | [Teleoperation](docs/TELEOPERATION.md) |
-| Preview or record both cameras | [Camera and video](docs/CAMERA_VIDEO.md) |
-| Record local LeRobot episodes | [Episode recording](docs/EPISODE_RECORDING.md) |
-| Restore this exact arm pair's calibration | [Calibration](docs/CALIBRATION.md) |
-| Diagnose devices, cameras, or Rerun | [Troubleshooting](docs/TROUBLESHOOTING.md) |
-| Optional ROS 2 / MoveIt operation | [ROS 2 / MoveIt](docs/ROS2_MOVEIT.md) |
-
-## Repository contents
-
-```text
-calibration/                    reviewed snapshots for this physical arm pair
-config/operation.env.example   portable machine/device configuration template
-docs/                           operating and migration procedures
-scripts/bootstrap_new_pc.sh    creates the unified Conda environment
-scripts/preflight.sh           read-only hardware/software/model verification
-scripts/sync_policy.sh         transfers and verifies the ACT checkpoint
-scripts/infer_keep_pose.py      guarded LeRobot policy rollout wrapper
-scripts/run_viola_inference.sh displayed inference launcher
-scripts/teleoperate_keep_pose.py keep-pose leader/follower wrapper
-scripts/record_episodes_keep_pose.py guarded local episode recorder
-ros2/                           optional pinned ROS 2/MoveIt workflow
-tests/                          no-hardware regression tests
-```
-
-Generated datasets, checkpoints, recordings, logs, credentials, and local
-`config/operation.env` are ignored. Model training remains in the separate private
-`yuanlong-o/starai-viola-act-training` repository and is not required here.
+See [the command reference](docs/COMMAND_REFERENCE.md) and
+[safety design](docs/SAFETY.md) for a shorter operator checklist.

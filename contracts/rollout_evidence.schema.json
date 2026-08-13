@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neurolabware.invalid/viola/v1/rollout_evidence.schema.json",
+  "title": "Viola PC-A rollout evidence payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "session_id", "session_bundle_id", "session_content_id", "session_manifest_sha256", "policy_bundle_id", "policy_content_id", "prior_phase_bundles", "evaluation_sha256", "checkpoint_inventory_sha256", "dataset_release_id", "policy", "experiment", "phase", "status", "started_at", "completed_at", "details", "repo", "wandb"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "rollout_evidence"},
+    "session_id": {"type": "string", "minLength": 1},
+    "session_bundle_id": {"$ref": "#/$defs/sha256"},
+    "session_content_id": {"$ref": "#/$defs/sha256"},
+    "session_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "policy_bundle_id": {"$ref": "#/$defs/sha256"},
+    "policy_content_id": {"$ref": "#/$defs/sha256"},
+    "prior_phase_bundles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hold", "shakedown"],
+      "properties": {
+        "hold": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/bundleRef"}]},
+        "shakedown": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/bundleRef"}]}
+      }
+    },
+    "evaluation_sha256": {"$ref": "#/$defs/sha256"},
+    "checkpoint_inventory_sha256": {"$ref": "#/$defs/sha256"},
+    "dataset_release_id": {"type": "string", "minLength": 1},
+    "policy": {"enum": ["act", "diffusion", "vqbet", "smolvla", "pi0", "pi0_fast", "pi05", "groot"]},
+    "experiment": {"type": "string", "minLength": 1},
+    "phase": {"enum": ["hold", "shakedown", "scored"]},
+    "status": {"enum": ["completed", "blocked_setup", "unsafe_shakedown"]},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "details": {"type": "object"},
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "clean", "hostname", "python"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "clean": {"const": true},
+        "hostname": {"type": "string", "minLength": 1},
+        "python": {"type": "string", "pattern": "^3\\.12\\."}
+      }
+    },
+    "wandb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "url"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "pattern": "^https://"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "bundleRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle_id", "content_id"],
+      "properties": {
+        "bundle_id": {"$ref": "#/$defs/sha256"},
+        "content_id": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"phase": {"const": "hold"}}},
+      "then": {
+        "properties": {
+          "prior_phase_bundles": {
+            "properties": {"hold": {"type": "null"}, "shakedown": {"type": "null"}}
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "prior_phase_bundles": {
+            "properties": {"hold": {"$ref": "#/$defs/bundleRef"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"phase": {"const": "shakedown"}}},
+      "then": {
+        "properties": {
+          "prior_phase_bundles": {
+            "properties": {"shakedown": {"type": "null"}}
+          }
+        }
+      },
+      "else": {
+        "if": {"properties": {"phase": {"const": "scored"}}},
+        "then": {
+          "properties": {
+            "prior_phase_bundles": {
+              "properties": {"shakedown": {"$ref": "#/$defs/bundleRef"}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "completed"}}},
+      "then": {
+        "not": {"properties": {"details": {"required": ["failure_type"]}}}
+      }
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["blocked_setup", "unsafe_shakedown"]}}},
+      "then": {
+        "properties": {
+          "details": {
+            "required": ["failure_type", "failure_reason", "motion_aborted"],
+            "properties": {
+              "failure_type": {"type": "string", "minLength": 1},
+              "failure_reason": {"type": "string", "minLength": 1},
+              "motion_aborted": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

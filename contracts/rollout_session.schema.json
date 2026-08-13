@@ -1,0 +1,265 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neurolabware.invalid/viola/v1/rollout_session.schema.json",
+  "title": "Viola PC-B to PC-A live rollout session payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "policy_bundle_id",
+    "policy_content_id",
+    "setup_hashes",
+    "phase_permissions",
+    "blockers",
+    "operator",
+    "task",
+    "session_inputs_binding",
+    "source_session",
+    "executor",
+    "estop",
+    "trial_protocol",
+    "act_infrastructure_clearance"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "policy_bundle_id": {"$ref": "#/$defs/sha256"},
+    "policy_content_id": {"$ref": "#/$defs/sha256"},
+    "setup_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calibration", "camera", "robot", "reset"],
+      "properties": {
+        "calibration": {"$ref": "#/$defs/sha256"},
+        "camera": {"$ref": "#/$defs/sha256"},
+        "robot": {"$ref": "#/$defs/sha256"},
+        "reset": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "phase_permissions": {"const": ["hold", "shakedown", "scored"]},
+    "blockers": {"const": []},
+    "operator": {"type": "string", "minLength": 1},
+    "task": {
+      "const": "Move the blue cube, then the red cube, from the white pad on the right to the gray platform on the left."
+    },
+    "session_inputs_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle_id",
+        "content_id",
+        "manifest_sha256",
+        "payload_sha256",
+        "setup_record_inventory_sha256"
+      ],
+      "properties": {
+        "bundle_id": {"$ref": "#/$defs/sha256"},
+        "content_id": {"$ref": "#/$defs/sha256"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "payload_sha256": {"$ref": "#/$defs/sha256"},
+        "setup_record_inventory_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "source_session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "created_at_utc",
+        "benchmark_lineage_sha256",
+        "policy_bindings_sha256",
+        "policy_binding_sha256",
+        "physical_setup_binding_sha256",
+        "executor_binding_sha256"
+      ],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "created_at_utc": {"type": "string", "format": "date-time"},
+        "benchmark_lineage_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_bindings_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_binding_sha256": {"$ref": "#/$defs/sha256"},
+        "physical_setup_binding_sha256": {"$ref": "#/$defs/sha256"},
+        "executor_binding_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "repository_commit",
+        "entrypoint_sha256",
+        "attestation_sha256",
+        "reviewed_at_utc"
+      ],
+      "properties": {
+        "repository": {"const": "starai-viola-lerobot-ops"},
+        "repository_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "entrypoint_sha256": {"$ref": "#/$defs/sha256"},
+        "attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "reviewed_at_utc": {"type": "string", "format": "date-time"}
+      }
+    },
+    "estop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operator", "tested_at_utc", "attestation_sha256"],
+      "properties": {
+        "operator": {"type": "string", "minLength": 1},
+        "tested_at_utc": {"type": "string", "format": "date-time"},
+        "attestation_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "act_infrastructure_clearance": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/actInfrastructureClearance"}
+      ]
+    },
+    "trial_protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "hold_required",
+        "shakedown_trials",
+        "shakedown_speed_scale",
+        "scored_trials",
+        "nominal_trials",
+        "perturbation_trials",
+        "trial_duration_s",
+        "stable_success_s",
+        "target_hz",
+        "action_dimensions",
+        "replan_actions",
+        "ordered_conditions",
+        "schedule_order",
+        "execution_order"
+      ],
+      "properties": {
+        "seed": {"const": 1000},
+        "hold_required": {"const": true},
+        "shakedown_trials": {"const": 2},
+        "shakedown_speed_scale": {"const": 0.25},
+        "scored_trials": {"const": 10},
+        "nominal_trials": {"const": 6},
+        "perturbation_trials": {"const": 4},
+        "trial_duration_s": {"const": 60},
+        "stable_success_s": {"const": 3.0},
+        "target_hz": {"const": 30.0},
+        "action_dimensions": {"const": 7},
+        "replan_actions": {"const": 10},
+        "ordered_conditions": {"$ref": "#/$defs/orderedConditions"},
+        "schedule_order": {"$ref": "#/$defs/conditionOrder"},
+        "execution_order": {"$ref": "#/$defs/conditionOrder"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "conditionOrder": {
+      "const": [
+        "nominal_01",
+        "nominal_02",
+        "nominal_03",
+        "nominal_04",
+        "nominal_05",
+        "nominal_06",
+        "robustness_01",
+        "robustness_02",
+        "robustness_03",
+        "robustness_04"
+      ]
+    },
+    "orderedConditions": {
+      "const": [
+        {"condition_id": "nominal_01", "stratum": "nominal", "blue_axis": null, "blue_offset_mm": 0.0, "red_axis": null, "red_offset_mm": 0.0},
+        {"condition_id": "nominal_02", "stratum": "nominal", "blue_axis": null, "blue_offset_mm": 0.0, "red_axis": null, "red_offset_mm": 0.0},
+        {"condition_id": "nominal_03", "stratum": "nominal", "blue_axis": null, "blue_offset_mm": 0.0, "red_axis": null, "red_offset_mm": 0.0},
+        {"condition_id": "nominal_04", "stratum": "nominal", "blue_axis": null, "blue_offset_mm": 0.0, "red_axis": null, "red_offset_mm": 0.0},
+        {"condition_id": "nominal_05", "stratum": "nominal", "blue_axis": null, "blue_offset_mm": 0.0, "red_axis": null, "red_offset_mm": 0.0},
+        {"condition_id": "nominal_06", "stratum": "nominal", "blue_axis": null, "blue_offset_mm": 0.0, "red_axis": null, "red_offset_mm": 0.0},
+        {"condition_id": "robustness_01", "stratum": "robustness", "blue_axis": "pad_x", "blue_offset_mm": -25.0, "red_axis": "pad_y", "red_offset_mm": -25.0},
+        {"condition_id": "robustness_02", "stratum": "robustness", "blue_axis": "pad_x", "blue_offset_mm": -25.0, "red_axis": "pad_y", "red_offset_mm": 25.0},
+        {"condition_id": "robustness_03", "stratum": "robustness", "blue_axis": "pad_x", "blue_offset_mm": 25.0, "red_axis": "pad_y", "red_offset_mm": -25.0},
+        {"condition_id": "robustness_04", "stratum": "robustness", "blue_axis": "pad_x", "blue_offset_mm": 25.0, "red_axis": "pad_y", "red_offset_mm": 25.0}
+      ]
+    },
+    "actInfrastructureClearance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "act_outcome_sha256",
+        "act_terminal_status",
+        "act_rollout_evidence_bundle_id",
+        "attestation_sha256",
+        "blocker_stage",
+        "blocker_code",
+        "reviewer",
+        "reviewed_at"
+      ],
+      "properties": {
+        "mode": {"enum": ["shared_infrastructure_proven", "policy_specific_act_blocker"]},
+        "act_outcome_sha256": {"$ref": "#/$defs/sha256"},
+        "act_terminal_status": {
+          "enum": [
+            "scored",
+            "ineligible_training",
+            "ineligible_offline",
+            "ineligible_pc_runtime",
+            "unsafe_shadow",
+            "unsafe_shakedown"
+          ]
+        },
+        "act_rollout_evidence_bundle_id": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+        },
+        "attestation_sha256": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+        },
+        "blocker_stage": {"type": ["string", "null"]},
+        "blocker_code": {"type": ["string", "null"]},
+        "reviewer": {"type": ["string", "null"]},
+        "reviewed_at": {"type": ["string", "null"], "format": "date-time"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {"const": "shared_infrastructure_proven"},
+            "act_terminal_status": {"const": "scored"},
+            "act_rollout_evidence_bundle_id": {"$ref": "#/$defs/sha256"},
+            "attestation_sha256": {"const": null},
+            "blocker_stage": {"const": null},
+            "blocker_code": {"const": null},
+            "reviewer": {"const": null},
+            "reviewed_at": {"const": null}
+          }
+        },
+        {
+          "properties": {
+            "mode": {"const": "policy_specific_act_blocker"},
+            "act_terminal_status": {
+              "enum": [
+                "ineligible_training",
+                "ineligible_offline",
+                "ineligible_pc_runtime",
+                "unsafe_shadow",
+                "unsafe_shakedown"
+              ]
+            },
+            "act_rollout_evidence_bundle_id": {"const": null},
+            "attestation_sha256": {"$ref": "#/$defs/sha256"},
+            "blocker_stage": {
+              "enum": ["training", "offline_evaluation", "pc_runtime", "disconnected_shadow", "shakedown"]
+            },
+            "blocker_code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$"},
+            "reviewer": {"type": "string", "minLength": 1},
+            "reviewed_at": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    }
+  }
+}

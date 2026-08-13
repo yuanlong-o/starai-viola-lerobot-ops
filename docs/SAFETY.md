@@ -1,64 +1,64 @@
-# Safety
+# Safety design
 
-## Before enabling either arm
+Software cannot replace the physical E-stop or an attentive operator. This
+repository therefore treats every missing, malformed, stale, or inconsistent
+input as a blocker.
 
-1. Confirm the Viola follower is the adapter on the current `usb-0:10` path and
-   the Violin teacher is on `usb-0:11`. If anything was replugged, perform the
-   unplug test in [Setup, ports, and permissions](SETUP_AND_PORTS.md).
-2. Put both arms in comfortable, collision-free poses. The follower does not
-   need to match the teacher; the keep-pose wrapper measures both starting poses.
-3. Clear cubes, tools, cables, people, and camera stands from the arm envelope.
-4. Ensure the arm base and cameras cannot move.
-5. Keep immediate access to the hardware power or torque cutoff.
-6. Run the read-only preflight from the repository root:
+## Before hardware can exist
 
-   ```bash
-   sg dialout -c 'exec ./scripts/preflight.sh'
-   ```
+`viola-ops policy execute` checks, in order:
 
-## Why the stock command moves to a strange pose
+1. locally accepted Repo-B candidate and rollout session;
+2. `live_session` permission and exactly `blockers: []`;
+3. exact policy, task, queue, setup, session-input, and lineage bindings;
+4. active, unchanged canonical NAS bundles and receipts;
+5. current clean reviewed Repo-A commit, Python 3.12, LeRobot 0.6.1, `lerobot`
+   Conda environment, W&B 0.27.2, and online mode;
+6. reviewed calibration, two-camera mapping, reset protocol, seven keyed
+   absolute limits, per-step limits, and executor entrypoint hash;
+7. passed operator-owned E-stop evidence less than 24 hours old at rollout;
+8. accepted hold/shakedown predecessor evidence when the phase needs it;
+9. an exact session/phase/trial `ARM ...` phrase from a real `/dev/tty`;
+10. a finished online W&B intent run.
 
-In the installed `lerobot_robot_viola==0.0.4` and
-`lerobot_teleoperator_violin==0.0.4` plugins, `connect()` calls
-`move_to_initial_position()` when a calibration file is loaded. That method
-commands this normalized target over 1.5 seconds:
+Only then are hardware-capable modules imported. The motion permit is an
+unforgeable in-process object tied to one session, phase, and challenge.
 
-```text
-Motor_0=0, Motor_1=-100, Motor_2=60, Motor_3=0,
-Motor_4=30, Motor_5=0, gripper=50
-```
+## During execution
 
-This is why the arm can jump or fold into an unexpected shape after a stock
-`lerobot-teleoperate`, `lerobot-record`, or even calibration connection.
+- Connection uses the reviewed public FashionStar interface and commands only
+  the freshly measured current pose at startup.
+- Every action must name exactly seven joints and contain finite values.
+- An action that is out of bounds or would need clamping is rejected; it is not
+  silently corrected.
+- Shakedowns use 25% of reviewed per-step limits. Scored trials use the reviewed
+  limits without a runtime override.
+- Stale camera data, one missed control deadline, feedback loss, malformed
+  action, limit failure, evidence-queue saturation, collision, intervention, or
+  operator stop aborts before the current write whenever possible.
+- Evidence capacity is reserved before a motor write. Proposed, sent, and
+  feedback actions plus timings, freshness, hashes, and videos are retained.
+- Network and ordinary filesystem work stay outside the 30 Hz loop.
+- Torque is retained on disconnect; the operator owns physical safeing.
 
-The wrappers in this repository patch that behavior only inside their Python
-process. They read the current follower pose, engage with a goal equal to that
-pose, leave the teacher unlocked at its current pose, and then use:
+## Phase order
 
-```text
-follower target = follower startup + (teacher current - teacher startup)
-```
+The only sequence is hold-only commissioning, exactly two unscored 25%-rate
+shakedowns, then ten preregistered scored trials. Repo B must accept and validate
+the completed prior phase before Repo A can advance.
 
-The first requested follower target is therefore its measured current pose.
+## Explicitly unsupported paths
 
-## Limits of the software guard
+Direct calibration, leader/follower teleoperation, demonstration recording, the
+old ACT launcher, and the ROS hardware driver have no live-session authorization
+contract. Their legacy entrypoints exit before checking or opening devices.
+Camera preview/recording utilities remain motor-inert but do not provide policy
+or rollout evidence.
 
-- `--max_step=3.0` limits each normalized command step, not physical velocity,
-  force, energy, or collision risk.
-- The wrapper assumes seven normalized controls named `Motor_0` through
-  `Motor_5` and `gripper`; it is not a general UR5 safety layer.
-- A wrong port assignment, wrong calibration, failed sensor, plugin update, or
-  external program can still cause dangerous movement.
-- Never rely on a GUI, keyboard shortcut, Python exception, or USB disconnect as
-  the emergency stop.
+## Known cross-repository evidence blocker
 
-## Rules that protect recorded data
-
-- Never run two writers against one dataset root.
-- Do not move a cube manually after an episode starts. Discard the episode with
-  Left Arrow and reset during the reset phase.
-- Do not append to the frozen right-to-left source dataset.
-- Do not mix demonstrations made with different calibrations in one dataset
-  version.
-- Preserve interrupted or suspicious directories for diagnosis; do not record
-  over them blindly.
+The merged Repo-B contract currently uses incompatible completed and unsafe
+trace shapes. Repo A preserves the richer safety trace and derives Repo B's
+compact completed view, but it will not mint `READY` unsafe evidence until both
+repositories share one schema that can prove the required safety facts. This
+blocks a readiness claim; it is not relaxed at runtime.

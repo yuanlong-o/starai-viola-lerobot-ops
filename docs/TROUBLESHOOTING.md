@@ -1,5 +1,10 @@
 # Troubleshooting
 
+> The old calibration, teleoperation, recording, ACT inference, and ROS
+> hardware launchers are retired. Do not follow historical device-recovery
+> suggestions below to start them; use `viola-ops --help` and the accepted
+> session workflow in the current README.
+
 Start with the terminal output and the latest log. Rerun is a visualization
 client; an empty or stale panel does not prove that recording is healthy.
 
@@ -71,7 +76,7 @@ GUI window exists.
 
 Cut power first. This usually means a stock command invoked the StarAI plugin's
 hardcoded startup pose. Confirm the command calls either
-`teleoperate_keep_pose.py` or `run_viola_inference.sh`. Then verify arm
+the retired teleoperation or inference path. Then verify arm
 roles, calibration hashes, `use_degrees=false`, and pinned versions. See
 [Safety](SAFETY.md).
 

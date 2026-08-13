@@ -1,0 +1,536 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://neurolabware.invalid/viola/v1/shadow_evidence.schema.json",
+    "title": "Viola disconnected shadow evidence",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "schema_version",
+        "kind",
+        "status",
+        "bundle_id",
+        "content_id",
+        "policy",
+    "setup_hashes",
+    "frozen_state_capture",
+    "runtime_binding",
+    "failure",
+    "verification",
+        "summary",
+        "trace",
+        "trace_file_sha256",
+        "videos",
+        "repo",
+        "wandb",
+        "completed_at"
+    ],
+    "properties": {
+        "schema_version": {"const": 1},
+        "kind": {"const": "shadow_evidence"},
+        "status": {"enum": ["passed", "unsafe_shadow", "ineligible_pc_runtime"]},
+        "bundle_id": {"$ref": "#/$defs/sha256"},
+        "content_id": {"$ref": "#/$defs/sha256"},
+        "policy": {
+            "enum": ["act", "diffusion", "vqbet", "smolvla", "pi0", "pi0_fast", "pi05", "groot"]
+        },
+        "setup_hashes": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/setupHashes"}]},
+    "frozen_state_capture": {
+            "oneOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+          "required": ["setup_id", "evidence_sha256", "frozen_state_sha256", "state_sha256", "wandb"],
+          "properties": {
+            "setup_id": {"type": "string", "minLength": 1},
+                        "evidence_sha256": {"$ref": "#/$defs/sha256"},
+                        "frozen_state_sha256": {"$ref": "#/$defs/sha256"},
+                        "state_sha256": {"$ref": "#/$defs/sha256"},
+                        "wandb": {"$ref": "#/$defs/wandb"}
+                    }
+                }
+      ]
+    },
+    "runtime_binding": {
+      "$ref": "#/$defs/runtimeBinding"
+    },
+    "failure": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/failure"
+        }
+      ]
+    },
+    "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sha256", "run_id", "url"],
+            "properties": {
+                "sha256": {"$ref": "#/$defs/sha256"},
+                "run_id": {"type": "string", "minLength": 1},
+                "url": {
+                    "type": "string",
+                    "pattern": "^https://wandb\\.ai/[^/\\s]+/[^/\\s]+/runs/[A-Za-z0-9_-]+$"
+                }
+            }
+        },
+        "summary": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/shadowSummary"}]},
+        "trace": {"type": ["string", "null"], "minLength": 1},
+        "trace_file_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+        "videos": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "front": {
+                    "allOf": [
+                        {"$ref": "#/$defs/video"},
+                        {"properties": {"path": {"const": "videos/front.mp4"}}}
+                    ]
+                },
+                "up": {
+                    "allOf": [
+                        {"$ref": "#/$defs/video"},
+                        {"properties": {"path": {"const": "videos/up.mp4"}}}
+                    ]
+                }
+            }
+        },
+        "repo": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["commit", "clean", "hostname", "python"],
+            "properties": {
+                "commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+                "clean": {"const": true},
+                "hostname": {"type": "string", "minLength": 1},
+                "python": {"type": "string", "pattern": "^3\\.12\\."}
+            }
+        },
+        "wandb": {"$ref": "#/$defs/wandb"},
+        "completed_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "vector7": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"type": "number"}
+    },
+    "jointOrder": {
+      "const": ["Motor_0", "Motor_1", "Motor_2", "Motor_3", "Motor_4", "Motor_5", "gripper"]
+    },
+    "jointViolations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["Motor_0", "Motor_1", "Motor_2", "Motor_3", "Motor_4", "Motor_5", "gripper"]}
+    },
+    "cameraValues": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["front", "up"],
+      "properties": {
+        "front": {"type": "number", "minimum": 0},
+        "up": {"type": "number", "minimum": 0}
+      }
+    },
+    "nullableCameraValues": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["front", "up"],
+      "properties": {
+        "front": {"type": ["number", "null"], "minimum": 0},
+        "up": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "cameraFreshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_api", "arrival_clock", "read_deadline_ms", "frame_age_ms", "interarrival_ms"],
+      "properties": {
+        "public_api": {"const": "OpenCVCamera.async_read"},
+        "arrival_clock": {"const": "time.perf_counter"},
+        "read_deadline_ms": {"const": 100.0},
+        "frame_age_ms": {"$ref": "#/$defs/cameraValues"},
+        "interarrival_ms": {"$ref": "#/$defs/nullableCameraValues"}
+      }
+    },
+    "canonicalLimitCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "joint_order", "lower", "upper", "absolute_violations", "rate_limits_reviewed", "passed"],
+      "properties": {
+        "scope": {"const": "canonical_device_domain_only"},
+        "joint_order": {"$ref": "#/$defs/jointOrder"},
+        "lower": {"$ref": "#/$defs/vector7"},
+        "upper": {"$ref": "#/$defs/vector7"},
+        "absolute_violations": {"$ref": "#/$defs/jointViolations"},
+        "rate_limits_reviewed": {"const": false},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "deploymentLimitCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "reference", "joint_order", "reference_action", "lower", "upper", "reviewed_max_step_deltas", "speed_scale", "allowed_step_deltas", "absolute_violations", "rate_violations", "would_be_clamped", "passed"],
+      "properties": {
+        "scope": {"const": "reviewed_setup_absolute_and_per_step"},
+        "reference": {"enum": ["frozen_state", "previous_proposed_action"]},
+        "joint_order": {"$ref": "#/$defs/jointOrder"},
+        "reference_action": {"$ref": "#/$defs/vector7"},
+        "lower": {"$ref": "#/$defs/vector7"},
+        "upper": {"$ref": "#/$defs/vector7"},
+        "reviewed_max_step_deltas": {"$ref": "#/$defs/vector7"},
+        "speed_scale": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "allowed_step_deltas": {"$ref": "#/$defs/vector7"},
+        "absolute_violations": {"$ref": "#/$defs/jointViolations"},
+        "rate_violations": {"$ref": "#/$defs/jointViolations"},
+        "would_be_clamped": {"$ref": "#/$defs/jointViolations"},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "replayActionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repeat", "episode", "frame", "action", "state_sha256", "front_sha256", "up_sha256", "latency_ms", "limit_check", "replan"],
+      "properties": {
+        "repeat": {"type": "integer", "minimum": 0},
+        "episode": {"type": "integer", "minimum": 0},
+        "frame": {"type": "integer", "minimum": 0},
+        "action": {"$ref": "#/$defs/vector7"},
+        "state_sha256": {"$ref": "#/$defs/sha256"},
+        "front_sha256": {"$ref": "#/$defs/sha256"},
+        "up_sha256": {"$ref": "#/$defs/sha256"},
+        "latency_ms": {"type": "number", "minimum": 0},
+        "limit_check": {"$ref": "#/$defs/canonicalLimitCheck"},
+        "replan": {"type": "boolean"}
+      }
+    },
+    "replayMalformedRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repeat", "episode", "frame", "event", "detail", "limit_scope"],
+      "properties": {
+        "repeat": {"type": "integer", "minimum": 0},
+        "episode": {"type": "integer", "minimum": 0},
+        "frame": {"type": "integer", "minimum": 0},
+        "event": {"const": "malformed_action"},
+        "detail": {"type": "string", "minLength": 1},
+        "limit_scope": {"const": "canonical_device_domain_only"}
+      }
+    },
+    "replayTraceRow": {
+      "oneOf": [
+        {"$ref": "#/$defs/replayActionRow"},
+        {"$ref": "#/$defs/replayMalformedRow"}
+      ]
+    },
+    "liveActionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "elapsed_s", "action", "state_sha256", "front_sha256", "up_sha256", "latency_ms", "observation_read_ms", "total_loop_latency_ms", "deadline_ms", "deadline_passed", "target_period_ms", "rate_passed", "frame_ages_ms", "camera_freshness", "limit_check", "replan"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "elapsed_s": {"type": "number", "minimum": 0},
+        "action": {"$ref": "#/$defs/vector7"},
+        "state_sha256": {"$ref": "#/$defs/sha256"},
+        "front_sha256": {"$ref": "#/$defs/sha256"},
+        "up_sha256": {"$ref": "#/$defs/sha256"},
+        "latency_ms": {"type": "number", "minimum": 0},
+        "observation_read_ms": {"type": "number", "minimum": 0},
+        "total_loop_latency_ms": {"type": "number", "minimum": 0},
+        "deadline_ms": {"const": 300.0},
+        "deadline_passed": {"type": "boolean"},
+        "target_period_ms": {"const": 33.333333333333336},
+        "rate_passed": {"type": "boolean"},
+        "frame_ages_ms": {"$ref": "#/$defs/cameraValues"},
+        "camera_freshness": {"$ref": "#/$defs/cameraFreshness"},
+        "limit_check": {"$ref": "#/$defs/deploymentLimitCheck"},
+        "replan": {"type": "boolean"}
+      }
+    },
+    "liveSourceStaleRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "elapsed_s", "event", "source_blocker", "detail", "total_loop_latency_ms"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "elapsed_s": {"type": "number", "minimum": 0},
+        "event": {"const": "stale_observation"},
+        "source_blocker": {"enum": ["stale_observation", "camera_read"]},
+        "detail": {"type": "string", "minLength": 1},
+        "total_loop_latency_ms": {"type": "number", "minimum": 0}
+      }
+    },
+    "liveAgeStaleRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "elapsed_s", "event", "frame_ages_ms", "stale_cameras", "observation_read_ms", "total_loop_latency_ms", "camera_freshness"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "elapsed_s": {"type": "number", "minimum": 0},
+        "event": {"const": "stale_observation"},
+        "frame_ages_ms": {"$ref": "#/$defs/cameraValues"},
+        "stale_cameras": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["front", "up"]}},
+        "observation_read_ms": {"type": "number", "minimum": 0},
+        "total_loop_latency_ms": {"type": "number", "minimum": 0},
+        "camera_freshness": {"$ref": "#/$defs/cameraFreshness"}
+      }
+    },
+    "liveMalformedRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "elapsed_s", "event", "detail", "observation_read_ms", "total_loop_latency_ms", "frame_ages_ms", "camera_freshness"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "elapsed_s": {"type": "number", "minimum": 0},
+        "event": {"const": "malformed_action"},
+        "detail": {"type": "string", "minLength": 1},
+        "observation_read_ms": {"type": "number", "minimum": 0},
+        "total_loop_latency_ms": {"type": "number", "minimum": 0},
+        "frame_ages_ms": {"$ref": "#/$defs/cameraValues"},
+        "camera_freshness": {"$ref": "#/$defs/cameraFreshness"}
+      }
+    },
+    "liveTraceRow": {
+      "oneOf": [
+        {"$ref": "#/$defs/liveActionRow"},
+        {"$ref": "#/$defs/liveSourceStaleRow"},
+        {"$ref": "#/$defs/liveAgeStaleRow"},
+        {"$ref": "#/$defs/liveMalformedRow"}
+      ]
+    },
+    "shadowSummary": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "mode",
+                "actions",
+                "captured_observations",
+                "replans",
+                "runtime_resets",
+                "logical_seconds",
+                "wall_seconds",
+                "deadline_misses",
+                "rate_misses",
+                "stale_frames",
+                "limit_violations",
+                "malformed_actions",
+                "action_trace_sha256",
+                "frozen_state_sha256",
+                "completed",
+                "requirements"
+            ],
+            "properties": {
+                "mode": {"enum": ["replay", "live-soak"]},
+                "actions": {"type": "integer", "minimum": 0},
+                "captured_observations": {"type": "integer", "minimum": 0},
+                "replans": {"type": "integer", "minimum": 0},
+                "runtime_resets": {"type": "integer", "minimum": 1},
+                "logical_seconds": {"type": "number", "minimum": 0},
+                "wall_seconds": {"type": "number", "minimum": 0},
+                "deadline_misses": {"type": "integer", "minimum": 0},
+                "rate_misses": {"type": "integer", "minimum": 0},
+                "stale_frames": {"type": "integer", "minimum": 0},
+                "limit_violations": {"type": "integer", "minimum": 0},
+                "malformed_actions": {"type": "integer", "minimum": 0},
+                "action_trace_sha256": {"$ref": "#/$defs/sha256"},
+                "frozen_state_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+                "completed": {"type": "boolean"},
+                "requirements": {
+                    "const": {
+                        "minimum_actions": 9000,
+                        "minimum_seconds": 300.0,
+                        "target_hz": 30.0,
+                        "rate_tolerance_ms": 5.0,
+                        "deadline_ms": 300.0,
+                        "maximum_frame_age_ms": 100.0,
+                        "action_dimensions": 7,
+                        "recorded_cameras": ["front", "up"],
+                        "replay_limit_scope": "canonical_device_domain_only",
+                        "live_limit_scope": "reviewed_setup_absolute_and_per_step",
+                        "live_rate_reference": "frozen_then_previous_proposed_action"
+                    }
+                }
+            }
+        },
+        "setupHashes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["calibration", "camera", "robot", "reset"],
+            "properties": {
+                "calibration": {"$ref": "#/$defs/sha256"},
+                "camera": {"$ref": "#/$defs/sha256"},
+                "robot": {"$ref": "#/$defs/sha256"},
+                "reset": {"$ref": "#/$defs/sha256"}
+            }
+        },
+        "runtimeBinding": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "checkpoint_inventory_sha256",
+                "checkpoint_config_sha256",
+                "processor_sha256",
+                "dependency_inventory_sha256"
+            ],
+            "properties": {
+                "checkpoint_inventory_sha256": {"$ref": "#/$defs/sha256"},
+                "checkpoint_config_sha256": {"$ref": "#/$defs/sha256"},
+                "processor_sha256": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["preprocessor", "postprocessor"],
+                    "properties": {
+                        "preprocessor": {"$ref": "#/$defs/sha256"},
+                        "postprocessor": {"$ref": "#/$defs/sha256"}
+                    }
+                },
+                "dependency_inventory_sha256": {
+                    "type": "object",
+                    "additionalProperties": {"$ref": "#/$defs/sha256"}
+                }
+            }
+        },
+        "failure": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "recoverable", "evidence"],
+            "properties": {
+                "code": {
+                    "enum": [
+                        "runtime_load_failed",
+                        "observation_contract_failed",
+                        "inference_failed",
+                        "benchmark_failed",
+                        "latency_exceeded",
+                        "deadline_miss",
+                        "rate_miss",
+                        "stale_observation",
+                        "limit_violation",
+                        "malformed_action"
+                    ]
+                },
+                "recoverable": {"const": false},
+                "evidence": {"type": "object"}
+            }
+        },
+        "video": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "frame_count", "fps", "duration_s", "width", "height"],
+            "properties": {
+                "path": {"type": "string", "pattern": "^videos/(front|up)\\.mp4$"},
+                "sha256": {"$ref": "#/$defs/sha256"},
+                "frame_count": {"type": "integer", "minimum": 0},
+                "fps": {"const": 30.0},
+                "duration_s": {"type": "number", "minimum": 0},
+                "width": {"const": 640},
+                "height": {"const": 480}
+            }
+        },
+        "wandb": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["run_id", "url"],
+            "properties": {
+                "run_id": {"type": "string", "minLength": 1},
+                "url": {
+                    "type": "string",
+                    "pattern": "^https://wandb\\.ai/[^/\\s]+/[^/\\s]+/runs/[A-Za-z0-9_-]+$"
+                }
+            }
+        }
+    },
+    "allOf": [
+        {
+            "if": {"properties": {"status": {"const": "ineligible_pc_runtime"}}},
+            "then": {
+                "properties": {
+                    "setup_hashes": {"type": "null"},
+                    "frozen_state_capture": {"type": "null"},
+                    "summary": {"type": "null"},
+                    "trace": {"type": "null"},
+                    "trace_file_sha256": {"type": "null"},
+                    "videos": {"maxProperties": 0},
+                    "failure": {"$ref": "#/$defs/failure"}
+                }
+            },
+            "else": {
+                "properties": {
+                    "summary": {"$ref": "#/$defs/shadowSummary"},
+                    "trace": {"const": "action_trace.jsonl"},
+                    "trace_file_sha256": {"$ref": "#/$defs/sha256"}
+                }
+            }
+        },
+        {
+            "if": {"properties": {"status": {"const": "passed"}}},
+            "then": {
+                "properties": {
+                    "summary": {
+                        "properties": {
+              "actions": {"minimum": 9000},
+              "captured_observations": {"minimum": 9000},
+                            "replans": {"minimum": 900},
+                            "logical_seconds": {"minimum": 300},
+                            "deadline_misses": {"const": 0},
+                            "rate_misses": {"const": 0},
+                            "stale_frames": {"const": 0},
+                            "limit_violations": {"const": 0},
+                            "malformed_actions": {"const": 0},
+                            "completed": {"const": true}
+                        }
+                    },
+                    "failure": {"type": "null"}
+                }
+            }
+        },
+        {
+            "if": {"properties": {"status": {"const": "unsafe_shadow"}}},
+            "then": {"properties": {"failure": {"$ref": "#/$defs/failure"}}}
+        },
+        {
+            "if": {
+                "properties": {
+                    "summary": {"type": "object", "properties": {"mode": {"const": "replay"}}}
+                }
+            },
+            "then": {
+                "properties": {
+                    "setup_hashes": {"type": "null"},
+                    "frozen_state_capture": {"type": "null"},
+                    "summary": {"properties": {"frozen_state_sha256": {"type": "null"}}},
+                    "videos": {"maxProperties": 0}
+                }
+            }
+        },
+        {
+            "if": {
+                "properties": {
+                    "summary": {"type": "object", "properties": {"mode": {"const": "live-soak"}}}
+                }
+            },
+            "then": {
+                "properties": {
+                    "setup_hashes": {"$ref": "#/$defs/setupHashes"},
+                    "frozen_state_capture": {"type": "object"},
+                    "summary": {"properties": {"frozen_state_sha256": {"$ref": "#/$defs/sha256"}}},
+                    "videos": {"required": ["front", "up"]}
+                }
+            }
+        },
+        {
+            "if": {
+                "properties": {
+                    "status": {"const": "passed"},
+                    "summary": {"type": "object", "properties": {"mode": {"const": "live-soak"}}}
+                }
+            },
+            "then": {"properties": {"summary": {"properties": {"wall_seconds": {"minimum": 300}}}}}
+        }
+    ]
+}

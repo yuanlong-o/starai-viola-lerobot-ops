@@ -1,32 +1,14 @@
-# Local LeRobot episode recording
+# Episode-recording status
 
-The operations repository can capture synchronized robot state, bounded action,
-and both camera streams for later use. It does not contain or run model training.
+Robot demonstration recording is not authorized by the live-session contract.
+The former recorder depended on runtime replacements of installed LeRobot and
+StarAI methods; it has been replaced by a fail-closed stub.
 
-Before every session, close camera previews and other robot processes, clear the
-workspace, support the Viola, and keep the physical cutoff reachable. Validate
-the selected direction without opening hardware:
+The historical 34-episode release is frozen. `viola-ops dataset validate` and
+`viola-ops dataset release` read and release those exact bytes without opening
+hardware or modifying the dataset.
 
-```bash
-./scripts/run_viola_episode_recording.sh right-to-left --check
-./scripts/run_viola_episode_recording.sh left-to-right --check
-```
-
-Record a direction with the same command minus `--check`:
-
-```bash
-./scripts/run_viola_episode_recording.sh right-to-left
-./scripts/run_viola_episode_recording.sh left-to-right
-```
-
-Rerun displays `front` and `up` throughout recording. The launcher uses MJPG for
-front and the stable YUYV mode for up, keeps the follower at its measured startup
-pose, and bounds each action step by `VIOLA_MAX_STEP` (default `3.0`). Right Arrow
-accepts an episode after the five-second safety floor, Left Arrow rejects and
-repeats it, and Esc stops cleanly. Reaching 60 seconds without acceptance keeps
-recording; run from the graphical desktop for Rerun and release-aware hotkeys.
-
-The first run creates one pilot episode below `VIOLA_DATASET_DIR` (default
-`~/lerobot-data`). Later runs resume in batches of up to ten only when
-`meta/info.json` exists. Datasets, videos, and logs are ignored by Git and are
-never pushed to Hugging Face.
+Camera-only preview and local video utilities remain motor-inert, but their
+output is not a LeRobot training release or rollout evidence. A future dataset
+version requires a separately reviewed recording authorization and new release
+identity.
