@@ -127,6 +127,13 @@ Later phases additionally require accepted predecessor evidence. Run
 `viola-ops policy execute --help`. There is no valid motion command before a
 blocker-free accepted live session, reviewed setup/current E-stop evidence,
 online intent receipt, and exact interactive operator action all pass.
+Only a post-frame unsafe shakedown whose retained traces and videos pass the
+full consumer contract produces terminal `evidence_only` for Repo B; it is
+never a completed predecessor. A stop before the first retained frame remains
+non-READY as `repo_b_unsafe_terminal_video_unavailable`. An unsafe scored result
+remains non-READY with blocker
+`repo_b_unsafe_scored_predecessor_schema_mismatch` until Repo B unifies its
+mutually exclusive compact/rich predecessor schemas.
 ACT is checked first. Every non-ACT session requires Repo B to bind either a
 scored, accepted ACT rollout as `shared_infrastructure_proven`, or a reviewed
 `policy_specific_act_blocker` attestation proving that the ACT failure does not

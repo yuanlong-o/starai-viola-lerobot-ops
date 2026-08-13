@@ -12,17 +12,25 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from viola_handoff import HandoffError, VerifiedBundle, canonical_json_bytes, inspect_bundle
+from viola_handoff import (
+    HandoffError,
+    VerifiedBundle,
+    canonical_json_bytes,
+    inspect_bundle,
+    inventory_root,
+)
 
 from .errors import ValidationError
 from .policies import (
@@ -146,6 +154,26 @@ class AcceptedPolicyCandidate:
     @property
     def policy(self) -> str:
         return self.spec.token
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeCandidateSnapshot:
+    """A private, verified byte snapshot retained while a policy executes."""
+
+    candidate: AcceptedPolicyCandidate
+    root: Path
+    _inventories: tuple[tuple[str, Path, Mapping[str, Any]], ...]
+
+    def verify(self) -> None:
+        """Fail closed if any snapshotted runtime byte changed."""
+
+        for label, path, expected in self._inventories:
+            try:
+                current = inventory_root(path)
+            except (HandoffError, OSError) as exc:
+                raise ValidationError(f"cannot verify runtime snapshot {label}: {exc}") from exc
+            if current != dict(expected):
+                raise ValidationError(f"runtime snapshot {label} differs from signed bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +368,109 @@ def inspect_candidate(path: str | Path) -> AcceptedPolicyCandidate:
         dependencies=MappingProxyType(dependencies),
         runtime_binding=MappingProxyType(runtime_binding),
     )
+
+
+@contextmanager
+def _snapshot_candidate_runtime(
+    candidate: AcceptedPolicyCandidate,
+) -> Iterator[_RuntimeCandidateSnapshot]:
+    """Copy only runtime inputs into a private, signed-byte-verified tree.
+
+    The accepted handoff remains the source of authority.  This temporary copy
+    closes the gap between hashing those mutable paths and LeRobot opening
+    them.  Held-out frames and videos are deliberately excluded: execution
+    needs only dataset metadata in addition to the checkpoint and configured
+    dependency subtrees.
+    """
+
+    root = Path(tempfile.mkdtemp(prefix="viola-runtime-"))
+    try:
+        artifact_by_name = {
+            item["name"]: item for item in candidate.bundle.manifest["artifacts"]
+        }
+        checkpoint_inventory = _artifact_inventory(
+            artifact_by_name, CHECKPOINT_ARTIFACT
+        )
+        checkpoint = root / "checkpoint"
+        _copy_verified_runtime_tree(
+            candidate.checkpoint,
+            checkpoint,
+            checkpoint_inventory,
+            label="checkpoint",
+        )
+
+        replay_inventory = _project_artifact_inventory(
+            _artifact_inventory(artifact_by_name, REPLAY_DATASET_ARTIFACT),
+            PurePosixPath("meta"),
+            label="replay metadata",
+        )
+        replay_dataset = root / "replay_dataset"
+        replay_dataset.mkdir(mode=0o700)
+        replay_meta = replay_dataset / "meta"
+        _copy_verified_runtime_tree(
+            candidate.replay_dataset / "meta",
+            replay_meta,
+            replay_inventory,
+            label="replay metadata",
+        )
+
+        dependency_paths: dict[str, Path] = {}
+        inventories: list[tuple[str, Path, Mapping[str, Any]]] = [
+            ("checkpoint", checkpoint, MappingProxyType(checkpoint_inventory)),
+            ("replay metadata", replay_meta, MappingProxyType(replay_inventory)),
+        ]
+        dependency_payload = _object(
+            candidate.payload["dependency_artifacts"], "dependency_artifacts"
+        )
+        dependency_root = root / "dependencies"
+        dependency_root.mkdir(mode=0o700)
+        for dependency_id in candidate.spec.dependency_ids:
+            binding = _object(
+                dependency_payload[dependency_id], f"dependency {dependency_id}"
+            )
+            artifact_name = _text(
+                binding["artifact"], f"dependency {dependency_id} artifact"
+            )
+            relative = PurePosixPath(
+                _text(binding["relative_path"], f"dependency {dependency_id} path")
+            )
+            expected = _project_artifact_inventory(
+                _artifact_inventory(artifact_by_name, artifact_name),
+                relative,
+                label=f"dependency {dependency_id}",
+            )
+            destination = dependency_root / dependency_id
+            _copy_verified_runtime_tree(
+                candidate.dependencies[dependency_id],
+                destination,
+                expected,
+                label=f"dependency {dependency_id}",
+            )
+            dependency_paths[dependency_id] = destination
+            inventories.append(
+                (
+                    f"dependency {dependency_id}",
+                    destination,
+                    MappingProxyType(expected),
+                )
+            )
+
+        snapshot_candidate = replace(
+            candidate,
+            checkpoint=checkpoint,
+            replay_dataset=replay_dataset,
+            dependencies=MappingProxyType(dependency_paths),
+        )
+        snapshot = _RuntimeCandidateSnapshot(
+            candidate=snapshot_candidate,
+            root=root,
+            _inventories=tuple(inventories),
+        )
+        _make_runtime_snapshot_read_only(root)
+        snapshot.verify()
+        yield snapshot
+    finally:
+        _remove_runtime_snapshot(root)
 
 
 class LeRobotPolicyRuntime:
@@ -802,6 +933,115 @@ def _accepted_artifact(bundle: VerifiedBundle, name: str) -> Path:
         raise ValidationError(
             f"candidate artifact {name!r} is not receiver-local; run viola-handoff accept first"
         ) from exc
+
+
+def _artifact_inventory(
+    artifact_by_name: Mapping[str, Mapping[str, Any]],
+    name: str,
+) -> dict[str, Any]:
+    try:
+        artifact = artifact_by_name[name]
+    except KeyError as exc:
+        raise ValidationError(f"runtime snapshot artifact {name!r} is absent") from exc
+    return {
+        key: json.loads(canonical_json_bytes(artifact[key]))
+        for key in (
+            "directories",
+            "files",
+            "file_count",
+            "byte_count",
+            "inventory_sha256",
+        )
+    }
+
+
+def _project_artifact_inventory(
+    inventory: Mapping[str, Any],
+    relative: PurePosixPath,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValidationError(f"runtime snapshot {label} path escapes its artifact")
+    prefix = () if relative == PurePosixPath(".") else relative.parts
+
+    def below(path: PurePosixPath) -> bool:
+        return path.parts[: len(prefix)] == prefix
+
+    directories: list[str] = []
+    for raw_path in inventory["directories"]:
+        path = PurePosixPath(raw_path)
+        if path == relative:
+            continue
+        if below(path):
+            directories.append(PurePosixPath(*path.parts[len(prefix) :]).as_posix())
+
+    files: list[dict[str, Any]] = []
+    for raw_entry in inventory["files"]:
+        path = PurePosixPath(raw_entry["path"])
+        if below(path):
+            files.append(
+                {
+                    "path": PurePosixPath(*path.parts[len(prefix) :]).as_posix(),
+                    "sha256": raw_entry["sha256"],
+                    "size_bytes": raw_entry["size_bytes"],
+                }
+            )
+
+    if relative != PurePosixPath(".") and relative.as_posix() not in inventory["directories"]:
+        raise ValidationError(f"runtime snapshot {label} directory is absent from signed bytes")
+    directories.sort()
+    files.sort(key=lambda entry: entry["path"])
+    body = {"directories": directories, "files": files}
+    return {
+        **body,
+        "file_count": len(files),
+        "byte_count": sum(entry["size_bytes"] for entry in files),
+        "inventory_sha256": hashlib.sha256(canonical_json_bytes(body)).hexdigest(),
+    }
+
+
+def _copy_verified_runtime_tree(
+    source: Path,
+    destination: Path,
+    expected: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    try:
+        shutil.copytree(source, destination, symlinks=True, copy_function=shutil.copyfile)
+        current = inventory_root(destination)
+    except (HandoffError, OSError) as exc:
+        raise ValidationError(f"cannot copy runtime snapshot {label}: {exc}") from exc
+    if current != dict(expected):
+        raise ValidationError(f"runtime snapshot {label} differs from signed bytes")
+
+
+def _make_runtime_snapshot_read_only(root: Path) -> None:
+    try:
+        for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+            directory = Path(current)
+            for name in files:
+                (directory / name).chmod(0o400, follow_symlinks=False)
+            for name in directories:
+                (directory / name).chmod(0o500, follow_symlinks=False)
+            directory.chmod(0o500, follow_symlinks=False)
+    except OSError as exc:
+        raise ValidationError(f"cannot protect private runtime snapshot: {exc}") from exc
+
+
+def _remove_runtime_snapshot(root: Path) -> None:
+    """Best-effort cleanup that never hides the execution result."""
+
+    try:
+        for current, directories, _files in os.walk(root, topdown=False, followlinks=False):
+            directory = Path(current)
+            for name in directories:
+                (directory / name).chmod(0o700, follow_symlinks=False)
+            directory.chmod(0o700, follow_symlinks=False)
+        shutil.rmtree(root)
+    except OSError:
+        pass
 
 
 def _require_pc_a_acceptance(bundle: VerifiedBundle) -> None:

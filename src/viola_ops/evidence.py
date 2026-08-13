@@ -129,6 +129,7 @@ class QueuedTrialEvidence:
         self._capacity = threading.BoundedSemaphore(queue_size)
         self._failure: BaseException | None = None
         self._closed = False
+        self._terminal_detail: str | None = None
         self._rows = 0
         self._video_frames = 0
         self._thread = threading.Thread(
@@ -161,11 +162,19 @@ class QueuedTrialEvidence:
     def record_terminal(self, row: Mapping[str, Any]) -> None:
         """Record after motion has stopped; bounded waiting is safe here."""
 
+        detail = row.get("detail")
+        if not isinstance(detail, str) or not detail:
+            raise ValidationError("terminal evidence requires a nonempty detail")
         if self._failure is not None:
             raise ValidationError(f"evidence writer already failed: {self._failure}")
         if not self._capacity.acquire(timeout=5.0):
             raise ValidationError("evidence queue could not retain the terminal row")
+        self._terminal_detail = detail
         self._items.put(("terminal", dict(row), None, None))
+
+    @property
+    def terminal_detail(self) -> str | None:
+        return self._terminal_detail
 
     def close(self) -> None:
         if self._closed:

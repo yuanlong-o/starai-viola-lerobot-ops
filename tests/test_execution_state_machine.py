@@ -121,6 +121,7 @@ class _Recorder:
         self.capacity = capacity
         self.reservation_error = reservation_error
         self.terminal = []
+        self.terminal_detail = None
         self.closed = False
         self.reservations = []
 
@@ -135,6 +136,7 @@ class _Recorder:
 
     def record_terminal(self, row):
         self.terminal.append(dict(row))
+        self.terminal_detail = row["detail"]
 
     def close(self):
         self.closed = True
@@ -165,6 +167,17 @@ class _Operator:
         return TrialOutcome(False, "failure", "timeout", None, None, None, 0.0)
 
 
+class _AdvancingClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += max(seconds, 0.0)
+
+
 class _Monitor:
     def __init__(self, event=None):
         self.value = event
@@ -175,6 +188,66 @@ class _Monitor:
 
 def _allow_authority() -> None:
     """Stand in for Repo A's full live-authority check in state-machine tests."""
+
+
+def test_trial_duration_excludes_operator_review_and_terminal_queue_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import viola_ops.execution as execution
+
+    clock = _AdvancingClock()
+
+    class SlowReview(_Operator):
+        def outcome(self, trial_id):
+            clock.sleep(5.0)
+            return super().outcome(trial_id)
+
+    monkeypatch.setattr(execution, "TRIAL_DURATION_S", 0.1)
+    monkeypatch.setattr(execution, "TARGET_HZ", 1.0)
+    completed = run_control_trial(
+        _permit(),
+        _candidate(),
+        _Robot(),
+        _Runtime(),
+        _Recorder(),
+        SlowReview(),
+        _Monitor(),
+        index=0,
+        trial_id="trial",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=clock,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=clock.sleep,
+    )
+    assert completed.duration_sec == pytest.approx(0.1)
+    assert clock.value == pytest.approx(5.1)
+
+    class SlowTerminalRecorder(_Recorder):
+        def record_terminal(self, row):
+            super().record_terminal(row)
+            clock.sleep(5.0)
+
+    clock.value = 0.0
+    monkeypatch.setattr(execution, "TRIAL_DURATION_S", 1.0)
+    recorder = SlowTerminalRecorder()
+    aborted = run_control_trial(
+        _permit(),
+        _candidate(),
+        _Robot(),
+        _Runtime(),
+        recorder,
+        _Operator(abort=True),
+        _Monitor(),
+        index=0,
+        trial_id="trial",
+        condition=SimpleNamespace(to_dict=lambda: {}),
+        clock=clock,
+        clock_ns=lambda: 1_000_000_000,
+        sleep=clock.sleep,
+    )
+    assert recorder.terminal[0]["elapsed_s"] == pytest.approx(0.0)
+    assert aborted.duration_sec == pytest.approx(0.0)
+    assert clock.value == pytest.approx(5.0)
 
 
 def _aborting_trial(*_args, index, trial_id, condition, **_kwargs):
@@ -398,6 +471,23 @@ def test_phase_stops_after_first_unsafe_trial_and_tears_down() -> None:
     assert len(result.trials) == len(operator.prepared) == 1
     assert robot.writes == []
     assert robot.connects == robot.disconnects == 1
+
+
+def test_phase_preserves_the_raw_terminal_detail() -> None:
+    evidence = _EvidenceFactory()
+    result = execute_phase(
+        _permit("shakedown"),
+        _candidate(),
+        runtime_factory=lambda _candidate: _Runtime(),
+        robot_factory=lambda _permit: _Robot(),
+        evidence_factory=evidence,
+        operator=_Operator(abort=True),
+        safety_monitor=_Monitor(),
+        revalidate_authority=_allow_authority,
+    )
+
+    assert result.terminal_reason == "operator requested a stop"
+    assert result.terminal_reason == evidence.recorders[0].terminal[0]["detail"]
 
 
 def test_process_control_is_not_masked_by_recorder_or_robot_cleanup() -> None:

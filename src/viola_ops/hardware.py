@@ -8,8 +8,11 @@ read-only: it checks the measured pose, then connects the reviewed cameras.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import stat
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -174,7 +177,17 @@ class SafeViolaRobot(Robot):
         super().__init__(config)
         self.config = config
         self.permit = permit
-        self._calibration = load_calibration(config.calibration_path)
+        expected_calibration_sha256: str | None = None
+        if permit.calibration_path != Path():
+            if Path(os.path.abspath(config.calibration_path)) != Path(
+                os.path.abspath(permit.calibration_path)
+            ):
+                raise SafetyGateError("robot calibration path differs from the motion permit")
+            expected_calibration_sha256 = str(permit.setup_hashes["calibration"])
+        self._calibration = load_calibration(
+            config.calibration_path,
+            expected_sha256=expected_calibration_sha256,
+        )
         self._port_factory = port_factory or _fashionstar_port
         self._command_factory = command_factory or _fashionstar_command
         self.cameras = (
@@ -498,11 +511,23 @@ class SafeViolaRobot(Robot):
         return self._port
 
 
-def load_calibration(path: Path) -> dict[str, JointCalibration]:
-    """Load and strictly validate the reviewed seven-joint calibration."""
+def load_calibration(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, JointCalibration]:
+    """Load one pinned calibration byte snapshot and validate all seven joints."""
 
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_regular_file(path)
+        if (
+            expected_sha256 is not None
+            and hashlib.sha256(payload).hexdigest() != expected_sha256
+        ):
+            raise ValidationError("reviewed calibration hash differs from the motion permit")
+        value = json.loads(payload.decode("utf-8"))
+    except ValidationError:
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"cannot read reviewed calibration {path}: {exc}") from exc
     if not isinstance(value, dict) or set(value) != set(JOINTS):
@@ -522,6 +547,36 @@ def load_calibration(path: Path) -> dict[str, JointCalibration]:
             raise ValidationError(f"calibration range is invalid for {joint}")
         result[joint] = calibration
     return result
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """Read through pinned nonsymlink directories into one pinned regular file."""
+
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    if candidate == Path(candidate.anchor):
+        raise ValidationError("reviewed calibration path cannot be a filesystem root")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(candidate.anchor, directory_flags)
+    try:
+        for part in candidate.parts[1:-1]:
+            following = os.open(part, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = following
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate.name, file_flags, dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError("reviewed calibration is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def raw_to_normalized(raw: float, calibration: JointCalibration, *, gripper: bool) -> float:

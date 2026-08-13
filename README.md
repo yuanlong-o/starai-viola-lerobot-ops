@@ -175,6 +175,13 @@ recaptures positions.
   → ten scored trials, and retains complete action traces plus both encoded
   camera videos.
 
+A post-frame aborted shakedown with complete, decodable evidence is sealed as
+terminal `evidence_only` for Repo B and can never advance the phase gate. A stop
+before the first retained frame remains local and online non-READY with blocker
+`repo_b_unsafe_terminal_video_unavailable`. An aborted scored phase likewise
+remains non-READY because Repo B `6fcf643` requires contradictory
+shakedown-predecessor shapes for completed and unsafe scored outcomes.
+
 All eight policy tokens share this path:
 
 ```text

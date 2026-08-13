@@ -257,6 +257,20 @@ def test_shakedown_speed_scales_step_limit_without_clamping() -> None:
         validate_action(action, reference, permit)
 
 
+def test_reference_outside_reviewed_limits_is_rejected_before_action() -> None:
+    permit = _permit(datetime.now(UTC))
+    reference = {f"{joint}.pos": 0.0 for joint in JOINTS}
+    reference["gripper.pos"] = 50.0
+    reference["Motor_0.pos"] = 100.5
+    action = dict(reference)
+    action["Motor_0.pos"] = 100.0
+
+    with pytest.raises(
+        SafetyGateError, match="feedback Motor_0.pos is outside reviewed absolute limits"
+    ):
+        validate_action(action, reference, permit)
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), "0", None])
 def test_malformed_action_never_becomes_a_clamped_action(bad: object) -> None:
     now = datetime.now(UTC)

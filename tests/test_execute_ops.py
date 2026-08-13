@@ -5,6 +5,11 @@ import fcntl
 import json
 import os
 import pty
+import select
+import stat
+import subprocess
+import sys
+import threading
 import tty
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,16 +34,25 @@ class _StopBeforeHardware(RuntimeError):
     pass
 
 
-def _permit() -> SimpleNamespace:
+_TEST_ROBOT_PORT = f"/dev/viola-test-{os.getpid()}"
+
+
+def _permit(
+    *,
+    trial: str = "commissioning",
+    phase: str = "hold",
+    robot_port: str = _TEST_ROBOT_PORT,
+) -> SimpleNamespace:
     return SimpleNamespace(
         session_id="session-1",
         session_bundle_id="a" * 64,
         candidate_bundle_id="b" * 64,
         policy="act",
-        phase="hold",
-        trial="commissioning",
+        phase=phase,
+        trial=trial,
         speed_scale=1.0,
         operator="operator",
+        robot_port=robot_port,
         setup_hashes={name: "c" * 64 for name in ("calibration", "camera", "robot", "reset")},
         absolute_limits={
             joint: ((0.0, 100.0) if joint == "gripper" else (-100.0, 100.0))
@@ -74,8 +88,28 @@ def _accepted_material() -> tuple[SimpleNamespace, SimpleNamespace]:
         manifest={"experiment": "viola-eight-policy-v1"},
     )
     candidate_bundle = SimpleNamespace(bundle_id="b" * 64, content_id="b" * 64)
-    candidate = SimpleNamespace(bundle=candidate_bundle)
+    candidate = SimpleNamespace(bundle=candidate_bundle, runtime_binding={})
     return session, candidate
+
+
+class _TrackedRuntimeSnapshot:
+    def __init__(self, candidate: object) -> None:
+        self.candidate = candidate
+        self.active = False
+        self.closed = False
+        self.verify_calls = 0
+
+    def __enter__(self):
+        self.active = True
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.active = False
+        self.closed = True
+
+    def verify(self) -> None:
+        assert self.active
+        self.verify_calls += 1
 
 
 def _stub_pre_hardware_checks(
@@ -85,7 +119,7 @@ def _stub_pre_hardware_checks(
 
     def authorize(_request):
         order.append("gate")
-        return _permit()
+        return _permit(trial=_request.trial, phase=_request.phase)
 
     monkeypatch.setattr(execute_ops, "authorize_motion", authorize)
     monkeypatch.setattr(
@@ -113,14 +147,20 @@ def _stub_pre_hardware_checks(
     )
 
 
-def _execute(tmp_path: Path, *, publisher):
+def _execute(
+    tmp_path: Path,
+    *,
+    publisher,
+    trial: str = "commissioning",
+    phase: str = "hold",
+):
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     return execute_ops.execute_command(
         Path("accepted-session"),
         candidate=Path("accepted-candidate"),
-        phase="hold",
-        trial="commissioning",
+        phase=phase,
+        trial=trial,
         repo_root=repo,
         handoff_root=tmp_path / "handoffs",
         evidence_root=tmp_path / "evidence",
@@ -227,6 +267,187 @@ def test_failed_online_intent_stops_before_hardware_import(
     imported_names = {name for name, _level in imports}
     assert "hardware" not in imported_names
     assert "viola_ops.hardware" not in imported_names
+
+
+def test_robot_execution_lease_contends_across_processes() -> None:
+    script = (
+        "import sys\n"
+        "from viola_ops.execute_ops import _execution_lease\n"
+        f"with _execution_lease({_TEST_ROBOT_PORT!r}):\n"
+        "    print('lease-held', flush=True)\n"
+        "    sys.stdin.read(1)\n"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    assert process.stdin is not None
+    try:
+        readable, _, _ = select.select([process.stdout], [], [], 5.0)
+        if not readable:
+            process.kill()
+            process.wait(timeout=5.0)
+            error = process.stderr.read() if process.stderr is not None else ""
+            pytest.fail(f"lease holder did not become ready: {error}")
+        assert process.stdout.readline().strip() == "lease-held"
+        with pytest.raises(SafetyGateError, match="already holds the execution lease"):
+            with execute_ops._execution_lease(_TEST_ROBOT_PORT):
+                pytest.fail("a second process acquired the same robot lease")
+    finally:
+        if process.poll() is None:
+            process.stdin.write("x")
+            process.stdin.close()
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5.0)
+
+
+def test_robot_execution_lease_treats_device_aliases_as_one_robot() -> None:
+    with execute_ops._execution_lease("/dev/null"):
+        with pytest.raises(SafetyGateError, match="already holds the execution lease"):
+            with execute_ops._execution_lease("/dev/../dev/null"):
+                pytest.fail("a device alias acquired a second robot lease")
+
+
+def test_robot_execution_lease_survives_absent_to_present_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    robot_port = "/dev/viola-hotplug-test"
+    original_stat = execute_ops.os.stat
+    original_realpath = execute_ops.os.path.realpath
+    inspections = 0
+    resolutions = 0
+
+    def changing_realpath(path):
+        nonlocal resolutions
+        if os.fspath(path) != robot_port:
+            return original_realpath(path)
+        resolutions += 1
+        return robot_port if resolutions == 1 else "/dev/ttyUSB0"
+
+    def changing_stat(path, *args, **kwargs):
+        nonlocal inspections
+        if os.fspath(path) != robot_port:
+            return original_stat(path, *args, **kwargs)
+        inspections += 1
+        if inspections == 1:
+            raise FileNotFoundError(robot_port)
+        return SimpleNamespace(
+            st_mode=stat.S_IFCHR | 0o660,
+            st_rdev=os.makedev(188, 0),
+        )
+
+    monkeypatch.setattr(execute_ops.os, "stat", changing_stat)
+    monkeypatch.setattr(execute_ops.os.path, "realpath", changing_realpath)
+
+    with execute_ops._execution_lease(robot_port):
+        with pytest.raises(SafetyGateError, match="already holds the execution lease"):
+            with execute_ops._execution_lease(robot_port):
+                pytest.fail("a hot-plug transition acquired a second robot lease")
+
+    # A failed multi-key acquisition released every key it briefly held.
+    with execute_ops._execution_lease(robot_port):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("second_trial", "blocked_during_job"),
+    [
+        ("commissioning", "viola-policy-execution-intent"),
+        ("different-trial", "viola-policy-execution-failure"),
+    ],
+)
+def test_concurrent_execution_for_same_robot_never_reaches_a_second_publisher_or_hardware(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_trial: str,
+    blocked_during_job: str,
+) -> None:
+    order: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    entered = threading.Event()
+    release = threading.Event()
+    publisher_threads: list[str] = []
+    hardware_threads: list[str] = []
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    class Operator:
+        def close(self) -> None:
+            pass
+
+    def publish(run, **kwargs):
+        publisher_threads.append(threading.current_thread().name)
+        if kwargs["job_type"] == blocked_during_job:
+            entered.set()
+            if not release.wait(timeout=5.0):
+                raise AssertionError("test did not release the first execution")
+        return run
+
+    def stop_without_hardware(*_args, **_kwargs):
+        hardware_threads.append(threading.current_thread().name)
+        raise RuntimeError("disconnected execution test stop")
+
+    monkeypatch.setattr(execute_ops, "InteractiveTrialOperator", Operator)
+    import viola_ops.execution as execution
+
+    monkeypatch.setattr(execution, "execute_phase", stop_without_hardware)
+
+    def run_first() -> None:
+        try:
+            outcomes.append(_execute(tmp_path, publisher=publish))
+        except BaseException as exc:  # pragma: no cover - asserted in the parent thread
+            failures.append(exc)
+
+    first = threading.Thread(target=run_first, name="first-execution")
+    first.start()
+    try:
+        assert entered.wait(timeout=5.0)
+        with pytest.raises(SafetyGateError, match="already holds the execution lease"):
+            _execute(tmp_path, publisher=publish, trial=second_trial)
+    finally:
+        release.set()
+        first.join(timeout=5.0)
+
+    assert not first.is_alive()
+    assert failures == []
+    assert len(outcomes) == 1
+    assert getattr(outcomes[0], "status") == "execution_failed_not_ready"
+    assert set(publisher_threads) == {"first-execution"}
+    assert hardware_threads == ["first-execution"]
+    if second_trial != "commissioning":
+        second_material = (
+            tmp_path / "evidence" / "session-1" / "act" / "hold" / second_trial
+        )
+        assert not second_material.exists()
+
+
+def test_preexisting_empty_attempt_is_refused_before_intent_or_hardware(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    material = tmp_path / "evidence" / "session-1" / "act" / "hold" / "commissioning"
+    material.mkdir(parents=True)
+
+    with pytest.raises(ValidationError, match="incomplete live attempt"):
+        _execute(
+            tmp_path,
+            publisher=lambda *_args, **_kwargs: order.append("intent"),
+        )
+
+    assert "intent" not in order
+    assert list(material.iterdir()) == []
 
 
 def test_finished_intent_receipt_exists_before_hardware_module_import(
@@ -407,6 +628,176 @@ def test_post_start_callback_revalidates_and_blocks_before_motion(
     ]
 
 
+def test_post_disconnect_revocation_preserves_result_and_records_non_ready_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    jobs: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    checks = 0
+
+    def revoke_after_disconnect(*_args, **_kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise SafetyGateError("session was revoked while execution was active")
+        session, candidate = _accepted_material()
+        return session, candidate.bundle
+
+    class Operator:
+        def close(self) -> None:
+            order.append("operator-close")
+
+    held = {key: (50.0 if key == "gripper.pos" else 0.0) for key in ACTION_KEYS}
+    result = PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="hold",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=1.0,
+        held_action=held,
+        trials=(),
+        terminal_event=None,
+        terminal_reason=None,
+    )
+
+    def publish(run, **kwargs):
+        jobs.append(kwargs["job_type"])
+        return run
+
+    def disconnected_execution(*_args, **_kwargs):
+        order.append("execution-disconnected")
+        return result
+
+    def must_not_seal(*_args, **_kwargs):
+        pytest.fail("revoked authority reached READY finalization")
+
+    monkeypatch.setattr(execute_ops, "revalidate_motion", revoke_after_disconnect)
+    monkeypatch.setattr(execute_ops, "InteractiveTrialOperator", Operator)
+    import viola_ops.execution as execution
+
+    monkeypatch.setattr(execution, "execute_phase", disconnected_execution)
+    monkeypatch.setattr(rollout_evidence, "seal_completed_phase", must_not_seal)
+
+    first = _execute(tmp_path, publisher=publish)
+    material = first.material_root
+    result_bytes = (material / "PHASE_RESULT.json").read_bytes()
+    marker = json.loads((material / "EXECUTION_FAILURE.json").read_bytes())
+
+    assert first.status == "execution_failed_not_ready"
+    assert first.bundle is None
+    assert checks == 3
+    assert marker["stage"] == "post_execution_revalidation"
+    assert marker["ready"] is False
+    assert marker["hardware_may_have_connected"] is True
+    assert result_bytes == canonical_json_bytes(execute_ops._phase_result_payload(result))
+    assert not list(tmp_path.rglob("READY"))
+
+    # A retry republishes the terminal failure without importing or repeating
+    # the hardware path, and it leaves the raw result byte-for-byte unchanged.
+    second = _execute(tmp_path, publisher=publish)
+    assert second.status == "execution_failed_not_ready"
+    assert second.bundle is None
+    assert checks == 3
+    assert (material / "PHASE_RESULT.json").read_bytes() == result_bytes
+    assert jobs == [
+        "viola-policy-execution-intent",
+        "viola-policy-execution-failure",
+        "viola-policy-execution-intent",
+        "viola-policy-execution-failure",
+    ]
+
+
+def test_execution_revalidation_rejects_same_runtime_hashes_from_another_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    original = _accepted_material()[1]
+    replacement_bundle = SimpleNamespace(
+        bundle_id="e" * 64,
+        content_id="e" * 64,
+    )
+    replacement = SimpleNamespace(bundle=replacement_bundle, runtime_binding={})
+    inspections = 0
+
+    def changing_candidate(_path: Path) -> SimpleNamespace:
+        nonlocal inspections
+        inspections += 1
+        return original if inspections == 1 else replacement
+
+    monkeypatch.setattr(policy_runtime, "inspect_candidate", changing_candidate)
+
+    class Operator:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(execute_ops, "InteractiveTrialOperator", Operator)
+    outcome = _execute(tmp_path, publisher=lambda run, **_kwargs: run)
+
+    marker = json.loads(
+        (outcome.material_root / "EXECUTION_FAILURE.json").read_text(encoding="utf-8")
+    )
+    assert marker["stage"] == "execution_revalidation"
+    assert "policy candidate runtime material" in marker["error_message"]
+    assert outcome.bundle is None
+
+
+def test_execute_uses_verifies_and_cleans_private_runtime_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    accepted = _accepted_material()[1]
+    runtime_candidate = SimpleNamespace(
+        bundle=accepted.bundle,
+        bundle_id=accepted.bundle.bundle_id,
+        policy="act",
+        runtime_binding=accepted.runtime_binding,
+    )
+    snapshot = _TrackedRuntimeSnapshot(runtime_candidate)
+    snapshotted: list[object] = []
+
+    def make_snapshot(candidate: object) -> _TrackedRuntimeSnapshot:
+        snapshotted.append(candidate)
+        return snapshot
+
+    monkeypatch.setattr(
+        policy_runtime,
+        "_snapshot_candidate_runtime",
+        make_snapshot,
+    )
+
+    class Operator:
+        def close(self) -> None:
+            order.append("operator-close")
+
+    monkeypatch.setattr(execute_ops, "InteractiveTrialOperator", Operator)
+    import viola_ops.execution as execution
+
+    def fail_after_start(_permit, candidate, **kwargs):
+        assert candidate is runtime_candidate
+        assert snapshot.active
+        kwargs["revalidate_authority"]()
+        assert snapshot.verify_calls == 2
+        raise RuntimeError("disconnected execution stop")
+
+    monkeypatch.setattr(execution, "execute_phase", fail_after_start)
+    outcome = _execute(
+        tmp_path,
+        publisher=lambda run, **_kwargs: run,
+        phase="shakedown",
+        trial="supervised-shakedown",
+    )
+
+    assert outcome.status == "execution_failed_not_ready"
+    assert snapshot.verify_calls == 2
+    assert snapshot.closed
+    assert not snapshot.active
+    assert len(snapshotted) == 1
+
+
 def test_replaced_evidence_root_cannot_redirect_failure_writes_into_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -448,6 +839,53 @@ def test_replaced_evidence_root_cannot_redirect_failure_writes_into_checkout(
     assert "hardware" not in imports
     assert "viola_ops.hardware" not in imports
     assert not list((tmp_path / "repo").rglob("EXECUTION_FAILURE.json"))
+
+
+def test_same_path_attempt_replacement_is_rejected_before_hardware(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    imports: list[str] = []
+    jobs: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    captures = 0
+    material = tmp_path / "evidence/session-1/act/hold/commissioning"
+    preserved = material.with_name("commissioning-preserved")
+
+    def capture(**_kwargs):
+        nonlocal captures
+        captures += 1
+        if captures == 2:
+            material.rename(preserved)
+            material.mkdir()
+        return _identity()
+
+    def publish(run, **kwargs):
+        jobs.append(kwargs["job_type"])
+        return run
+
+    original_import = builtins.__import__
+
+    def record_import(name, globals=None, locals=None, fromlist=(), level=0):
+        imports.append(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(
+        execute_ops,
+        "RuntimeIdentity",
+        SimpleNamespace(capture=capture),
+    )
+    monkeypatch.setattr(builtins, "__import__", record_import)
+
+    with pytest.raises(SafetyGateError, match="live evidence path changed"):
+        _execute(tmp_path, publisher=publish)
+
+    assert jobs == ["viola-policy-execution-intent"]
+    assert (preserved / "EXECUTION_INTENT_WANDB_SYNCED.json").is_file()
+    assert list(material.iterdir()) == []
+    assert not list(tmp_path.rglob("EXECUTION_FAILURE.json"))
+    assert "hardware" not in imports
+    assert "viola_ops.hardware" not in imports
 
 
 def test_support_import_failure_after_intent_is_recoverable_terminal_evidence(
@@ -653,10 +1091,306 @@ def test_completed_local_result_retries_finalization_without_hardware_import(
         "session-inspect",
         "candidate-inspect",
         "intent",
+        "identity",
+        "final-revalidate",
+        "candidate-inspect",
         "seal",
     ]
     assert "hardware" not in imports
     assert "viola_ops.hardware" not in imports
+
+
+def test_unsafe_shakedown_result_seals_without_hardware_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    imports: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    permit = _permit(trial="supervised-shakedown")
+    permit.phase = "shakedown"
+    permit.speed_scale = 0.25
+    condition = shakedown_conditions()[0].to_dict()
+    trial = TrialResult(
+        trial_id="session-1-shakedown-01",
+        index=0,
+        condition=condition,
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        duration_sec=1.0,
+        actions=0,
+        replans=0,
+        inference_latency_ms=(),
+        control_latency_ms=(),
+        outcome=TrialOutcome(
+            False,
+            "safety_abort",
+            "feedback_loss",
+            None,
+            None,
+            None,
+            0.0,
+        ),
+        safety_events=("feedback_loss",),
+        trace_path="trials/trial-00.jsonl",
+        front_video_path="videos/trial-00-front.mp4",
+        up_video_path="videos/trial-00-up.mp4",
+    )
+    result = PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="shakedown",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=0.25,
+        held_action=None,
+        trials=(trial,),
+        terminal_event="feedback_loss",
+        terminal_reason="motor write outcome was unknown",
+    )
+    output = tmp_path / "evidence"
+    handoff = tmp_path / "handoffs"
+    material = output / "session-1/act/shakedown/supervised-shakedown"
+    (material / "motion_record/safety_traces").mkdir(parents=True)
+    (material / "motion_record/videos").mkdir()
+    (material / "PHASE_RESULT.json").write_bytes(
+        canonical_json_bytes(execute_ops._phase_result_payload(result))
+    )
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    gate_request = SimpleNamespace(
+        repository_root=repository,
+        session_bundle=Path("accepted-session"),
+        candidate_bundle=Path("accepted-candidate"),
+        prior_hold_bundle=Path("accepted-hold"),
+        prior_shakedown_bundle=None,
+    )
+    bundle = SimpleNamespace(path=tmp_path / "sealed", bundle_id="e" * 64)
+
+    def seal_unsafe(local_result, **kwargs):
+        order.append("seal-unsafe")
+        assert local_result == result
+        assert kwargs["evidence_factory"].root == material / "motion_record"
+        assert kwargs["prior_hold"] is not None
+        return SimpleNamespace(bundle=bundle)
+
+    monkeypatch.setattr(rollout_evidence, "seal_unsafe_phase", seal_unsafe)
+    original_import = builtins.__import__
+
+    def record_import(name, globals=None, locals=None, fromlist=(), level=0):
+        imports.append(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", record_import)
+    outcome = execute_ops._execute_authorized_command(
+        gate_request,
+        permit,
+        output=output,
+        handoff=handoff,
+        evidence_root=output,
+        handoff_root=handoff,
+        wandb_entity="test-entity",
+        wandb_project="project",
+        intent_publisher=lambda run, **_kwargs: run,
+    )
+
+    assert outcome.status == "unsafe_shakedown"
+    assert outcome.bundle is bundle
+    assert "cannot authorize another motion phase" in outcome.note
+    assert "seal-unsafe" in order
+    assert "hardware" not in imports
+    assert "viola_ops.hardware" not in imports
+    assert not (material / "UNSAFE_NOT_SEALED.json").exists()
+
+
+def test_zero_frame_unsafe_shakedown_records_non_ready_without_hardware_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    jobs: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    permit = _permit(trial="supervised-shakedown")
+    permit.phase = "shakedown"
+    permit.speed_scale = 0.25
+    condition = shakedown_conditions()[0].to_dict()
+    trial = TrialResult(
+        trial_id="session-1-shakedown-01",
+        index=0,
+        condition=condition,
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        duration_sec=1.0,
+        actions=0,
+        replans=0,
+        inference_latency_ms=(),
+        control_latency_ms=(),
+        outcome=TrialOutcome(
+            False,
+            "safety_abort",
+            "operator_abort",
+            None,
+            None,
+            None,
+            0.0,
+        ),
+        safety_events=("operator_abort",),
+        trace_path="trials/trial-00.jsonl",
+        front_video_path="videos/trial-00-front.mp4",
+        up_video_path="videos/trial-00-up.mp4",
+    )
+    result = PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="shakedown",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=0.25,
+        held_action=None,
+        trials=(trial,),
+        terminal_event="operator_abort",
+        terminal_reason="operator stopped before observation capture",
+    )
+    output = tmp_path / "evidence"
+    handoff = tmp_path / "handoffs"
+    material = output / "session-1/act/shakedown/supervised-shakedown"
+    (material / "motion_record/safety_traces").mkdir(parents=True)
+    (material / "motion_record/videos").mkdir()
+    (material / "PHASE_RESULT.json").write_bytes(
+        canonical_json_bytes(execute_ops._phase_result_payload(result))
+    )
+    (material / "motion_record/safety_traces/trial-00.jsonl").write_bytes(
+        canonical_json_bytes(
+            {
+                "trial": trial.trial_id,
+                "condition": condition,
+                "index": 0,
+                "elapsed_s": 1.0,
+                "event": "operator_abort",
+                "detail": result.terminal_reason,
+                "actions_sent": 0,
+                "action_attempts": 0,
+                "ambiguous_write_attempts": 0,
+            }
+        )
+        + b"\n"
+    )
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    gate_request = SimpleNamespace(
+        repository_root=repository,
+        session_bundle=Path("accepted-session"),
+        candidate_bundle=Path("accepted-candidate"),
+        prior_hold_bundle=Path("accepted-hold"),
+        prior_shakedown_bundle=None,
+    )
+
+    def publish(run, **kwargs):
+        jobs.append(kwargs["job_type"])
+        return run
+
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_unsafe_phase",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            rollout_evidence.UnsafeTerminalVideoUnavailableError(
+                "no transferable camera frame"
+            )
+        ),
+    )
+    first = execute_ops._execute_authorized_command(
+        gate_request,
+        permit,
+        output=output,
+        handoff=handoff,
+        evidence_root=output,
+        handoff_root=handoff,
+        wandb_entity="test-entity",
+        wandb_project="project",
+        intent_publisher=publish,
+    )
+    second = execute_ops._execute_authorized_command(
+        gate_request,
+        permit,
+        output=output,
+        handoff=handoff,
+        evidence_root=output,
+        handoff_root=handoff,
+        wandb_entity="test-entity",
+        wandb_project="project",
+        intent_publisher=publish,
+    )
+
+    assert first.status == second.status == "unsafe_shakedown"
+    assert first.bundle is second.bundle is None
+    marker = json.loads((material / "UNSAFE_NOT_SEALED.json").read_bytes())
+    assert marker["blocker"] == "repo_b_unsafe_terminal_video_unavailable"
+    assert marker["ready"] is False
+    assert (material / "UNSAFE_WANDB_SYNCED.json").is_file()
+    assert not list(handoff.rglob("READY"))
+    assert jobs == [
+        "viola-policy-execution-intent",
+        "viola-policy-unsafe-outcome",
+        "viola-policy-execution-intent",
+        "viola-policy-unsafe-outcome",
+    ]
+
+
+def test_unsafe_shakedown_does_not_mask_other_finalizer_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    permit = _permit(trial="supervised-shakedown")
+    permit.phase = "shakedown"
+    permit.speed_scale = 0.25
+    result = PhaseResult(
+        session_id="session-1",
+        policy="act",
+        phase="shakedown",
+        started_at="2026-08-13T01:00:00+00:00",
+        completed_at="2026-08-13T01:00:01+00:00",
+        speed_scale=0.25,
+        held_action=None,
+        trials=(),
+        terminal_event="feedback_loss",
+        terminal_reason="tampered evidence",
+    )
+    output = tmp_path / "evidence"
+    handoff = tmp_path / "handoffs"
+    material = output / "session-1/act/shakedown/supervised-shakedown"
+    (material / "motion_record/safety_traces").mkdir(parents=True)
+    (material / "motion_record/videos").mkdir()
+    (material / "PHASE_RESULT.json").write_bytes(
+        canonical_json_bytes(execute_ops._phase_result_payload(result))
+    )
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    gate_request = SimpleNamespace(
+        repository_root=repository,
+        session_bundle=Path("accepted-session"),
+        candidate_bundle=Path("accepted-candidate"),
+        prior_hold_bundle=Path("accepted-hold"),
+        prior_shakedown_bundle=None,
+    )
+    monkeypatch.setattr(
+        rollout_evidence,
+        "seal_unsafe_phase",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValidationError("schema tamper")),
+    )
+    monkeypatch.setattr(execute_ops, "_load_phase_result", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(ValidationError, match="schema tamper"):
+        execute_ops._execute_authorized_command(
+            gate_request,
+            permit,
+            output=output,
+            handoff=handoff,
+            evidence_root=output,
+            handoff_root=handoff,
+            wandb_entity="test-entity",
+            wandb_project="project",
+            intent_publisher=lambda run, **_kwargs: run,
+        )
+    assert not (material / "UNSAFE_NOT_SEALED.json").exists()
 
 
 def test_operator_setup_failure_is_terminal_non_ready_evidence(

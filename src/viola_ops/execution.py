@@ -339,6 +339,9 @@ def execute_phase(
             results.append(result)
             if not result.completed_safely:
                 event = result.safety_events[-1]
+                terminal_detail = getattr(recorder, "terminal_detail", None)
+                if not isinstance(terminal_detail, str) or not terminal_detail:
+                    terminal_detail = f"trial {trial_id} terminated with {event}"
                 return PhaseResult(
                     permit.session_id,
                     permit.policy,
@@ -349,7 +352,7 @@ def execute_phase(
                     None,
                     tuple(results),
                     event,
-                    f"trial {trial_id} terminated with {event}",
+                    terminal_detail,
                 )
         return PhaseResult(
             permit.session_id,
@@ -417,6 +420,7 @@ def run_control_trial(
     ambiguous_write_attempts = 0
     replans = 0
     safety_events: list[str] = []
+    control_completed_duration: float | None = None
     initial_receipt = getattr(robot, "last_receipt", None)
     previous_command_sequence = int(getattr(initial_receipt, "command_sequence", 0))
     previous_feedback_received_ns = (
@@ -685,14 +689,16 @@ def run_control_trial(
         remaining = started + TRIAL_DURATION_S - clock()
         if remaining > 0:
             sleep(remaining)
+        control_completed_duration = max(clock() - started, 0.0)
     except _Abort as abort:
+        control_completed_duration = max(clock() - started, 0.0)
         safety_events.append(abort.event)
         recorder.record_terminal(
             {
                 "trial": trial_id,
                 "condition": condition.to_dict(),
                 "index": action_attempts,
-                "elapsed_s": max(clock() - started, 0.0),
+                "elapsed_s": control_completed_duration,
                 "event": abort.event,
                 "detail": abort.reason,
                 "actions_sent": actions,
@@ -701,6 +707,8 @@ def run_control_trial(
             }
         )
 
+    if control_completed_duration is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("control loop ended without a terminal duration")
     completed_wall = datetime.now(UTC)
     if safety_events:
         outcome = TrialOutcome(False, "safety_abort", safety_events[-1], None, None, None, 0.0)
@@ -713,7 +721,7 @@ def run_control_trial(
         condition=condition.to_dict(),
         started_at=started_wall.isoformat(),
         completed_at=completed_wall.isoformat(),
-        duration_sec=max(clock() - started, 0.0),
+        duration_sec=control_completed_duration,
         actions=actions,
         replans=replans,
         inference_latency_ms=tuple(inference_samples),

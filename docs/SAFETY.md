@@ -60,13 +60,25 @@ contract. Their legacy entrypoints exit before checking or opening devices.
 Camera preview/recording utilities remain motor-inert but do not provide policy
 or rollout evidence.
 
-## Known cross-repository evidence blocker
+## Known cross-repository evidence limitation
 
-The merged Repo-B contract currently uses incompatible completed and unsafe
-trace shapes. Repo A preserves the richer safety trace and derives Repo B's
-compact completed view, but it will not mint `READY` unsafe evidence until both
-repositories share one schema that can prove the required safety facts. This
-blocks a readiness claim; it is not relaxed at runtime.
+Repo B can consume rich terminal evidence for a post-frame aborted shakedown.
+Repo A therefore preserves its original safety trace, derives Repo B's reviewed
+unsafe view, fully decodes its retained videos, and seals it with
+`evidence_only` permission when every consumer invariant passes. Its `READY`
+marker means only that immutable evidence is ready for transfer; it can never
+satisfy the completed-predecessor gate for more motion. A terminal before the
+first retained camera frame is recorded locally and online as non-READY with
+blocker `repo_b_unsafe_terminal_video_unavailable`. Any other projection or
+decode failure raises without being relabeled or fabricating evidence.
+
+Repo B `6fcf643` cannot consume the equivalent scored-phase abort reliably: its
+unsafe path requires a rich completed-shakedown predecessor, while its normal
+scored path requires the same predecessor in a mutually exclusive compact
+shape. Repo A keeps an unsafe scored result locally and online as non-READY
+evidence, marked `repo_b_unsafe_scored_predecessor_schema_mismatch`, instead of
+issuing a bundle that Repo B would reject. This remains a readiness blocker
+until Repo B versions one predecessor schema for both paths.
 
 Repo B also currently derives its benchmark-report configuration identity from
 resolved absolute checkout paths. Identical Repo-B source trees therefore

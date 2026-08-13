@@ -23,6 +23,7 @@ from viola_ops.policies import CANONICAL_TASK, POLICY_TOKENS, get_policy_spec
 from viola_ops.policy_runtime import (
     AcceptedPolicyCandidate,
     LeRobotPublicApi,
+    _snapshot_candidate_runtime,
     build_verification_payload,
     finite_action,
     inspect_candidate,
@@ -230,6 +231,51 @@ def test_replay_loader_uses_exact_public_lerobot_selection(monkeypatch: pytest.M
             },
         )
     ]
+
+
+def test_runtime_snapshot_retains_verified_private_bytes_after_source_changes(
+    tmp_path: Path,
+) -> None:
+    candidate = _runtime_snapshot_candidate(tmp_path)
+
+    with _snapshot_candidate_runtime(candidate) as snapshot:
+        snapshot_root = snapshot.root
+        runtime_candidate = snapshot.candidate
+        candidate.checkpoint.joinpath("model.safetensors").write_bytes(b"changed-source")
+        candidate.dependencies["paligemma_tokenizer"].joinpath("token.json").write_bytes(
+            b"changed-source"
+        )
+
+        assert runtime_candidate.checkpoint.joinpath("model.safetensors").read_bytes() == b"model"
+        assert runtime_candidate.dependencies["paligemma_tokenizer"].joinpath(
+            "token.json"
+        ).read_bytes() == b"tokenizer"
+        assert runtime_candidate.replay_dataset.joinpath("meta", "info.json").is_file()
+        assert not runtime_candidate.dependencies["paligemma_tokenizer"].joinpath(
+            "unused.bin"
+        ).exists()
+        assert snapshot.root.stat().st_mode & 0o777 == 0o500
+        snapshot.verify()
+
+    assert not snapshot_root.exists()
+
+
+def test_runtime_snapshot_rejects_a_post_inspection_source_change_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = _runtime_snapshot_candidate(tmp_path)
+    candidate.checkpoint.joinpath("model.safetensors").write_bytes(b"changed-source")
+    failed_snapshot = tmp_path / "failed-runtime-snapshot"
+    failed_snapshot.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        "viola_ops.policy_runtime.tempfile.mkdtemp",
+        lambda **_kwargs: str(failed_snapshot),
+    )
+
+    with pytest.raises(ValidationError, match="checkpoint differs from signed bytes"):
+        with _snapshot_candidate_runtime(candidate):
+            pytest.fail("a changed accepted checkpoint reached the runtime")
+    assert not failed_snapshot.exists()
 
 
 @pytest.mark.parametrize("token", POLICY_TOKENS)
@@ -505,6 +551,51 @@ def _identity(role: str, commit: str) -> RuntimeIdentity:
         python_version="3.12.13",
         lerobot_version="0.6.1",
         conda_environment="lerobot",
+    )
+
+
+def _runtime_snapshot_candidate(tmp_path: Path) -> AcceptedPolicyCandidate:
+    candidate = _candidate("pi0")
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    checkpoint.joinpath("model.safetensors").write_bytes(b"model")
+    replay = tmp_path / "replay"
+    replay.joinpath("meta").mkdir(parents=True)
+    replay.joinpath("meta", "info.json").write_text("{}\n", encoding="utf-8")
+    replay.joinpath("data").mkdir()
+    replay.joinpath("data", "heldout.parquet").write_bytes(b"not-needed-at-runtime")
+    dependency = tmp_path / "dependency"
+    dependency.joinpath("tokenizer").mkdir(parents=True)
+    dependency.joinpath("tokenizer", "token.json").write_bytes(b"tokenizer")
+    dependency.joinpath("unused.bin").write_bytes(b"not-configured")
+
+    artifacts = []
+    for name, root in (
+        ("selected_checkpoint", checkpoint),
+        ("replay_dataset", replay),
+        ("dependency_paligemma", dependency),
+    ):
+        artifacts.append({"name": name, "root": str(root), **inventory_root(root)})
+    bundle = SimpleNamespace(
+        bundle_id=candidate.bundle_id,
+        content_id=candidate.content_id,
+        manifest={"artifacts": artifacts},
+    )
+    payload = dict(candidate.payload)
+    payload["dependency_artifacts"] = {
+        "paligemma_tokenizer": {
+            "artifact": "dependency_paligemma",
+            "inventory_sha256": inventory_root(dependency)["inventory_sha256"],
+            "relative_path": "tokenizer",
+        }
+    }
+    return replace(
+        candidate,
+        bundle=bundle,
+        payload=MappingProxyType(payload),
+        checkpoint=checkpoint,
+        replay_dataset=replay,
+        dependencies=MappingProxyType({"paligemma_tokenizer": dependency / "tokenizer"}),
     )
 
 

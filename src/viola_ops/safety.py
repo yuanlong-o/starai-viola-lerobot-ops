@@ -988,6 +988,8 @@ def validate_action(
         proposed = _finite(action[key], key)
         current = _finite(reference[key], f"feedback {key}")
         lower, upper = permit.absolute_limits[joint]
+        if not lower <= current <= upper:
+            raise SafetyGateError(f"feedback {key} is outside reviewed absolute limits")
         if not lower <= proposed <= upper:
             raise SafetyGateError(f"{key} is outside reviewed absolute limits")
         allowed = permit.max_step_deltas[joint] * permit.speed_scale

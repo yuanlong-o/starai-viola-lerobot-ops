@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import pytest
 
 import viola_ops.hardware as hardware
-from viola_ops.errors import SafetyGateError
+from viola_ops.errors import SafetyGateError, ValidationError
 from viola_ops.hardware import (
     AmbiguousMotorWriteError,
     JointCalibration,
@@ -117,6 +118,12 @@ def _permit() -> MotionPermit:
     )
 
 
+def _permit_with_calibration(path: Path) -> MotionPermit:
+    hashes = dict(_permit().setup_hashes)
+    hashes["calibration"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return replace(_permit(), calibration_path=path, setup_hashes=hashes)
+
+
 def test_position_conversions_round_trip() -> None:
     body = JointCalibration(0, 0, 0, 1012, 3242)
     inverted = JointCalibration(0, 1, 0, 1012, 3242)
@@ -165,6 +172,55 @@ def test_load_calibration_requires_exact_joint_ids(tmp_path: Path) -> None:
     path.write_text(json.dumps(value))
     with pytest.raises(Exception, match="must be 2"):
         load_calibration(path)
+
+
+def test_robot_rejects_calibration_changed_after_session_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
+    path = _calibration(tmp_path / "calibration.json")
+    permit = _permit_with_calibration(path)
+    value = json.loads(path.read_text())
+    value["Motor_0"]["range_max"] = 4000
+    path.write_text(json.dumps(value), encoding="utf-8")
+    port_factory_called = False
+
+    def port_factory(_path: str, _baud: int) -> FakePort:
+        nonlocal port_factory_called
+        port_factory_called = True
+        return FakePort()
+
+    with pytest.raises(ValidationError, match="hash differs from the motion permit"):
+        SafeViolaRobot(
+            SafeViolaConfig(
+                port="/dev/fake",
+                calibration_path=path,
+                cameras={},
+                id="test",
+                calibration_dir=tmp_path / "lerobot-calibration",
+            ),
+            permit,
+            port_factory=port_factory,
+            command_factory=lambda *values: values,
+            camera_factory=lambda _configs: {},
+        )
+
+    assert port_factory_called is False
+
+
+def test_calibration_loader_refuses_symlinked_path_components(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    calibration = _calibration(real / "calibration.json")
+    leaf_link = tmp_path / "leaf.json"
+    leaf_link.symlink_to(calibration)
+    directory_link = tmp_path / "directory"
+    directory_link.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValidationError, match="cannot read reviewed calibration"):
+        load_calibration(leaf_link)
+    with pytest.raises(ValidationError, match="cannot read reviewed calibration"):
+        load_calibration(directory_link / "calibration.json")
 
 
 def test_safe_adapter_connect_is_read_only_and_connects_reviewed_cameras(
@@ -273,6 +329,41 @@ def test_rejected_action_causes_zero_additional_writes(
     action["Motor_0.pos"] = float("nan")
     with pytest.raises(SafetyGateError, match="finite"):
         robot.send_action(action)
+    assert port.writes == []
+    robot.disconnect()
+
+
+def test_feedback_drift_outside_reviewed_limits_causes_zero_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hardware, "assert_permit_current", lambda permit, **kwargs: None)
+    permit = _permit()
+    permit.absolute_limits["Motor_0"] = (-1.0, 1.0)
+    port = FakePort(current_position=0.0)
+    robot = SafeViolaRobot(
+        SafeViolaConfig(
+            port="/dev/fake",
+            calibration_path=_calibration(tmp_path / "calibration.json"),
+            cameras={},
+            id="test",
+            calibration_dir=tmp_path / "lerobot-calibration",
+        ),
+        permit,
+        port_factory=lambda _path, _baud: port,
+        command_factory=lambda *values: values,
+        camera_factory=lambda _configs: {},
+    )
+    robot.connect(calibrate=False)
+    port.current_position = 2.0
+    action = {
+        f"{joint}.pos": (50.0 if joint == "gripper" else 0.5) for joint in JOINTS
+    }
+
+    with pytest.raises(
+        SafetyGateError, match="feedback Motor_0.pos is outside reviewed absolute limits"
+    ):
+        robot.send_action(action)
+
     assert port.writes == []
     robot.disconnect()
 

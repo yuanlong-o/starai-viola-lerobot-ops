@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import math
 import os
 import re
 import select
+import socket
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,12 +31,14 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _ERROR_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _EXECUTION_FAILURE_STAGES = {
     "support_import",
+    "runtime_snapshot",
     "final_revalidation",
     "hardware_import",
     "operator_setup",
     "execution_revalidation",
     "execution",
     "local_result",
+    "post_execution_revalidation",
 }
 _EXECUTION_FAILURE_NOTE = (
     "The authorized attempt failed after its online intent. It is retained as "
@@ -91,6 +97,67 @@ class ExecutionOutcome:
             )
         lines.append(self.note)
         return "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterialRootIdentity:
+    """Filesystem identity of the one reserved live-attempt directory."""
+
+    device: int
+    inode: int
+
+
+@contextmanager
+def _execution_lease(robot_port: str) -> Iterator[None]:
+    """Hold one host-wide, nonblocking lease for the reviewed robot device.
+
+    Linux's abstract Unix-socket namespace has no filesystem entry that another
+    process can unlink and recreate while this process owns it.
+    """
+
+    if not isinstance(robot_port, str) or not robot_port.startswith("/dev/"):
+        raise SafetyGateError("motion permit does not name a reviewed robot device")
+    lexical_path = os.path.abspath(os.path.normpath(robot_port))
+    resolved_path = os.path.realpath(robot_port)
+    robot_identities = {f"path:{lexical_path}", f"path:{resolved_path}"}
+    try:
+        device = os.stat(robot_port)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise SafetyGateError(f"cannot identify reviewed robot device: {exc}") from exc
+    else:
+        if stat.S_ISCHR(device.st_mode):
+            robot_identities.add(
+                f"device:{os.major(device.st_rdev)}:{os.minor(device.st_rdev)}"
+            )
+
+    # The path lease is always held, including while the device is unplugged.
+    # The device lease additionally makes distinct aliases contend. Acquiring
+    # the deterministic set nonblockingly avoids both hot-plug races and
+    # lock-order deadlocks.
+    leases: list[socket.socket] = []
+    try:
+        for robot_identity in sorted(robot_identities):
+            digest = hashlib.sha256(robot_identity.encode("utf-8")).hexdigest()
+            lease_name = f"\0viola-ops-robot-{digest}"
+            lease = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                lease.bind(lease_name)
+            except OSError as exc:
+                lease.close()
+                if exc.errno != errno.EADDRINUSE:
+                    raise SafetyGateError(
+                        f"cannot acquire the execution lease for {robot_port}: {exc}"
+                    ) from exc
+                raise SafetyGateError(
+                    f"another process already holds the execution lease for {robot_port}"
+                ) from exc
+            leases.append(lease)
+        yield
+    finally:
+        for lease in reversed(leases):
+            lease.close()
 
 
 class _OperatorTerminal:
@@ -318,6 +385,41 @@ def execute_command(
     _safe_component(permit.trial, "permit trial")
     if permit.trial != trial:
         raise SafetyGateError("motion permit belongs to another trial")
+    with _execution_lease(permit.robot_port):
+        return _execute_authorized_command(
+            gate_request,
+            permit,
+            output=output,
+            handoff=handoff,
+            evidence_root=evidence_root,
+            handoff_root=handoff_root,
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            intent_publisher=intent_publisher,
+        )
+
+
+def _execute_authorized_command(
+    gate_request: GateRequest,
+    permit: MotionPermit,
+    *,
+    output: Path,
+    handoff: Path,
+    evidence_root: Path,
+    handoff_root: Path,
+    wandb_entity: str,
+    wandb_project: str,
+    intent_publisher: Callable[..., WandbRunIdentity],
+) -> ExecutionOutcome:
+    """Execute while the caller holds the reviewed robot's host-wide lease."""
+
+    repository = gate_request.repository_root
+    session = gate_request.session_bundle
+    candidate = gate_request.candidate_bundle
+    phase = permit.phase
+    trial = permit.trial
+    prior_hold_bundle = gate_request.prior_hold_bundle
+    prior_shakedown_bundle = gate_request.prior_shakedown_bundle
     identity = RuntimeIdentity.capture(role="pc_a", repo_root=repository)
 
     # Semantic inspection and a finished online intent run still happen before
@@ -333,30 +435,65 @@ def execute_command(
     accepted_candidate = inspect_candidate(candidate)
     hold = _optional_evidence(prior_hold_bundle)
     shakedown = _optional_evidence(prior_shakedown_bundle)
-    material = (output / permit.session_id / permit.policy / permit.phase / trial).resolve()
+    material = output / permit.session_id / permit.policy / permit.phase / trial
     if not material.is_relative_to(output):
         raise ValidationError("live evidence path escapes the requested evidence_root")
-    existed = material.exists()
-    material.mkdir(parents=True, exist_ok=True)
+    # The leaf mkdir is the atomic attempt reservation. Existing terminal
+    # evidence may take its upload-only recovery path; an empty or partial leaf
+    # must never become a second motion attempt.
+    try:
+        material.mkdir(parents=True)
+    except FileExistsError:
+        existed = True
+        material_identity = _material_root_identity(material)
+        if not _material_root_is_stable(
+            material, output, repository, material_identity
+        ):
+            raise ValidationError("existing live attempt path is not a stable directory")
+    else:
+        existed = False
+        material_identity = _material_root_identity(material)
+        if not _material_root_is_stable(
+            material, output, repository, material_identity
+        ):
+            raise ValidationError("new live attempt path is not a stable directory")
+
+    def require_material_root(boundary: str) -> None:
+        """Refuse to follow a replacement for this attempt directory."""
+
+        if not _material_root_is_stable(
+            material, output, repository, material_identity
+        ):
+            raise SafetyGateError(f"live evidence path changed {boundary}")
+
     result_path = material / "PHASE_RESULT.json"
     failure_path = material / "EXECUTION_FAILURE.json"
     resume_result = None
     resume_failure = None
     if result_path.is_file():
-        if failure_path.exists():
-            raise ValidationError("local execution contains both a result and a failure marker")
         resume_result = _load_phase_result(result_path, permit=permit)
-    elif failure_path.is_file():
+    if failure_path.is_file():
         resume_failure = _load_execution_failure(
             failure_path,
             permit=permit,
             identity=identity,
         )
-    elif existed and any(material.iterdir()):
+    if resume_result is not None and resume_failure is not None:
+        if resume_failure["stage"] != "post_execution_revalidation":
+            raise ValidationError("local execution contains both a result and a failure marker")
+    elif (
+        resume_failure is not None
+        and resume_failure["stage"] == "post_execution_revalidation"
+    ):
+        raise ValidationError(
+            "post-execution revalidation failure is missing its preserved phase result"
+        )
+    elif resume_result is None and resume_failure is None and existed:
         raise ValidationError(
             "an incomplete live attempt is preserved at this evidence path; refusing to "
             "repeat motion or overwrite it"
         )
+    require_material_root("while inspecting terminal attempt evidence")
     _publish_execution_intent(
         permit=permit,
         session=accepted_session,
@@ -367,8 +504,104 @@ def execute_command(
         wandb_project=wandb_project,
         publisher=intent_publisher,
     )
+    require_material_root("while publishing the execution intent")
+
+    def revalidate_current_authority(
+        runtime_snapshot: Any | None,
+        *,
+        boundary: str,
+    ) -> RuntimeIdentity:
+        """Reopen every signed input before another trusted boundary."""
+
+        current_identity = RuntimeIdentity.capture(role="pc_a", repo_root=repository)
+        current_session, current_candidate = revalidate_motion(
+            gate_request,
+            permit,
+            identity=current_identity,
+        )
+        _require_same_bundle(current_session, accepted_session, "rollout session")
+        _require_same_bundle(
+            current_candidate,
+            accepted_candidate.bundle,
+            "policy candidate",
+        )
+        current_material = inspect_candidate(candidate)
+        _require_same_bundle(
+            current_material.bundle,
+            accepted_candidate.bundle,
+            "policy candidate runtime material",
+        )
+        if dict(current_material.runtime_binding) != dict(
+            accepted_candidate.runtime_binding
+        ):
+            raise SafetyGateError(
+                f"accepted policy runtime bytes changed {boundary}"
+            )
+        if runtime_snapshot is not None:
+            runtime_snapshot.verify()
+        if _external_root(evidence_root, repository, "live evidence_root") != output:
+            raise SafetyGateError(f"live evidence_root changed {boundary}")
+        if _external_root(handoff_root, repository, "live handoff_root") != handoff:
+            raise SafetyGateError(f"live handoff_root changed {boundary}")
+        require_material_root(boundary)
+        return current_identity
+
+    def record_execution_failure(
+        error: BaseException,
+        *,
+        failure_stage: str,
+    ) -> ExecutionOutcome:
+        """Retain a terminal, non-READY failure without repeating motion."""
+
+        marker = _execution_failure_payload(
+            permit,
+            identity=identity,
+            stage=failure_stage,
+            error=error,
+        )
+        process_control = not isinstance(error, Exception)
+        if not _material_root_is_stable(
+            material, output, repository, material_identity
+        ):
+            # The original attempt may still hold raw evidence, but following a
+            # replacement path would put the failure marker in the wrong place.
+            raise error.with_traceback(error.__traceback__)
+        try:
+            marker_path = write_canonical_json(failure_path, marker)
+            require_material_root("while recording the execution failure")
+            _publish_execution_failure(
+                marker=marker,
+                marker_path=marker_path,
+                permit=permit,
+                session=accepted_session,
+                candidate=accepted_candidate.bundle,
+                identity=identity,
+                material=material,
+                wandb_entity=wandb_entity,
+                wandb_project=wandb_project,
+                publisher=intent_publisher,
+            )
+            require_material_root("while publishing the execution failure")
+        except Exception:
+            # KeyboardInterrupt, SystemExit, and other process-control
+            # exceptions keep their language-level semantics. The immutable
+            # local marker remains available for an upload-only retry.
+            if process_control:
+                raise error.with_traceback(error.__traceback__)
+            raise
+        if process_control:
+            raise error.with_traceback(error.__traceback__)
+        return ExecutionOutcome(
+            str(marker["status"]),
+            permit.phase,
+            permit.session_id,
+            material,
+            None,
+            "The failed attempt is retained, is not READY, and will never be rerun in place.",
+        )
 
     if resume_failure is not None:
+        require_material_root("before republishing the execution failure")
         _publish_execution_failure(
             marker=resume_failure,
             marker_path=failure_path,
@@ -381,6 +614,7 @@ def execute_command(
             wandb_project=wandb_project,
             publisher=intent_publisher,
         )
+        require_material_root("after republishing the execution failure")
         return ExecutionOutcome(
             str(resume_failure["status"]),
             permit.phase,
@@ -394,8 +628,23 @@ def execute_command(
     # intent receipt above have succeeded.  A completed local result takes the
     # upload-only recovery path and never imports the hardware adapter.
     if resume_result is not None:
+        try:
+            identity = revalidate_current_authority(
+                None,
+                boundary="before recovered-result finalization",
+            )
+        except BaseException as exc:
+            return record_execution_failure(
+                exc,
+                failure_stage="post_execution_revalidation",
+            )
+
         from .evidence import PhaseEvidenceFactory
-        from .rollout_evidence import seal_completed_phase
+        from .rollout_evidence import (
+            UnsafeTerminalVideoUnavailableError,
+            seal_completed_phase,
+            seal_unsafe_phase,
+        )
 
         result = resume_result
         factory = (
@@ -405,9 +654,24 @@ def execute_command(
         )
     else:
         stage = "support_import"
+        runtime_stack = ExitStack()
         try:
             from .evidence import PhaseEvidenceFactory
-            from .rollout_evidence import seal_completed_phase
+            from .policy_runtime import _snapshot_candidate_runtime, load_lerobot_runtime
+            from .rollout_evidence import (
+                UnsafeTerminalVideoUnavailableError,
+                seal_completed_phase,
+                seal_unsafe_phase,
+            )
+
+            runtime_snapshot = None
+            runtime_candidate = accepted_candidate
+            if phase != "hold":
+                stage = "runtime_snapshot"
+                runtime_snapshot = runtime_stack.enter_context(
+                    _snapshot_candidate_runtime(accepted_candidate)
+                )
+                runtime_candidate = runtime_snapshot.candidate
 
             # The operator may spend time confirming and the online intent may
             # take time to finish.  Reopen all authority and recapture the exact
@@ -429,14 +693,15 @@ def execute_command(
                 raise SafetyGateError("live evidence_root changed before hardware import")
             if _external_root(handoff_root, repository, "live handoff_root") != handoff:
                 raise SafetyGateError("live handoff_root changed before hardware import")
-            if not _material_root_is_stable(material, output, repository):
+            if not _material_root_is_stable(
+                material, output, repository, material_identity
+            ):
                 raise SafetyGateError("live evidence path changed before hardware import")
             identity = final_identity
 
             stage = "hardware_import"
             from .execution import execute_phase
             from .hardware import SafeViolaRobot, config_from_permit
-            from .policy_runtime import load_lerobot_runtime
 
             factory = (
                 None
@@ -446,45 +711,21 @@ def execute_command(
             stage = "operator_setup"
             operator = InteractiveTrialOperator()
             try:
-                def revalidate_execution_authority() -> None:
+                def revalidate_execution_authority(
+                    *,
+                    failure_stage: str = "execution_revalidation",
+                    success_stage: str = "execution",
+                    boundary: str = "at an execution boundary",
+                ) -> None:
                     """Reopen every live input at one motion boundary."""
 
                     nonlocal identity, stage
-                    stage = "execution_revalidation"
-                    current_identity = RuntimeIdentity.capture(
-                        role="pc_a", repo_root=repository
+                    stage = failure_stage
+                    identity = revalidate_current_authority(
+                        runtime_snapshot,
+                        boundary=boundary,
                     )
-                    current_session, current_candidate = revalidate_motion(
-                        gate_request,
-                        permit,
-                        identity=current_identity,
-                    )
-                    _require_same_bundle(
-                        current_session, accepted_session, "rollout session"
-                    )
-                    _require_same_bundle(
-                        current_candidate,
-                        accepted_candidate.bundle,
-                        "policy candidate",
-                    )
-                    if _external_root(
-                        evidence_root, repository, "live evidence_root"
-                    ) != output:
-                        raise SafetyGateError(
-                            "live evidence_root changed at an execution boundary"
-                        )
-                    if _external_root(
-                        handoff_root, repository, "live handoff_root"
-                    ) != handoff:
-                        raise SafetyGateError(
-                            "live handoff_root changed at an execution boundary"
-                        )
-                    if not _material_root_is_stable(material, output, repository):
-                        raise SafetyGateError(
-                            "live evidence path changed at an execution boundary"
-                        )
-                    identity = current_identity
-                    stage = "execution"
+                    stage = success_stage
 
                 # Entering the state machine gets a fresh check.  It receives
                 # the same callback and repeats the full check immediately
@@ -494,7 +735,7 @@ def execute_command(
                 stage = "execution"
                 result = execute_phase(
                     permit,
-                    accepted_candidate,
+                    runtime_candidate,
                     runtime_factory=load_lerobot_runtime,
                     robot_factory=lambda approved: SafeViolaRobot(
                         config_from_permit(approved), approved
@@ -515,73 +756,83 @@ def execute_command(
             else:
                 operator.close()
             stage = "local_result"
+            require_material_root("before preserving the phase result")
             write_canonical_json(result_path, _phase_result_payload(result))
+            require_material_root("after preserving the phase result")
+            revalidate_execution_authority(
+                failure_stage="post_execution_revalidation",
+                success_stage="post_execution_revalidation",
+                boundary="after hardware disconnect and before finalization",
+            )
         except BaseException as exc:
-            marker = _execution_failure_payload(
-                permit,
-                identity=identity,
-                stage=stage,
-                error=exc,
-            )
-            process_control = not isinstance(exc, Exception)
-            if not _material_root_is_stable(material, output, repository):
-                # Do not follow a replaced evidence directory while trying to
-                # explain why the final gate failed.  Preserve the original
-                # exception and leave the already-finished intent untouched.
-                raise
-            try:
-                marker_path = write_canonical_json(failure_path, marker)
-                _publish_execution_failure(
-                    marker=marker,
-                    marker_path=marker_path,
-                    permit=permit,
-                    session=accepted_session,
-                    candidate=accepted_candidate.bundle,
-                    identity=identity,
-                    material=material,
-                    wandb_entity=wandb_entity,
-                    wandb_project=wandb_project,
-                    publisher=intent_publisher,
-                )
-            except Exception:
-                # KeyboardInterrupt, SystemExit, and other process-control
-                # exceptions must keep their language-level semantics.  The
-                # immutable local marker remains available for an upload-only
-                # retry if online publication itself failed.
-                if process_control:
-                    raise exc.with_traceback(exc.__traceback__)
-                raise
-            if process_control:
-                raise
-            return ExecutionOutcome(
-                str(marker["status"]),
-                permit.phase,
-                permit.session_id,
-                material,
-                None,
-                "The failed attempt is retained, is not READY, and will never be rerun in place.",
-            )
+            return record_execution_failure(exc, failure_stage=stage)
+        finally:
+            runtime_stack.close()
 
-    if result.status != "completed":
-        marker = {
-            "schema_version": 1,
-            "status": result.status,
-            "session_id": result.session_id,
-            "policy": result.policy,
-            "phase": result.phase,
-            "terminal_event": result.terminal_event,
-            "terminal_reason": result.terminal_reason,
-            "ready": False,
-            "blocker": "repo_b_rollout_trace_schema_mismatch",
-            "note": (
-                "Rich local evidence is retained. No READY bundle was minted because the merged "
-                "Repo-B completed and unsafe trace consumers require incompatible shapes."
+    require_material_root("before terminal finalization")
+    if result.status == "unsafe_shakedown" and result.phase == "shakedown":
+        if factory is None:
+            raise ValidationError("unsafe shakedown is missing its motion evidence")
+        require_material_root("before unsafe-evidence finalization")
+        try:
+            sealed = seal_unsafe_phase(
+                result,
+                session=accepted_session,
+                candidate=accepted_candidate,
+                identity=identity,
+                experiment=accepted_session.manifest["experiment"],
+                material_root=material,
+                handoff_root=handoff,
+                wandb_entity=wandb_entity,
+                wandb_project=wandb_project,
+                evidence_factory=factory,
+                prior_hold=hold,
+                prior_shakedown=None,
+                publisher=intent_publisher,
+            )
+            require_material_root("after unsafe-evidence finalization")
+        except UnsafeTerminalVideoUnavailableError:
+            require_material_root("before recording the unsealed unsafe outcome")
+            outcome = _record_unsealed_unsafe_outcome(
+                result=result,
+                blocker="repo_b_unsafe_terminal_video_unavailable",
+                note=(
+                    "The shakedown stopped before a transferable camera frame was retained. "
+                    "Raw terminal evidence remains local and non-READY."
+                ),
+                permit=permit,
+                session=accepted_session,
+                candidate=accepted_candidate.bundle,
+                identity=identity,
+                material=material,
+                wandb_entity=wandb_entity,
+                wandb_project=wandb_project,
+                publisher=intent_publisher,
+            )
+            require_material_root("after recording the unsealed unsafe outcome")
+            return outcome
+        return ExecutionOutcome(
+            result.status,
+            result.phase,
+            result.session_id,
+            material,
+            sealed.bundle,
+            (
+                "Unsafe terminal evidence is sealed for Repo B; it cannot authorize "
+                "another motion phase."
             ),
-        }
-        marker_path = write_canonical_json(material / "UNSAFE_NOT_SEALED.json", marker)
-        _publish_unsafe_outcome(
-            marker=marker,
-            marker_path=marker_path,
+        )
+
+    if result.status == "unsafe_shakedown" and result.phase == "scored":
+        require_material_root("before recording the unsealed unsafe outcome")
+        outcome = _record_unsealed_unsafe_outcome(
+            result=result,
+            blocker="repo_b_unsafe_scored_predecessor_schema_mismatch",
+            note=(
+                "Rich local evidence is retained. No READY bundle was minted because Repo B "
+                "requires mutually exclusive compact and rich schemas for the completed "
+                "shakedown predecessor of a scored phase."
+            ),
             permit=permit,
             session=accepted_session,
             candidate=accepted_candidate.bundle,
@@ -591,15 +842,13 @@ def execute_command(
             wandb_project=wandb_project,
             publisher=intent_publisher,
         )
-        return ExecutionOutcome(
-            result.status,
-            result.phase,
-            result.session_id,
-            material,
-            None,
-            marker["note"],
-        )
+        require_material_root("after recording the unsealed unsafe outcome")
+        return outcome
 
+    if result.status != "completed":
+        raise ValidationError(f"unsupported physical phase result status: {result.status}")
+
+    require_material_root("before completed-evidence finalization")
     sealed = seal_completed_phase(
         result,
         session=accepted_session,
@@ -614,6 +863,7 @@ def execute_command(
         prior_hold=hold,
         prior_shakedown=shakedown,
     )
+    require_material_root("after completed-evidence finalization")
     return ExecutionOutcome(
         "completed",
         result.phase,
@@ -698,6 +948,57 @@ def _publish_execution_intent(
         "wandb": run.binding(),
     }
     return write_canonical_json(receipt_path, receipt)
+
+
+def _record_unsealed_unsafe_outcome(
+    *,
+    result: PhaseResult,
+    blocker: str,
+    note: str,
+    permit: MotionPermit,
+    session: VerifiedBundle,
+    candidate: VerifiedBundle,
+    identity: RuntimeIdentity,
+    material: Path,
+    wandb_entity: str,
+    wandb_project: str,
+    publisher: Callable[..., WandbRunIdentity],
+) -> ExecutionOutcome:
+    """Persist and publish a typed terminal that cannot form a Repo-B bundle."""
+
+    marker = {
+        "schema_version": 1,
+        "status": result.status,
+        "session_id": result.session_id,
+        "policy": result.policy,
+        "phase": result.phase,
+        "terminal_event": result.terminal_event,
+        "terminal_reason": result.terminal_reason,
+        "ready": False,
+        "blocker": blocker,
+        "note": note,
+    }
+    marker_path = write_canonical_json(material / "UNSAFE_NOT_SEALED.json", marker)
+    _publish_unsafe_outcome(
+        marker=marker,
+        marker_path=marker_path,
+        permit=permit,
+        session=session,
+        candidate=candidate,
+        identity=identity,
+        material=material,
+        wandb_entity=wandb_entity,
+        wandb_project=wandb_project,
+        publisher=publisher,
+    )
+    return ExecutionOutcome(
+        result.status,
+        result.phase,
+        result.session_id,
+        material,
+        None,
+        note,
+    )
 
 
 def _publish_unsafe_outcome(
@@ -798,6 +1099,7 @@ def _execution_failure_payload(
         "execution_revalidation",
         "execution",
         "local_result",
+        "post_execution_revalidation",
     }
     marker = {
         "schema_version": 1,
@@ -1031,6 +1333,7 @@ def _validate_execution_failure(
         "execution_revalidation",
         "execution",
         "local_result",
+        "post_execution_revalidation",
     }
     if marker["hardware_may_have_connected"] is not hardware_expected:
         raise ValidationError("execution failure hardware exposure differs from its stage")
@@ -1500,14 +1803,34 @@ def _require_same_bundle(current: Any, original: Any, label: str) -> None:
         raise SafetyGateError(f"revalidated {label} differs from the authorized bundle")
 
 
-def _material_root_is_stable(material: Path, output: Path, repository: Path) -> bool:
-    """Return whether evidence paths still resolve to their approved location."""
+def _material_root_identity(material: Path) -> _MaterialRootIdentity:
+    """Capture the directory entry reserved for one live attempt."""
+
+    try:
+        details = material.lstat()
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect live attempt directory: {exc}") from exc
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValidationError("live attempt path is not a directory")
+    return _MaterialRootIdentity(device=details.st_dev, inode=details.st_ino)
+
+
+def _material_root_is_stable(
+    material: Path,
+    output: Path,
+    repository: Path,
+    expected_identity: _MaterialRootIdentity | None = None,
+) -> bool:
+    """Return whether the approved path still names the reserved directory."""
 
     try:
         current_output = output.resolve()
         current_material = material.resolve()
         checkout = repository.resolve()
+        current_identity = _material_root_identity(material)
     except OSError:
+        return False
+    except ValidationError:
         return False
     return (
         current_output == output
@@ -1516,6 +1839,10 @@ def _material_root_is_stable(material: Path, output: Path, repository: Path) -> 
         and output != checkout
         and not output.is_relative_to(checkout)
         and not checkout.is_relative_to(output)
+        and (
+            expected_identity is None
+            or current_identity == expected_identity
+        )
     )
 
 
