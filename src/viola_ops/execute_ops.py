@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import select
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,7 +18,7 @@ from viola_handoff import RuntimeIdentity, VerifiedBundle, canonical_json_bytes,
 
 from .errors import SafetyGateError, ValidationError
 from .jsonutil import read_json_object, require_exact_keys, sha256_json, write_canonical_json
-from .safety import GateRequest, MotionPermit, authorize_motion
+from .safety import GateRequest, MotionPermit, authorize_motion, revalidate_motion
 from .wandb_ops import WandbRunIdentity, planned_run, publish_finished_run
 
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -25,8 +27,10 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _ERROR_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _EXECUTION_FAILURE_STAGES = {
     "support_import",
+    "final_revalidation",
     "hardware_import",
     "operator_setup",
+    "execution_revalidation",
     "execution",
     "local_result",
 }
@@ -89,24 +93,60 @@ class ExecutionOutcome:
         return "\n".join(lines)
 
 
+class _OperatorTerminal:
+    """One text interface over separate readable and writable TTY handles."""
+
+    def __init__(self, path: str = "/dev/tty") -> None:
+        # Keep input unbuffered so blocking setup reads cannot hide a later
+        # STOP line from the control loop's descriptor-level polling.
+        self._reader = open(path, "rb", buffering=0)
+        try:
+            self._writer = open(path, "w", encoding="utf-8", buffering=1)
+        except BaseException:
+            self._reader.close()
+            raise
+
+    def fileno(self) -> int:
+        return self._reader.fileno()
+
+    def isatty(self) -> bool:
+        return self._reader.isatty() and self._writer.isatty()
+
+    def readline(self) -> str:
+        return self._reader.readline().decode("utf-8")
+
+    def write(self, value: str) -> int:
+        return self._writer.write(value)
+
+    def flush(self) -> None:
+        self._writer.flush()
+
+    def close(self) -> None:
+        try:
+            self._reader.close()
+        finally:
+            self._writer.close()
+
+
 class InteractiveTrialOperator:
     """TTY-only trial reset, abort, and outcome input."""
 
     def __init__(self) -> None:
         try:
-            self._terminal = open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+            self._terminal = _OperatorTerminal()
         except OSError as exc:
             raise SafetyGateError("live execution requires an available /dev/tty") from exc
         if not self._terminal.isatty():
             self._terminal.close()
             raise SafetyGateError("live execution requires an interactive terminal")
         self._pending_event: str | None = None
+        self._input_buffer = bytearray()
 
     def prepare_trial(self, session_id: str, trial_id: str, condition: dict[str, Any]) -> None:
         phrase = f"START {trial_id}"
         self._terminal.write(
             "\nPrepare the reviewed reset and cube condition:\n"
-            f"{json.dumps(condition, indent=2, sort_keys=True)}\n"
+            f"{_render_trial_condition(condition)}\n"
             "Keep ownership of the physical E-stop. During motion, type STOP, "
             "COLLISION, or INTERVENTION followed by Enter.\n"
             f"Type exactly when the workspace is ready: {phrase}\n> "
@@ -167,6 +207,8 @@ class InteractiveTrialOperator:
     def _poll(self) -> None:
         if self._pending_event is not None:
             return
+        if self._consume_buffered_line():
+            return
         try:
             readable, _, _ = select.select([self._terminal], [], [], 0.0)
         except (OSError, ValueError):
@@ -174,11 +216,65 @@ class InteractiveTrialOperator:
             return
         if not readable:
             return
-        command = self._terminal.readline().strip().upper()
+        try:
+            descriptor = self._terminal.fileno()
+            was_blocking = os.get_blocking(descriptor)
+            try:
+                if was_blocking:
+                    os.set_blocking(descriptor, False)
+                chunk = os.read(descriptor, 4096)
+            finally:
+                if was_blocking:
+                    os.set_blocking(descriptor, True)
+        except (BlockingIOError, OSError, ValueError):
+            self._pending_event = "operator_abort"
+            return
+        if not chunk:
+            self._pending_event = "operator_abort"
+            return
+        self._input_buffer.extend(chunk)
+        if len(self._input_buffer) > 4096:
+            self._input_buffer.clear()
+            self._pending_event = "operator_abort"
+            return
+        self._consume_buffered_line()
+
+    def _consume_buffered_line(self) -> bool:
+        """Consume one complete command without ever waiting for more bytes."""
+
+        try:
+            newline = self._input_buffer.index(b"\n")
+        except ValueError:
+            return False
+        raw = bytes(self._input_buffer[:newline])
+        del self._input_buffer[: newline + 1]
+        try:
+            command = raw.decode("utf-8").strip().upper()
+        except UnicodeDecodeError:
+            command = ""
         self._pending_event = {
             "COLLISION": "collision",
             "INTERVENTION": "intervention",
         }.get(command, "operator_abort")
+        return True
+
+
+def _render_trial_condition(condition: Mapping[str, Any]) -> str:
+    """Render the signed cube placement as short operator instructions."""
+
+    condition_id = str(condition.get("condition_id", ""))
+    stratum = str(condition.get("stratum", ""))
+    lines = [f"  Condition: {condition_id} ({stratum})"]
+    for cube in ("blue", "red"):
+        axis = condition.get(f"{cube}_axis")
+        offset = condition.get(f"{cube}_offset_mm")
+        if axis is None:
+            lines.append(f"  {cube.title()} cube: nominal reviewed position")
+        else:
+            lines.append(
+                f"  {cube.title()} cube: {float(offset):+g} mm along {axis}"
+            )
+    return "\n".join(lines)
 
 
 def execute_command(
@@ -200,24 +296,22 @@ def execute_command(
 
     _safe_component(trial, "trial")
     repository = repo_root.resolve()
-    output = evidence_root.expanduser().resolve()
-    if output == repository or output.is_relative_to(repository):
-        raise ValidationError("live evidence_root must be outside the Git worktree")
+    output = _external_root(evidence_root, repository, "live evidence_root")
+    handoff = _external_root(handoff_root, repository, "live handoff_root")
 
     # This call performs every trust/revision/E-stop/predecessor/operator check.
     # No policy, robot, camera, serial, or motor module is imported above it.
-    permit = authorize_motion(
-        GateRequest(
-            session_bundle=session,
-            candidate_bundle=candidate,
-            phase=phase,
-            trial=trial,
-            repository_root=repository,
-            handoff_root=handoff_root,
-            prior_hold_bundle=prior_hold_bundle,
-            prior_shakedown_bundle=prior_shakedown_bundle,
-        )
+    gate_request = GateRequest(
+        session_bundle=session,
+        candidate_bundle=candidate,
+        phase=phase,
+        trial=trial,
+        repository_root=repository,
+        handoff_root=handoff,
+        prior_hold_bundle=prior_hold_bundle,
+        prior_shakedown_bundle=prior_shakedown_bundle,
     )
+    permit = authorize_motion(gate_request)
     _safe_component(permit.session_id, "session_id")
     _safe_component(permit.policy, "policy")
     _safe_component(permit.phase, "phase")
@@ -315,6 +409,30 @@ def execute_command(
             from .evidence import PhaseEvidenceFactory
             from .rollout_evidence import seal_completed_phase
 
+            # The operator may spend time confirming and the online intent may
+            # take time to finish.  Reopen all authority and recapture the exact
+            # signed runtime at the final boundary before hardware-capable code.
+            stage = "final_revalidation"
+            final_identity = RuntimeIdentity.capture(role="pc_a", repo_root=repository)
+            current_session, current_candidate = revalidate_motion(
+                gate_request,
+                permit,
+                identity=final_identity,
+            )
+            _require_same_bundle(current_session, accepted_session, "rollout session")
+            _require_same_bundle(
+                current_candidate,
+                accepted_candidate.bundle,
+                "policy candidate",
+            )
+            if _external_root(evidence_root, repository, "live evidence_root") != output:
+                raise SafetyGateError("live evidence_root changed before hardware import")
+            if _external_root(handoff_root, repository, "live handoff_root") != handoff:
+                raise SafetyGateError("live handoff_root changed before hardware import")
+            if not _material_root_is_stable(material, output, repository):
+                raise SafetyGateError("live evidence path changed before hardware import")
+            identity = final_identity
+
             stage = "hardware_import"
             from .execution import execute_phase
             from .hardware import SafeViolaRobot, config_from_permit
@@ -328,6 +446,51 @@ def execute_command(
             stage = "operator_setup"
             operator = InteractiveTrialOperator()
             try:
+                def revalidate_execution_authority() -> None:
+                    """Reopen every live input at one motion boundary."""
+
+                    nonlocal identity, stage
+                    stage = "execution_revalidation"
+                    current_identity = RuntimeIdentity.capture(
+                        role="pc_a", repo_root=repository
+                    )
+                    current_session, current_candidate = revalidate_motion(
+                        gate_request,
+                        permit,
+                        identity=current_identity,
+                    )
+                    _require_same_bundle(
+                        current_session, accepted_session, "rollout session"
+                    )
+                    _require_same_bundle(
+                        current_candidate,
+                        accepted_candidate.bundle,
+                        "policy candidate",
+                    )
+                    if _external_root(
+                        evidence_root, repository, "live evidence_root"
+                    ) != output:
+                        raise SafetyGateError(
+                            "live evidence_root changed at an execution boundary"
+                        )
+                    if _external_root(
+                        handoff_root, repository, "live handoff_root"
+                    ) != handoff:
+                        raise SafetyGateError(
+                            "live handoff_root changed at an execution boundary"
+                        )
+                    if not _material_root_is_stable(material, output, repository):
+                        raise SafetyGateError(
+                            "live evidence path changed at an execution boundary"
+                        )
+                    identity = current_identity
+                    stage = "execution"
+
+                # Entering the state machine gets a fresh check.  It receives
+                # the same callback and repeats the full check immediately
+                # after every successful per-trial START.
+                stage = "execution_revalidation"
+                revalidate_execution_authority()
                 stage = "execution"
                 result = execute_phase(
                     permit,
@@ -339,6 +502,7 @@ def execute_command(
                     evidence_factory=factory,
                     operator=operator,
                     safety_monitor=operator,
+                    revalidate_authority=revalidate_execution_authority,
                 )
             except BaseException:
                 # Preserve the active failure, especially KeyboardInterrupt or
@@ -360,6 +524,11 @@ def execute_command(
                 error=exc,
             )
             process_control = not isinstance(exc, Exception)
+            if not _material_root_is_stable(material, output, repository):
+                # Do not follow a replaced evidence directory while trying to
+                # explain why the final gate failed.  Preserve the original
+                # exception and leave the already-finished intent untouched.
+                raise
             try:
                 marker_path = write_canonical_json(failure_path, marker)
                 _publish_execution_failure(
@@ -438,7 +607,7 @@ def execute_command(
         identity=identity,
         experiment=accepted_session.manifest["experiment"],
         material_root=material,
-        handoff_root=handoff_root,
+        handoff_root=handoff,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         evidence_factory=factory,
@@ -625,7 +794,11 @@ def _execution_failure_payload(
 ) -> dict[str, Any]:
     """Describe one terminal execution failure without granting readiness."""
 
-    hardware_may_have_connected = stage in {"execution", "local_result"}
+    hardware_may_have_connected = stage in {
+        "execution_revalidation",
+        "execution",
+        "local_result",
+    }
     marker = {
         "schema_version": 1,
         "kind": "viola_execution_failure",
@@ -854,7 +1027,11 @@ def _validate_execution_failure(
     recorded_at = _utc_datetime(marker["recorded_at_utc"], "execution failure recorded_at_utc")
     if recorded_at.isoformat() != marker["recorded_at_utc"]:
         raise ValidationError("execution failure timestamp must use canonical UTC ISO format")
-    hardware_expected = marker["stage"] in {"execution", "local_result"}
+    hardware_expected = marker["stage"] in {
+        "execution_revalidation",
+        "execution",
+        "local_result",
+    }
     if marker["hardware_may_have_connected"] is not hardware_expected:
         raise ValidationError("execution failure hardware exposure differs from its stage")
     if marker["motion_may_have_started"] is not hardware_expected:
@@ -1282,6 +1459,64 @@ def _safe_component(value: Any, label: str) -> str:
             f"{label} must be one path-safe component using letters, numbers, '.', '_', or '-'"
         )
     return value
+
+
+def _external_root(path: Path, repository: Path, label: str) -> Path:
+    """Return a nonsymlink write root disjoint from the reviewed checkout."""
+
+    root = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    current = Path(root.anchor)
+    for part in root.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect {label} path {current}: {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise ValidationError(f"symlink path is forbidden for {label}: {current}")
+        if not stat.S_ISDIR(mode):
+            raise ValidationError(f"{label} component is not a directory: {current}")
+    checkout = repository.resolve()
+    if (
+        root == checkout
+        or root.is_relative_to(checkout)
+        or checkout.is_relative_to(root)
+    ):
+        raise ValidationError(
+            f"{label} must be outside the Git worktree, and the root cannot contain it"
+        )
+    return root
+
+
+def _require_same_bundle(current: Any, original: Any, label: str) -> None:
+    """Require final inspection to recover the exact content-addressed bundle."""
+
+    if (
+        getattr(current, "bundle_id", None) != getattr(original, "bundle_id", None)
+        or getattr(current, "content_id", None) != getattr(original, "content_id", None)
+    ):
+        raise SafetyGateError(f"revalidated {label} differs from the authorized bundle")
+
+
+def _material_root_is_stable(material: Path, output: Path, repository: Path) -> bool:
+    """Return whether evidence paths still resolve to their approved location."""
+
+    try:
+        current_output = output.resolve()
+        current_material = material.resolve()
+        checkout = repository.resolve()
+    except OSError:
+        return False
+    return (
+        current_output == output
+        and current_material == material
+        and material.is_relative_to(output)
+        and output != checkout
+        and not output.is_relative_to(checkout)
+        and not checkout.is_relative_to(output)
+    )
 
 
 def _optional_evidence(path: Path | None) -> VerifiedBundle | None:

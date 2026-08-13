@@ -192,6 +192,17 @@ class ShadowEvidence:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _EvidenceRootSnapshot:
+    """Exact directory identity and bytes across one online publication."""
+
+    label: str
+    path: Path
+    device: int
+    inode: int
+    inventory: Mapping[str, Any]
+
+
 def verify_command(
     bundle: str | Path,
     output_root: str | Path,
@@ -220,6 +231,9 @@ def verify_command(
         role="pc_a", repo_root=repo_root
     )
     _require_pc_a_identity(identity)
+    _require_external_root(output_root, repo_root=repo_root, label="policy evidence")
+    _require_external_root(handoff_root, repo_root=repo_root, label="handoff")
+    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
     repo = _repo_identity(identity)
     attempt = _attempt_id(attempt_id)
     material = _material_root(
@@ -256,6 +270,8 @@ def verify_command(
     )
     verification_path = write_canonical_json(material / "verification.json", payload)
     evidence_sha256 = sha256_file(verification_path)
+    publication_snapshot = _snapshot_evidence_roots({"verification payload": material})
+    _require_current_identity(repo_root, identity)
     publisher(
         wandb,
         job_type="viola-policy-verify",
@@ -274,6 +290,9 @@ def verify_command(
         binding=verification_sync_binding(candidate, payload),
         synced_at=_utc(now()).isoformat(),
     )
+    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
+    _require_current_identity(repo_root, identity)
+    _require_evidence_snapshot(publication_snapshot)
     sync_path = write_canonical_json(material / "verification_WANDB_SYNCED.json", sync)
 
     terminal_path: Path | None = None
@@ -301,6 +320,10 @@ def verify_command(
             wandb_project=wandb_project,
             payload_dir=material,
         )
+        seal_snapshot = _snapshot_evidence_roots({"verification payload": material})
+        _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
+        _require_current_identity(repo_root, identity)
+        _require_evidence_snapshot(seal_snapshot)
         terminal_bundle = _seal(request, bundle_evidence_logger)
     return VerificationEvidence(
         candidate,
@@ -347,6 +370,9 @@ def shadow_command(
         role="pc_a", repo_root=repo_root
     )
     _require_pc_a_identity(identity)
+    _require_external_root(output_root, repo_root=repo_root, label="policy evidence")
+    _require_external_root(handoff_root, repo_root=repo_root, label="handoff")
+    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
     repo = _repo_identity(identity)
     verification, verification_source, verification_sync_source = _load_verification(
         candidate,
@@ -401,6 +427,8 @@ def shadow_command(
             setup_hashes = _setup_hashes(setup)
             state, frozen_binding, frozen_files = _load_frozen_state(
                 frozen_state_path,
+                expected_setup_id=setup.setup_id,
+                expected_operator=setup.estop["operator"],
                 expected_setup_hashes=setup_hashes,
                 expected_repo=repo,
             )
@@ -467,6 +495,13 @@ def shadow_command(
     )
     shadow_path = write_canonical_json(payload_root / "shadow_evidence.json", shadow_payload)
     shadow_sha256 = sha256_file(shadow_path)
+    publication_snapshot = _snapshot_evidence_roots(
+        {
+            "shadow payload": payload_root,
+            "shadow artifact": artifact_root,
+        }
+    )
+    _require_current_identity(repo_root, identity)
     publisher(
         wandb,
         job_type="viola-policy-shadow",
@@ -500,6 +535,9 @@ def shadow_command(
         ),
         synced_at=_utc(now()).isoformat(),
     )
+    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
+    _require_current_identity(repo_root, identity)
+    _require_evidence_snapshot(publication_snapshot)
     shadow_sync_path = write_canonical_json(
         payload_root / "shadow_WANDB_SYNCED.json", shadow_sync
     )
@@ -533,6 +571,15 @@ def shadow_command(
         payload_dir=payload_root,
         artifact_roots={"shadow_record": artifact_root},
     )
+    seal_snapshot = _snapshot_evidence_roots(
+        {
+            "shadow payload": payload_root,
+            "shadow artifact": artifact_root,
+        }
+    )
+    _require_current_candidate(bundle, candidate, handoff_root=handoff_root)
+    _require_current_identity(repo_root, identity)
+    _require_evidence_snapshot(seal_snapshot)
     sealed = _seal(request, bundle_evidence_logger)
     return ShadowEvidence(candidate, run, material, payload_root, artifact_root, sealed)
 
@@ -569,7 +616,11 @@ def _load_verification(
             raise ValidationError(f"runtime verification differs from candidate/current {field}")
     finite_action(value["sample_action"], label="runtime verification sample action")
     latency = value["latency"]
-    if not isinstance(latency, Mapping) or latency.get("warmups") != 20 or latency.get("trials") != 200:
+    if (
+        not isinstance(latency, Mapping)
+        or latency.get("warmups") != 20
+        or latency.get("trials") != 200
+    ):
         raise ValidationError("runtime verification lacks the complete 20+200 latency benchmark")
     require_exact_keys(
         latency,
@@ -614,15 +665,30 @@ def _load_verification(
 def _load_frozen_state(
     path: str | Path,
     *,
+    expected_setup_id: str,
+    expected_operator: str,
     expected_setup_hashes: Mapping[str, str],
     expected_repo: Mapping[str, Any],
 ) -> tuple[tuple[float, ...], dict[str, Any], tuple[Path, Path, Path]]:
-    root = Path(path).expanduser().resolve()
-    if root.is_file():
-        root = root.parent
+    root = _existing_directory(path, label="frozen-state evidence")
+    expected_names = {
+        "frozen_state.json",
+        "frozen_state_capture.json",
+        "frozen_state_capture_WANDB_SYNCED.json",
+    }
+    if {item.name for item in root.iterdir()} != expected_names:
+        raise ValidationError(
+            "frozen-state evidence must contain exactly its state, capture, and W&B receipt"
+        )
     state_path = root / "frozen_state.json"
     capture_path = root / "frozen_state_capture.json"
     sync_path = root / "frozen_state_capture_WANDB_SYNCED.json"
+    for evidence_file in (state_path, capture_path, sync_path):
+        mode = evidence_file.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ValidationError(
+                f"frozen-state evidence must be a regular nonsymlink file: {evidence_file}"
+            )
     state = _read_canonical_object(state_path, label="frozen state")
     capture = _read_canonical_object(capture_path, label="frozen-state capture")
     sync = _read_canonical_object(sync_path, label="frozen-state W&B sync receipt")
@@ -644,20 +710,21 @@ def _load_frozen_state(
         or capture.get("frozen_state_file") != "frozen_state.json"
         or capture.get("frozen_state_sha256") != sha256_file(state_path)
         or capture.get("state_sha256") != state_sha
+        or capture.get("setup_id") != expected_setup_id
+        or capture.get("operator") != expected_operator
         or capture.get("setup_hashes") != dict(expected_setup_hashes)
         or capture.get("repo") != dict(expected_repo)
         or capture.get("captured_at") != state["captured_at"]
         or capture.get("motor_disconnected_at") != state["motor_disconnected_at"]
-        or not isinstance(capture.get("setup_id"), str)
-        or not capture["setup_id"].strip()
-        or not isinstance(capture.get("operator"), str)
-        or not capture["operator"].strip()
         or not isinstance(capture.get("wandb"), Mapping)
     ):
         raise ValidationError("frozen-state evidence differs from the reviewed live setup")
     _wandb_identity(capture["wandb"], "frozen-state capture")
     if disconnected_at <= captured_at:
         raise ValidationError("frozen-state disconnection must follow capture")
+    synced_at = _utc_string(sync.get("synced_at"), "frozen-state W&B synced_at")
+    if synced_at < disconnected_at:
+        raise ValidationError("frozen-state W&B sync predates serial disconnection")
     expected_sync_binding = {
         "setup_id": capture["setup_id"],
         "state_sha256": state_sha,
@@ -683,6 +750,24 @@ def _load_frozen_state(
         "wandb": capture["wandb"],
     }
     return state_vector, binding, (state_path, capture_path, sync_path)
+
+
+def _existing_directory(path: str | Path, *, label: str) -> Path:
+    """Return one existing directory without following symlink components."""
+
+    candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except OSError as exc:
+            raise ValidationError(f"{label} does not exist: {candidate}") from exc
+        if stat.S_ISLNK(mode):
+            raise ValidationError(f"symlink path is forbidden for {label}: {current}")
+    if not stat.S_ISDIR(candidate.lstat().st_mode):
+        raise ValidationError(f"{label} is not a directory: {candidate}")
+    return candidate
 
 
 def _verification_wandb_config(
@@ -857,7 +942,9 @@ class _VideoPairRecorder:
         try:
             self._queue.put_nowait(pair)
         except queue.Full as exc:
-            raise ValidationError("shadow video queue saturated; evidence would be incomplete") from exc
+            raise ValidationError(
+                "shadow video queue saturated; evidence would be incomplete"
+            ) from exc
 
     def close(self) -> None:
         if self._closed:
@@ -871,7 +958,9 @@ class _VideoPairRecorder:
         if self._thread.is_alive():
             raise ValidationError("shadow video encoder did not stop within 60 seconds")
         if self._failure is not None:
-            raise ValidationError(f"shadow video encoder failed: {self._failure}") from self._failure
+            raise ValidationError(
+                f"shadow video encoder failed: {self._failure}"
+            ) from self._failure
 
     def _worker(self) -> None:
         containers: dict[str, Any] = {}
@@ -1007,6 +1096,123 @@ def _safe_output_directory(path: str | Path) -> Path:
             raise ValidationError(f"output path component is not a directory: {current}")
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
+
+
+def _require_external_root(
+    path: str | Path,
+    *,
+    repo_root: str | Path,
+    label: str,
+) -> None:
+    """Keep generated evidence out of the reviewed Git worktree."""
+
+    candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    repository = Path(os.path.abspath(os.path.expanduser(os.fspath(repo_root))))
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect {label} root {current}: {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise ValidationError(f"symlink path is forbidden for {label} root: {current}")
+        if not stat.S_ISDIR(mode):
+            raise ValidationError(f"{label} root component is not a directory: {current}")
+    try:
+        candidate.relative_to(repository)
+    except ValueError:
+        return
+    raise ValidationError(f"{label} root must be outside the Repo-A worktree: {candidate}")
+
+
+def _require_current_identity(
+    repo_root: str | Path,
+    expected: viola_handoff.RuntimeIdentity,
+) -> None:
+    """Fail if Repo A or its required runtime changed during evidence production."""
+
+    current = viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repo_root)
+    _require_pc_a_identity(current)
+    if current != expected:
+        raise ValidationError(
+            "Repo-A revision or runtime identity changed during policy evidence production"
+        )
+
+
+def _require_current_candidate(
+    bundle: str | Path,
+    expected: AcceptedPolicyCandidate,
+    *,
+    handoff_root: str | Path,
+) -> None:
+    """Reinspect local bytes and prove the canonical candidate is still active."""
+
+    current = inspect_candidate(bundle)
+    if (
+        current.bundle_id != expected.bundle_id
+        or current.content_id != expected.content_id
+        or dict(current.runtime_binding) != dict(expected.runtime_binding)
+    ):
+        raise ValidationError("accepted policy candidate changed during evidence production")
+    try:
+        viola_handoff.require_active_canonical_source(
+            current.bundle,
+            handoff_root=handoff_root,
+            expected_kind="policy_candidate",
+            required_permission="disconnected_only",
+        )
+    except viola_handoff.HandoffError as exc:
+        raise ValidationError(
+            f"canonical policy candidate is unavailable, changed, or revoked: {exc}"
+        ) from exc
+
+
+def _snapshot_evidence_roots(
+    roots: Mapping[str, str | Path],
+) -> tuple[_EvidenceRootSnapshot, ...]:
+    """Capture exact directory identities and inventories without following links."""
+
+    snapshots: list[_EvidenceRootSnapshot] = []
+    for label, raw_path in roots.items():
+        path = Path(os.path.abspath(os.path.expanduser(os.fspath(raw_path))))
+        try:
+            before = path.lstat()
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect {label} root {path}: {exc}") from exc
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise ValidationError(f"{label} root must be a nonsymlink directory: {path}")
+        try:
+            inventory = viola_handoff.inventory_root(path)
+            after = path.lstat()
+        except (OSError, viola_handoff.HandoffError) as exc:
+            raise ValidationError(f"cannot inventory {label} root {path}: {exc}") from exc
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValidationError(f"{label} root changed while it was inventoried")
+        snapshots.append(
+            _EvidenceRootSnapshot(
+                label=label,
+                path=path,
+                device=before.st_dev,
+                inode=before.st_ino,
+                inventory=inventory,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _require_evidence_snapshot(
+    expected: tuple[_EvidenceRootSnapshot, ...],
+) -> None:
+    """Fail if a publication callback changed or replaced evidence material."""
+
+    current = _snapshot_evidence_roots(
+        {snapshot.label: snapshot.path for snapshot in expected}
+    )
+    if current != expected:
+        raise ValidationError("policy evidence changed during online publication or sealing")
 
 
 def _repo_identity(identity: viola_handoff.RuntimeIdentity) -> dict[str, Any]:

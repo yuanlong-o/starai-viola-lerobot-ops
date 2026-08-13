@@ -255,6 +255,7 @@ def execute_phase(
     evidence_factory: EvidenceFactory,
     operator: TrialOperator,
     safety_monitor: SafetyMonitor,
+    revalidate_authority: Callable[[], None],
     clock: Callable[[], float] = time.perf_counter,
     clock_ns: Callable[[], int] = time.perf_counter_ns,
     sleep: Callable[[float], None] = time.sleep,
@@ -304,6 +305,11 @@ def execute_phase(
         for index, condition in enumerate(conditions):
             trial_id = f"{permit.session_id}-{permit.phase}-{index + 1:02d}"
             operator.prepare_trial(permit.session_id, trial_id, condition.to_dict())
+            # START is the operator's final, trial-specific action.  Authority
+            # may have changed while the model loaded, the workspace was reset,
+            # or a previous trial was reviewed, so reopen it before this trial
+            # can reset the runtime, allocate evidence, or reach the robot.
+            revalidate_authority()
             runtime.reset()
             recorder = evidence_factory.start_trial(trial_id)
             try:

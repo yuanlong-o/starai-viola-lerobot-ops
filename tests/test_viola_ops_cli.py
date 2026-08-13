@@ -266,9 +266,51 @@ def test_capture_passes_only_backend_interactive_confirmation(
     assert name == "capture_frozen_state"
     assert positional == (Path("/setup.json"),)
     assert keywords["confirm"] is backends.confirmation
+    assert keywords["upload_only"] is False
     assert keywords["operator"] == "operator-a"
     assert keywords["wandb_entity"] == "entity"
     assert "Frozen state captured" in capsys.readouterr().out
+
+
+def test_capture_upload_only_skips_interactive_confirmation_backend(
+    backends: Backends, capsys
+) -> None:
+    delattr(backends.modules["setup"], "interactive_confirmation")
+    assert (
+        cli.main(
+            [
+                "setup",
+                "capture-frozen-state",
+                "--setup",
+                "/setup.json",
+                "--output-root",
+                "/evidence",
+                "--operator",
+                "operator-a",
+                "--repo-root",
+                "/repo",
+                "--wandb-entity",
+                "entity",
+                "--upload-only",
+            ]
+        )
+        == 0
+    )
+    name, positional, keywords = backends.calls[0]
+    assert name == "capture_frozen_state"
+    assert positional == (Path("/setup.json"),)
+    assert keywords["upload_only"] is True
+    assert keywords["confirm"] is None
+    assert "Status: captured" in capsys.readouterr().out
+
+
+def test_capture_help_explains_hardware_free_upload_recovery(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["setup", "capture-frozen-state", "--help"])
+    assert stopped.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert "--upload-only" in output
+    assert "never confirm or open serial hardware" in output
 
 
 def test_policy_verify_delegates_to_disconnected_backend(backends: Backends, capsys) -> None:

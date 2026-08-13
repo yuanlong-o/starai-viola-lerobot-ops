@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ DEFAULT_WANDB_PROJECT: Final = "starai-viola-policy-benchmark"
 DEFAULT_MATERIAL_ROOT: Final = Path(
     "/mnt/nas02/yz/starai/producer-materials/v1"
 )
+
+_FULL_GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_PYTHON_312: Final = re.compile(r"^3\.12(?:\.\d+)?$")
 
 RELEASE_ID: Final = "viola-cubes-right-to-left-blue-then-red-v1--31cf41385cd9e183"
 DATASET_REPO_ID: Final = "bourn117/viola_cubes_right_to_left_blue_then_red_train_v1"
@@ -447,6 +451,14 @@ def release_dataset(
 ) -> DatasetReleaseResult:
     """Run full validation and seal Repo B's current-v1 dataset release."""
 
+    repository = _existing_directory(repo_root, label="Repo-A worktree")
+    material_base = _external_output_root(
+        material_root, repository=repository, label="producer material root"
+    )
+    handoff_base = _external_output_root(
+        handoff_root, repository=repository, label="handoff root"
+    )
+
     expected = spec or CURRENT_DATASET
     checked = validation or validate_dataset(
         root,
@@ -465,13 +477,17 @@ def release_dataset(
     if viola_handoff.inventory_root(dataset_root) != expected.expected_inventory():
         raise ValidationError("dataset changed after validation and before release")
 
-    identity = producer_identity or viola_handoff.RuntimeIdentity.capture(
-        role="pc_a", repo_root=repo_root
+    identity_was_captured = producer_identity is None
+    identity = _producer_identity(
+        producer_identity
+        or viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repository)
     )
-    if identity.role != "pc_a":
-        raise ValidationError("dataset releases must use a pc_a producer identity")
 
-    material = _safe_output_directory(material_root) / expected.release_id / checked.evidence_sha256
+    material = _safe_output_directory(
+        material_base / expected.release_id / checked.evidence_sha256,
+        repository=repository,
+        label="producer material directory",
+    )
     payload = material / "payload"
     validation_evidence = checked.as_dict()
     write_canonical_json(payload / "validation_evidence.json", validation_evidence)
@@ -479,8 +495,13 @@ def release_dataset(
     write_canonical_json(payload / "dataset_release.json", release_payload)
     write_text_once(payload / "SUMMARY.md", _release_summary(expected, checked))
 
+    if viola_handoff.inventory_root(dataset_root) != expected.expected_inventory():
+        raise ValidationError("dataset changed immediately before release sealing")
+    if identity_was_captured:
+        _require_same_runtime(identity, repo_root=repository)
+
     request = viola_handoff.SealRequest(
-        root=handoff_root,
+        root=handoff_base,
         kind="dataset_release",
         experiment=experiment,
         subject=expected.release_id,
@@ -736,7 +757,42 @@ def _dataset_directory(path: str | Path) -> Path:
     return candidate
 
 
-def _safe_output_directory(path: str | Path) -> Path:
+def _existing_directory(path: str | Path, *, label: str) -> Path:
+    candidate = _path_without_symlinks(path, label=label, must_exist=True)
+    if not stat.S_ISDIR(candidate.lstat().st_mode):
+        raise ValidationError(f"{label} is not a directory: {candidate}")
+    return candidate
+
+
+def _external_output_root(
+    path: str | Path,
+    *,
+    repository: Path,
+    label: str,
+) -> Path:
+    candidate = _path_without_symlinks(path, label=label, must_exist=False)
+    if candidate == repository or repository in candidate.parents:
+        raise ValidationError(f"{label} must be outside the Repo-A worktree")
+    return candidate
+
+
+def _safe_output_directory(
+    path: str | Path,
+    *,
+    repository: Path,
+    label: str,
+) -> Path:
+    candidate = _external_output_root(path, repository=repository, label=label)
+    candidate.mkdir(parents=True, exist_ok=True)
+    return _existing_directory(candidate, label=label)
+
+
+def _path_without_symlinks(
+    path: str | Path,
+    *,
+    label: str,
+    must_exist: bool,
+) -> Path:
     candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
     current = Path(candidate.anchor)
     for part in candidate.parts[1:]:
@@ -744,13 +800,54 @@ def _safe_output_directory(path: str | Path) -> Path:
         try:
             mode = current.lstat().st_mode
         except FileNotFoundError:
+            if must_exist:
+                raise ValidationError(f"{label} does not exist: {candidate}") from None
             break
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect {label} {candidate}: {exc}") from exc
         if stat.S_ISLNK(mode):
-            raise ValidationError(f"symlink output path is forbidden: {current}")
+            raise ValidationError(f"symlink path is forbidden for {label}: {current}")
         if not stat.S_ISDIR(mode):
-            raise ValidationError(f"output path component is not a directory: {current}")
-    candidate.mkdir(parents=True, exist_ok=True)
+            raise ValidationError(f"{label} path component is not a directory: {current}")
     return candidate
+
+
+def _producer_identity(
+    identity: viola_handoff.RuntimeIdentity,
+) -> viola_handoff.RuntimeIdentity:
+    """Validate injected identities before any producer evidence is written."""
+
+    if not isinstance(identity, viola_handoff.RuntimeIdentity):
+        raise ValidationError("producer identity must be a RuntimeIdentity")
+    if identity.role != "pc_a":
+        raise ValidationError("dataset releases must use a pc_a producer identity")
+    if identity.repository_clean is not True:
+        raise ValidationError("dataset releases require a clean Repo-A identity")
+    if _FULL_GIT_SHA.fullmatch(identity.repository_commit) is None:
+        raise ValidationError("producer repository commit must be a full lowercase Git SHA")
+    if not identity.hostname:
+        raise ValidationError("producer hostname must be nonempty")
+    if _PYTHON_312.fullmatch(identity.python_version) is None:
+        raise ValidationError("dataset releases require Python 3.12")
+    if identity.lerobot_version != "0.6.1":
+        raise ValidationError("dataset releases require LeRobot 0.6.1")
+    if identity.conda_environment != "lerobot":
+        raise ValidationError("dataset releases require the lerobot Conda environment")
+    return identity
+
+
+def _require_same_runtime(
+    original: viola_handoff.RuntimeIdentity,
+    *,
+    repo_root: Path,
+) -> None:
+    current = _producer_identity(
+        viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repo_root)
+    )
+    if current != original:
+        raise ValidationError(
+            "Repo-A commit or runtime identity changed before release sealing"
+        )
 
 
 def _require_lerobot_061() -> None:

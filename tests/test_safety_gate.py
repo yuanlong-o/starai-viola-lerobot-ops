@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import viola_ops.safety as safety
+from viola_handoff import RuntimeIdentity
 from viola_ops.errors import SafetyGateError
 from viola_ops.safety import (
     CANONICAL_TASK,
@@ -20,6 +21,7 @@ from viola_ops.safety import (
     check_phase_predecessors,
     check_session_shape,
     operator_challenge,
+    revalidate_motion,
     validate_action,
 )
 
@@ -363,6 +365,12 @@ def _stub_authorization_dependencies(
                 for joint in JOINTS
             },
             max_step_deltas={joint: 4.0 for joint in JOINTS},
+            executor_identity={
+                "repository_commit": session_payload["executor"]["repository_commit"],
+                "python_version": "3.12.13",
+                "lerobot_version": "0.6.1",
+                "conda_environment": "lerobot",
+            },
         ),
     )
     return session_bundle, candidate_bundle
@@ -392,6 +400,101 @@ def test_motion_gate_requires_the_exact_tty_challenge(
     permit = authorize_motion(request, input_stream=exact, terminal_check=lambda _stream: True)
     assert permit.allows(session_id="session-1", phase="hold", trial="commissioning")
     assert exact.closed is False
+
+
+def test_final_revalidation_reopens_every_authority_and_exact_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    session, candidate = _stub_authorization_dependencies(monkeypatch, now)
+    request = GateRequest(
+        session_bundle=Path("session"),
+        candidate_bundle=Path("candidate"),
+        phase="hold",
+        trial="commissioning",
+        repository_root=Path.cwd(),
+        handoff_root=Path("handoffs"),
+        now=now,
+    )
+    permit = authorize_motion(
+        request,
+        input_stream=_ChallengeStream("ARM session-1 hold commissioning\n"),
+        terminal_check=lambda _stream: True,
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        safety,
+        "check_phase_predecessors",
+        lambda *_args, **_kwargs: events.append("predecessors"),
+    )
+    monkeypatch.setattr(
+        safety,
+        "require_active_canonical_source",
+        lambda bundle, **_kwargs: events.append(
+            "active-session" if bundle is session else "active-candidate"
+        ),
+    )
+    monkeypatch.setattr(
+        safety,
+        "check_estop_freshness",
+        lambda *_args: events.append("estop"),
+    )
+    monkeypatch.setattr(
+        safety,
+        "check_current_checkout",
+        lambda *_args: events.append("checkout"),
+    )
+    identity = RuntimeIdentity(
+        role="pc_a",
+        repository_commit="7" * 40,
+        repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.13",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
+    )
+
+    assert revalidate_motion(request, permit, identity=identity) == (session, candidate)
+    assert events == [
+        "predecessors",
+        "active-session",
+        "active-candidate",
+        "estop",
+        "checkout",
+    ]
+
+
+def test_final_revalidation_rejects_runtime_different_from_signed_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    _stub_authorization_dependencies(monkeypatch, now)
+    request = GateRequest(
+        session_bundle=Path("session"),
+        candidate_bundle=Path("candidate"),
+        phase="hold",
+        trial="commissioning",
+        repository_root=Path.cwd(),
+        handoff_root=Path("handoffs"),
+        now=now,
+    )
+    permit = authorize_motion(
+        request,
+        input_stream=_ChallengeStream("ARM session-1 hold commissioning\n"),
+        terminal_check=lambda _stream: True,
+    )
+    wrong_runtime = RuntimeIdentity(
+        role="pc_a",
+        repository_commit="7" * 40,
+        repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.12",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
+    )
+
+    with pytest.raises(SafetyGateError, match="differs from the signed reviewed executor"):
+        revalidate_motion(request, permit, identity=wrong_runtime)
 
 
 def test_scored_gate_rejects_a_spliced_hold_shakedown_chain(

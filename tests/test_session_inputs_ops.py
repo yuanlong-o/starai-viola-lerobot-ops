@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 
 import viola_handoff
+import viola_ops.session_inputs as session_inputs_ops
 from viola_ops.errors import ValidationError
 from viola_ops.jsonutil import sha256_file, sha256_json
 from viola_ops.schemas import EXECUTOR_CAPABILITIES, VIOLA_JOINTS
@@ -35,6 +37,12 @@ def _identity() -> viola_handoff.RuntimeIdentity:
         lerobot_version="0.6.1",
         conda_environment="lerobot",
     )
+
+
+def _repo_root(tmp_path: Path) -> Path:
+    repository = tmp_path / "repo-a"
+    repository.mkdir()
+    return repository
 
 
 def _write_setup(tmp_path: Path, *, tested_at: datetime | None = None) -> Path:
@@ -121,7 +129,7 @@ def test_session_inputs_are_readable_and_repo_b_compatible(tmp_path: Path) -> No
         material_root=tmp_path / "producer-materials",
         destination_root=receiver,
         wandb_project="viola-interop-test",
-        repo_root=tmp_path,
+        repo_root=_repo_root(tmp_path),
         producer_identity=_identity(),
         evidence_logger=evidence,
     )
@@ -178,7 +186,7 @@ def test_cross_repo_probe_can_replace_capture_and_seal_calls(
         material_root=tmp_path / "producer-materials",
         destination_root=tmp_path / "accepted",
         wandb_project="viola-interop-test",
-        repo_root=tmp_path,
+        repo_root=_repo_root(tmp_path),
     )
 
     assert result.bundle.bundle_id == result.bundle.content_id
@@ -221,3 +229,229 @@ def test_executor_capability_order_is_locked_to_repo_b_contract() -> None:
         "ten_action_queue",
         "torque_retained_on_disconnect",
     )
+
+
+@pytest.mark.parametrize("protected_root", ["material", "handoff"])
+def test_session_inputs_require_external_producer_roots(
+    tmp_path: Path,
+    protected_root: str,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    repository = _repo_root(tmp_path)
+    material_root = tmp_path / "producer-materials"
+    handoff_root = tmp_path / "handoffs"
+    if protected_root == "material":
+        material_root = repository / "producer-materials"
+    else:
+        handoff_root = repository / "handoffs"
+
+    with pytest.raises(ValidationError, match="outside the Repo-A worktree"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=handoff_root,
+            material_root=material_root,
+            repo_root=repository,
+            producer_identity=_identity(),
+            evidence_logger=FakeEvidence(),
+        )
+
+    assert not material_root.exists()
+    assert not handoff_root.exists()
+
+
+@pytest.mark.parametrize("protected_root", ["material", "handoff"])
+def test_session_inputs_reject_symlinked_producer_roots(
+    tmp_path: Path,
+    protected_root: str,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    repository = _repo_root(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    linked = tmp_path / "linked-external"
+    linked.symlink_to(external, target_is_directory=True)
+    material_root = tmp_path / "producer-materials"
+    handoff_root = tmp_path / "handoffs"
+    if protected_root == "material":
+        material_root = linked / "producer-materials"
+    else:
+        handoff_root = linked / "handoffs"
+
+    with pytest.raises(ValidationError, match="symlink path is forbidden"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=handoff_root,
+            material_root=material_root,
+            repo_root=repository,
+            producer_identity=_identity(),
+            evidence_logger=FakeEvidence(),
+        )
+
+
+def test_session_inputs_reject_a_symlink_inside_the_material_path(tmp_path: Path) -> None:
+    setup_path = _write_setup(tmp_path)
+    material_root = tmp_path / "producer-materials"
+    material_root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (material_root / "cross-repo-setup-v1").symlink_to(
+        elsewhere,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(ValidationError, match="symlink path is forbidden"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=tmp_path / "handoffs",
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            evidence_logger=FakeEvidence(),
+        )
+
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"role": "pc_b"}, "pc_a"),
+        ({"repository_clean": False}, "clean Repo-A"),
+        ({"repository_commit": "A" * 40}, "full lowercase Git SHA"),
+        ({"python_version": "3.11.9"}, "Python 3.12"),
+        ({"lerobot_version": "0.5.0"}, "LeRobot 0.6.1"),
+        ({"conda_environment": "base"}, "lerobot Conda"),
+    ],
+)
+def test_session_inputs_validate_injected_identity_before_writing(
+    tmp_path: Path,
+    changes: dict[str, Any],
+    message: str,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    material_root = tmp_path / "producer-materials"
+
+    with pytest.raises(ValidationError, match=message):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=tmp_path / "handoffs",
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=replace(_identity(), **changes),
+            evidence_logger=FakeEvidence(),
+        )
+
+    assert not material_root.exists()
+
+
+def test_session_inputs_recapture_the_clean_runtime_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    identities = iter([_identity(), replace(_identity(), repository_commit="b" * 40)])
+    monkeypatch.setattr(
+        viola_handoff.RuntimeIdentity,
+        "capture",
+        classmethod(lambda cls, **kwargs: next(identities)),
+    )
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="changed before session-input sealing"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=tmp_path / "handoffs",
+            material_root=tmp_path / "producer-materials",
+            repo_root=_repo_root(tmp_path),
+            evidence_logger=evidence,
+        )
+
+    assert evidence.events == []
+    assert not (tmp_path / "handoffs").exists()
+
+
+def test_session_inputs_recheck_reviewed_sources_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    setup = json.loads(setup_path.read_text())
+    calibration = Path(setup["calibration_path"])
+    real_write = session_inputs_ops.write_canonical_json
+
+    def write_then_change_source(path: str | Path, value: Any) -> Path:
+        written = real_write(path, value)
+        if Path(path).name == "session_inputs.json":
+            calibration.write_text('{"calibration":"changed"}\n', encoding="utf-8")
+        return written
+
+    monkeypatch.setattr(
+        session_inputs_ops,
+        "write_canonical_json",
+        write_then_change_source,
+    )
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="calibration_sha256"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=tmp_path / "handoffs",
+            material_root=tmp_path / "producer-materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            evidence_logger=evidence,
+        )
+
+    assert evidence.events == []
+    assert not (tmp_path / "handoffs").exists()
+
+
+def test_session_inputs_recheck_setup_record_inventory_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_path = _write_setup(tmp_path)
+    material_root = tmp_path / "producer-materials"
+    real_write = session_inputs_ops.write_canonical_json
+
+    def write_then_change_copy(path: str | Path, value: Any) -> Path:
+        written = real_write(path, value)
+        if Path(path).name == "session_inputs.json":
+            copied = next(material_root.rglob("setup_record/calibration.json"))
+            os.chmod(copied, 0o644)
+            copied.write_text('{"calibration":"changed-copy"}\n', encoding="utf-8")
+        return written
+
+    monkeypatch.setattr(
+        session_inputs_ops,
+        "write_canonical_json",
+        write_then_change_copy,
+    )
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="setup-record inventory changed"):
+        seal_session_inputs(
+            setup_path,
+            experiment="test",
+            subject="cross-repo-setup-v1",
+            handoff_root=tmp_path / "handoffs",
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            evidence_logger=evidence,
+        )
+
+    assert evidence.events == []
+    assert not (tmp_path / "handoffs").exists()

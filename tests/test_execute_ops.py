@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import builtins
+import fcntl
 import json
+import os
+import pty
+import tty
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +60,10 @@ def _identity() -> SimpleNamespace:
         role="pc_a",
         repository_commit="d" * 40,
         repository_clean=True,
+        hostname="pc-a",
+        python_version="3.12.13",
+        lerobot_version="0.6.1",
+        conda_environment="lerobot",
     )
 
 
@@ -95,6 +103,14 @@ def _stub_pre_hardware_checks(
         "inspect_candidate",
         lambda _path: order.append("candidate-inspect") or candidate,
     )
+    monkeypatch.setattr(
+        execute_ops,
+        "revalidate_motion",
+        lambda *_args, **_kwargs: (
+            order.append("final-revalidate") or session,
+            candidate.bundle,
+        ),
+    )
 
 
 def _execute(tmp_path: Path, *, publisher):
@@ -111,6 +127,54 @@ def _execute(tmp_path: Path, *, publisher):
         wandb_entity="test-entity",
         intent_publisher=publisher,
     )
+
+
+def test_operator_poll_buffers_partial_pty_input_without_blocking() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty.setraw(slave_fd)
+    terminal = execute_ops._OperatorTerminal(os.ttyname(slave_fd))
+    os.close(slave_fd)
+    operator = execute_ops.InteractiveTrialOperator.__new__(
+        execute_ops.InteractiveTrialOperator
+    )
+    operator._terminal = terminal
+    operator._pending_event = None
+    operator._input_buffer = bytearray()
+    original_flags = fcntl.fcntl(terminal.fileno(), fcntl.F_GETFL)
+    try:
+        os.write(master_fd, b"COLL")
+        assert operator.abort_requested() is False
+        assert operator.event() is None
+        assert bytes(operator._input_buffer) == b"COLL"
+        assert fcntl.fcntl(terminal.fileno(), fcntl.F_GETFL) == original_flags
+
+        os.write(master_fd, b"ISION\n")
+        assert operator.event() == "collision"
+        assert operator._input_buffer == bytearray()
+        assert fcntl.fcntl(terminal.fileno(), fcntl.F_GETFL) == original_flags
+    finally:
+        operator.close()
+        os.close(master_fd)
+
+
+def test_trial_condition_prompt_is_plain_language() -> None:
+    rendered = execute_ops._render_trial_condition(
+        {
+            "condition_id": "robustness_01",
+            "stratum": "robustness",
+            "blue_axis": "pad_x",
+            "blue_offset_mm": -25.0,
+            "red_axis": "pad_y",
+            "red_offset_mm": 25.0,
+        }
+    )
+
+    assert rendered.splitlines() == [
+        "  Condition: robustness_01 (robustness)",
+        "  Blue cube: -25 mm along pad_x",
+        "  Red cube: +25 mm along pad_y",
+    ]
+    assert "{" not in rendered
 
 
 def test_gate_failure_prevents_identity_intent_and_hardware(
@@ -203,6 +267,8 @@ def test_finished_intent_receipt_exists_before_hardware_module_import(
         "session-inspect",
         "candidate-inspect",
         "intent",
+        "identity",
+        "final-revalidate",
         "hardware-import",
         "failure",
     ]
@@ -220,6 +286,168 @@ def test_finished_intent_receipt_exists_before_hardware_module_import(
     assert receipt["binding"]["session_id"] == "session-1"
     assert receipt["binding"]["phase"] == "hold"
     assert receipt["wandb"]["url"].startswith("https://wandb.ai/")
+
+
+def test_final_revalidation_failure_records_and_recovers_without_hardware(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    imports: list[str] = []
+    jobs: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+
+    def revoked(*_args, **_kwargs):
+        order.append("final-revalidate")
+        raise SafetyGateError("candidate was revoked after operator authorization")
+
+    def publish(run, **kwargs):
+        jobs.append(kwargs["job_type"])
+        order.append(kwargs["job_type"])
+        return run
+
+    original_import = builtins.__import__
+
+    def record_import(name, globals=None, locals=None, fromlist=(), level=0):
+        imports.append(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(execute_ops, "revalidate_motion", revoked)
+    monkeypatch.setattr(builtins, "__import__", record_import)
+    outcome = _execute(tmp_path, publisher=publish)
+
+    assert outcome.status == "execution_failed_not_ready"
+    assert jobs == [
+        "viola-policy-execution-intent",
+        "viola-policy-execution-failure",
+    ]
+    assert order[-4:] == [
+        "viola-policy-execution-intent",
+        "identity",
+        "final-revalidate",
+        "viola-policy-execution-failure",
+    ]
+    assert "hardware" not in imports
+    assert "viola_ops.hardware" not in imports
+    marker = json.loads(
+        (outcome.material_root / "EXECUTION_FAILURE.json").read_text(encoding="utf-8")
+    )
+    assert marker["stage"] == "final_revalidation"
+    assert marker["hardware_may_have_connected"] is False
+    receipt = outcome.material_root / "EXECUTION_FAILURE_WANDB_SYNCED.json"
+    assert receipt.is_file()
+    receipt_bytes = receipt.read_bytes()
+
+    retry = _execute(tmp_path, publisher=publish)
+    assert retry.status == "execution_failed_not_ready"
+    assert jobs == [
+        "viola-policy-execution-intent",
+        "viola-policy-execution-failure",
+        "viola-policy-execution-intent",
+        "viola-policy-execution-failure",
+    ]
+    assert receipt.read_bytes() == receipt_bytes
+    assert "hardware" not in imports
+    assert "viola_ops.hardware" not in imports
+
+
+def test_post_start_callback_revalidates_and_blocks_before_motion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    jobs: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    checks = 0
+
+    def revoke_after_start(*_args, **_kwargs):
+        nonlocal checks
+        checks += 1
+        order.append(f"revalidate-{checks}")
+        if checks == 3:
+            raise SafetyGateError("session revoked after START")
+        return _accepted_material()[0], _accepted_material()[1].bundle
+
+    class Operator:
+        def close(self) -> None:
+            order.append("operator-close")
+
+    def publish(run, **kwargs):
+        jobs.append(kwargs["job_type"])
+        return run
+
+    monkeypatch.setattr(execute_ops, "revalidate_motion", revoke_after_start)
+    monkeypatch.setattr(execute_ops, "InteractiveTrialOperator", Operator)
+    import viola_ops.execution as execution
+
+    def simulate_successful_start(*_args, **kwargs):
+        order.append("start")
+        kwargs["revalidate_authority"]()
+        order.append("motion")
+        pytest.fail("motion reached after revocation")
+
+    monkeypatch.setattr(
+        execution,
+        "execute_phase",
+        simulate_successful_start,
+    )
+
+    outcome = _execute(tmp_path, publisher=publish)
+    marker = json.loads(
+        (outcome.material_root / "EXECUTION_FAILURE.json").read_text(encoding="utf-8")
+    )
+    assert marker["stage"] == "execution_revalidation"
+    assert marker["hardware_may_have_connected"] is True
+    assert marker["motion_may_have_started"] is True
+    assert checks == 3
+    assert order.index("start") < order.index("revalidate-3")
+    assert "motion" not in order
+    assert order[-1] == "operator-close"
+    assert jobs == [
+        "viola-policy-execution-intent",
+        "viola-policy-execution-failure",
+    ]
+
+
+def test_replaced_evidence_root_cannot_redirect_failure_writes_into_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    imports: list[str] = []
+    jobs: list[str] = []
+    _stub_pre_hardware_checks(monkeypatch, order)
+    captures = 0
+
+    def capture(**_kwargs):
+        nonlocal captures
+        captures += 1
+        if captures == 2:
+            evidence = tmp_path / "evidence"
+            evidence.rename(tmp_path / "preserved-evidence")
+            evidence.symlink_to(tmp_path / "repo", target_is_directory=True)
+        return _identity()
+
+    def publish(run, **kwargs):
+        jobs.append(kwargs["job_type"])
+        return run
+
+    original_import = builtins.__import__
+
+    def record_import(name, globals=None, locals=None, fromlist=(), level=0):
+        imports.append(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(
+        execute_ops,
+        "RuntimeIdentity",
+        SimpleNamespace(capture=capture),
+    )
+    monkeypatch.setattr(builtins, "__import__", record_import)
+    with pytest.raises(ValidationError, match="symlink path is forbidden"):
+        _execute(tmp_path, publisher=publish)
+
+    assert jobs == ["viola-policy-execution-intent"]
+    assert "hardware" not in imports
+    assert "viola_ops.hardware" not in imports
+    assert not list((tmp_path / "repo").rglob("EXECUTION_FAILURE.json"))
 
 
 def test_support_import_failure_after_intent_is_recoverable_terminal_evidence(
@@ -281,6 +509,62 @@ def test_evidence_root_inside_checkout_is_rejected_before_gate(
             repo_root=repo,
             handoff_root=tmp_path / "handoffs",
             evidence_root=repo / "evidence",
+            wandb_entity="test-entity",
+        )
+    assert called is False
+
+
+def test_handoff_root_that_can_dirty_checkout_is_rejected_before_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    called = False
+
+    def gate(_request):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(execute_ops, "authorize_motion", gate)
+    with pytest.raises(ValidationError, match="live handoff_root.*outside"):
+        execute_ops.execute_command(
+            Path("session"),
+            candidate=Path("candidate"),
+            phase="hold",
+            trial="commissioning",
+            repo_root=repo,
+            handoff_root=repo / "handoffs",
+            evidence_root=tmp_path / "evidence",
+            wandb_entity="test-entity",
+        )
+    assert called is False
+
+
+def test_symlinked_live_root_is_rejected_before_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = tmp_path / "external"
+    target.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+    called = False
+
+    def gate(_request):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(execute_ops, "authorize_motion", gate)
+    with pytest.raises(ValidationError, match="symlink path is forbidden"):
+        execute_ops.execute_command(
+            Path("session"),
+            candidate=Path("candidate"),
+            phase="hold",
+            trial="commissioning",
+            repo_root=repo,
+            handoff_root=tmp_path / "handoffs",
+            evidence_root=linked / "rollout",
             wandb_entity="test-entity",
         )
     assert called is False

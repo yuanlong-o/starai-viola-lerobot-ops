@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -343,7 +344,23 @@ def test_runtime_loader_uses_public_lerobot_factories_and_local_dependencies(
 
 
 @pytest.mark.parametrize("token", POLICY_TOKENS)
-def test_inspect_candidate_accepts_exact_receiver_local_bundle(tmp_path: Path, token: str) -> None:
+@pytest.mark.parametrize(
+    ("qualification", "valid_checkpoint_lineage", "error_match"),
+    (
+        ("current_release_bound", True, None),
+        ("legacy_hash_bound", True, None),
+        ("qualified", True, "training qualification"),
+        ("current_release_bound", False, "checkpoint evaluation hash"),
+    ),
+    ids=("current", "legacy", "unknown-qualification", "wrong-evaluation-checkpoint"),
+)
+def test_inspect_candidate_enforces_receiver_local_lineage(
+    tmp_path: Path,
+    token: str,
+    qualification: str,
+    valid_checkpoint_lineage: bool,
+    error_match: str | None,
+) -> None:
     checkpoint = tmp_path / f"checkpoint-{token}"
     checkpoint.mkdir()
     spec = get_policy_spec(token)
@@ -377,7 +394,7 @@ def test_inspect_candidate_accepts_exact_receiver_local_bundle(tmp_path: Path, t
 
     dataset_manifest = "1" * 64
     training = {
-        "qualification": "qualified",
+        "qualification": qualification,
         "run_id": f"train-{token}",
         "repository_commit": "2" * 40,
         "training_config_sha256": _sha256(checkpoint / "config.json"),
@@ -402,6 +419,7 @@ def test_inspect_candidate_accepts_exact_receiver_local_bundle(tmp_path: Path, t
     replay_path = payload_root / "replay_manifest.json"
     replay_path.write_bytes(canonical_json_bytes(replay_payload))
     checkpoint_inventory = inventory_root(checkpoint)["inventory_sha256"]
+    checkpoint_evaluation_sha256 = _repo_b_checkpoint_sha256(checkpoint)
     candidate_payload = {
         "schema_version": 1,
         "policy": token,
@@ -426,7 +444,9 @@ def test_inspect_candidate_accepts_exact_receiver_local_bundle(tmp_path: Path, t
         "evaluation_wandb_run_id": f"eval-{token}",
         "training_wandb_run_id": f"train-{token}",
         "checkpoint_inventory_sha256": checkpoint_inventory,
-        "checkpoint_evaluation_sha256": "4" * 64,
+        "checkpoint_evaluation_sha256": (
+            checkpoint_evaluation_sha256 if valid_checkpoint_lineage else "4" * 64
+        ),
         "training": training,
         "dependency_inventories": {
             name: dependency_payload[name]["inventory_sha256"] for name in spec.dependency_ids
@@ -454,6 +474,11 @@ def test_inspect_candidate_accepts_exact_receiver_local_bundle(tmp_path: Path, t
         receiver=_identity("pc_a", "6" * 40),
         evidence_logger=FakeEvidence(),
     )
+
+    if error_match is not None:
+        with pytest.raises(ValidationError, match=error_match):
+            inspect_candidate(accepted.path)
+        return
 
     candidate = inspect_candidate(accepted.path)
     assert candidate.policy == token
@@ -485,6 +510,26 @@ def _identity(role: str, commit: str) -> RuntimeIdentity:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _repo_b_checkpoint_sha256(root: Path) -> str:
+    """Mirror Repo B's path-independent ``snapshot_inventory`` digest."""
+
+    files = {
+        path.relative_to(root).as_posix(): {
+            "bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+    encoded = json.dumps(
+        files,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _offline_environment() -> dict[str, str | None]:

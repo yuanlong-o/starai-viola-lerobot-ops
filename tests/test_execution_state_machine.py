@@ -173,6 +173,10 @@ class _Monitor:
         return self.value
 
 
+def _allow_authority() -> None:
+    """Stand in for Repo A's full live-authority check in state-machine tests."""
+
+
 def _aborting_trial(*_args, index, trial_id, condition, **_kwargs):
     return TrialResult(
         trial_id=trial_id,
@@ -226,6 +230,7 @@ def test_forged_permit_fails_before_policy_or_hardware_factory() -> None:
             evidence_factory=_EvidenceFactory(),
             operator=_Operator(),
             safety_monitor=_Monitor(),
+            revalidate_authority=lambda: calls.append("authority"),
         )
     assert calls == []
 
@@ -243,12 +248,135 @@ def test_phase_schedule_is_exact_and_teardown_is_guaranteed(phase, expected) -> 
         evidence_factory=_EvidenceFactory(),
         operator=operator,
         safety_monitor=_Monitor(),
+        revalidate_authority=_allow_authority,
         trial_runner=_aborting_trial,
     )
     assert len(result.trials) == expected
     assert len(operator.prepared) == expected
     assert runtime.resets == expected
     assert robot.connects == robot.disconnects == 1
+
+
+def test_each_start_is_followed_by_authority_check_before_trial_work() -> None:
+    events: list[str] = []
+
+    class OrderedRobot(_Robot):
+        def connect(self, calibrate=False):
+            events.append("robot-connect")
+            super().connect(calibrate=calibrate)
+
+        def disconnect(self):
+            events.append("robot-disconnect")
+            super().disconnect()
+
+    class OrderedRuntime(_Runtime):
+        def reset(self):
+            events.append("runtime-reset")
+            super().reset()
+
+    class StartOperator(_Operator):
+        def prepare_trial(self, session_id, trial_id, condition):
+            super().prepare_trial(session_id, trial_id, condition)
+            events.append(f"start:{trial_id}")
+
+    class OrderedEvidenceFactory(_EvidenceFactory):
+        def start_trial(self, trial_id):
+            events.append(f"evidence:{trial_id}")
+            return super().start_trial(trial_id)
+
+    def load_runtime(_candidate):
+        events.append("model-load")
+        return OrderedRuntime()
+
+    def check_authority():
+        events.append("authority")
+
+    def run_trial(*_args, trial_id, **kwargs):
+        events.append(f"trial:{trial_id}")
+        return _aborting_trial(*_args, trial_id=trial_id, **kwargs)
+
+    result = execute_phase(
+        _permit("shakedown"),
+        _candidate(),
+        runtime_factory=load_runtime,
+        robot_factory=lambda _permit: OrderedRobot(),
+        evidence_factory=OrderedEvidenceFactory(),
+        operator=StartOperator(),
+        safety_monitor=_Monitor(),
+        revalidate_authority=check_authority,
+        trial_runner=run_trial,
+    )
+
+    assert result.status == "completed"
+    assert events == [
+        "robot-connect",
+        "model-load",
+        "start:session-1-shakedown-01",
+        "authority",
+        "runtime-reset",
+        "evidence:session-1-shakedown-01",
+        "trial:session-1-shakedown-01",
+        "start:session-1-shakedown-02",
+        "authority",
+        "runtime-reset",
+        "evidence:session-1-shakedown-02",
+        "trial:session-1-shakedown-02",
+        "robot-disconnect",
+    ]
+
+
+@pytest.mark.parametrize("revoked_after_start", [1, 2])
+def test_revoked_authority_after_start_stops_before_more_motion(
+    revoked_after_start: int,
+) -> None:
+    events: list[str] = []
+    robot = _Robot()
+    runtime = _Runtime()
+    evidence = _EvidenceFactory()
+    checks = 0
+
+    class StartOperator(_Operator):
+        def prepare_trial(self, session_id, trial_id, condition):
+            super().prepare_trial(session_id, trial_id, condition)
+            events.append(f"start:{trial_id}")
+
+    def check_authority():
+        nonlocal checks
+        checks += 1
+        events.append(f"authority:{checks}")
+        if checks == revoked_after_start:
+            raise SafetyGateError("live authority was revoked")
+
+    def run_trial(*args, **kwargs):
+        events.append(f"trial:{kwargs['trial_id']}")
+        return _aborting_trial(*args, **kwargs)
+
+    with pytest.raises(SafetyGateError, match="live authority was revoked"):
+        execute_phase(
+            _permit("shakedown"),
+            _candidate(),
+            runtime_factory=lambda _candidate: runtime,
+            robot_factory=lambda _permit: robot,
+            evidence_factory=evidence,
+            operator=StartOperator(),
+            safety_monitor=_Monitor(),
+            revalidate_authority=check_authority,
+            trial_runner=run_trial,
+        )
+
+    completed_trials = revoked_after_start - 1
+    assert runtime.resets == completed_trials
+    assert len(evidence.recorders) == completed_trials
+    assert sum(event.startswith("trial:") for event in events) == completed_trials
+    assert robot.writes == []
+    assert robot.connects == robot.disconnects == 1
+    failed_trial = f"session-1-shakedown-{revoked_after_start:02d}"
+    failed_start = events.index(f"start:{failed_trial}")
+    assert events[failed_start + 1] == f"authority:{revoked_after_start}"
+    assert not any(
+        event in {"runtime-reset", f"evidence:{failed_trial}", f"trial:{failed_trial}"}
+        for event in events[failed_start + 2 :]
+    )
 
 
 def test_phase_stops_after_first_unsafe_trial_and_tears_down() -> None:
@@ -262,6 +390,7 @@ def test_phase_stops_after_first_unsafe_trial_and_tears_down() -> None:
         evidence_factory=_EvidenceFactory(),
         operator=operator,
         safety_monitor=_Monitor(),
+        revalidate_authority=_allow_authority,
         trial_runner=_unsafe_trial,
     )
     assert result.status == "unsafe_shakedown"
@@ -301,6 +430,7 @@ def test_process_control_is_not_masked_by_recorder_or_robot_cleanup() -> None:
             evidence_factory=BrokenEvidenceFactory(),
             operator=_Operator(),
             safety_monitor=_Monitor(),
+            revalidate_authority=_allow_authority,
             trial_runner=interrupt_trial,
         )
 
@@ -322,6 +452,7 @@ def test_motion_permit_is_consumed_after_one_execution_attempt() -> None:
         evidence_factory=_EvidenceFactory(),
         operator=_Operator(),
         safety_monitor=_Monitor(),
+        revalidate_authority=_allow_authority,
     )
     assert first.status == "completed"
     with pytest.raises(SafetyGateError, match="consumed|exactly one"):
@@ -333,6 +464,7 @@ def test_motion_permit_is_consumed_after_one_execution_attempt() -> None:
             evidence_factory=_EvidenceFactory(),
             operator=_Operator(),
             safety_monitor=_Monitor(),
+            revalidate_authority=_allow_authority,
         )
 
 

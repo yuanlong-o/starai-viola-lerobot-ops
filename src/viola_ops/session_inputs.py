@@ -70,6 +70,8 @@ _CAMERA_FIELDS = {"type", "index_or_path", "width", "height", "fps"}
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _HEX_SHA = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40,64}$")
+_FULL_GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_PYTHON_312 = re.compile(r"^3\.12(?:\.\d+)?$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,28 +112,40 @@ def seal_session_inputs(
             f"subject {subject!r} must exactly match setup_id {setup.setup_id!r}"
         )
 
-    identity = producer_identity or viola_handoff.RuntimeIdentity.capture(
-        role="pc_a", repo_root=repo_root
+    repository = _existing_directory(repo_root, label="Repo-A worktree")
+    material_base = _external_output_root(
+        material_root, repository=repository, label="producer material root"
     )
-    if identity.role != "pc_a":
-        raise ValidationError("session inputs must be produced with a pc_a identity")
+    handoff_base = _external_output_root(
+        handoff_root, repository=repository, label="handoff root"
+    )
+    identity_was_captured = producer_identity is None
+    identity = _producer_identity(
+        producer_identity
+        or viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repository)
+    )
     if identity.repository_commit != setup.executor["commit"]:
         raise ValidationError(
             "reviewed executor commit differs from the clean Repo-A producer revision"
         )
 
+    source_hashes = _setup_source_hashes(setup)
     material_key = sha256_json(
         {
             "setup_id": setup.setup_id,
-            "calibration_sha256": sha256_file(setup.calibration_path),
-            "reset_protocol_sha256": sha256_file(setup.reset_protocol_path),
-            "entrypoint_sha256": sha256_file(setup.executor_entrypoint),
+            "calibration_sha256": source_hashes["calibration"],
+            "reset_protocol_sha256": source_hashes["reset"],
+            "entrypoint_sha256": source_hashes["entrypoint"],
             "camera_config_sha256": sha256_json(setup.cameras),
             "robot_config_sha256": sha256_json(_robot_binding(setup)),
             "estop": setup.estop,
         }
     )
-    material = _safe_output_directory(material_root) / setup.setup_id / material_key
+    material = _safe_output_directory(
+        material_base / setup.setup_id / material_key,
+        repository=repository,
+        label="producer material directory",
+    )
     payload = material / "payload"
     artifact = material / "setup_record"
 
@@ -149,6 +163,7 @@ def seal_session_inputs(
     }
     hardware_setup = _hardware_payload(setup, setup_hashes)
     executor = _executor_payload(setup.executor, entrypoint)
+    setup_record_inventory = viola_handoff.inventory_root(artifact)
     session_inputs = {
         "schema_version": 1,
         "setup_id": setup.setup_id,
@@ -156,18 +171,28 @@ def seal_session_inputs(
         "calibration_artifact": "setup_record",
         "calibration_relative_path": "calibration.json",
         "reset_relative_path": "reset_protocol.json",
-        "setup_record_inventory_sha256": viola_handoff.inventory_root(artifact)[
-            "inventory_sha256"
-        ],
+        "setup_record_inventory_sha256": setup_record_inventory["inventory_sha256"],
         "executor": executor,
         "estop_operator": setup.estop["operator"],
         "estop_tested_at": setup.estop["tested_at"],
     }
     write_canonical_json(payload / "hardware_setup.json", hardware_setup)
     write_canonical_json(payload / "session_inputs.json", session_inputs)
+    payload_inventory = viola_handoff.inventory_root(payload)
+
+    revalidation_time = current_time if now is not None else _utc_now(None)
+    current_setup = load_reviewed_setup(setup.source_path, now=revalidation_time)
+    if current_setup != setup or _setup_source_hashes(current_setup) != source_hashes:
+        raise ValidationError("reviewed setup changed immediately before bundle sealing")
+    if viola_handoff.inventory_root(artifact) != setup_record_inventory:
+        raise ValidationError("setup-record inventory changed before bundle sealing")
+    if viola_handoff.inventory_root(payload) != payload_inventory:
+        raise ValidationError("session-input payload changed before bundle sealing")
+    if identity_was_captured:
+        _require_same_runtime(identity, repo_root=repository)
 
     request = viola_handoff.SealRequest(
-        root=handoff_root,
+        root=handoff_base,
         kind="session_inputs",
         experiment=experiment,
         subject=subject,
@@ -408,7 +433,51 @@ def _robot_binding(setup: ReviewedSetup) -> dict[str, Any]:
     }
 
 
-def _safe_output_directory(path: str | Path) -> Path:
+def _setup_source_hashes(setup: ReviewedSetup) -> dict[str, str]:
+    return {
+        "reviewed_setup": sha256_file(setup.source_path),
+        "calibration": sha256_file(setup.calibration_path),
+        "reset": sha256_file(setup.reset_protocol_path),
+        "entrypoint": sha256_file(setup.executor_entrypoint),
+    }
+
+
+def _existing_directory(path: str | Path, *, label: str) -> Path:
+    candidate = _path_without_symlinks(path, label=label, must_exist=True)
+    if not stat.S_ISDIR(candidate.lstat().st_mode):
+        raise ValidationError(f"{label} is not a directory: {candidate}")
+    return candidate
+
+
+def _external_output_root(
+    path: str | Path,
+    *,
+    repository: Path,
+    label: str,
+) -> Path:
+    candidate = _path_without_symlinks(path, label=label, must_exist=False)
+    if candidate == repository or repository in candidate.parents:
+        raise ValidationError(f"{label} must be outside the Repo-A worktree")
+    return candidate
+
+
+def _safe_output_directory(
+    path: str | Path,
+    *,
+    repository: Path,
+    label: str,
+) -> Path:
+    candidate = _external_output_root(path, repository=repository, label=label)
+    candidate.mkdir(parents=True, exist_ok=True)
+    return _existing_directory(candidate, label=label)
+
+
+def _path_without_symlinks(
+    path: str | Path,
+    *,
+    label: str,
+    must_exist: bool,
+) -> Path:
     candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
     current = Path(candidate.anchor)
     for part in candidate.parts[1:]:
@@ -416,13 +485,54 @@ def _safe_output_directory(path: str | Path) -> Path:
         try:
             mode = current.lstat().st_mode
         except FileNotFoundError:
+            if must_exist:
+                raise ValidationError(f"{label} does not exist: {candidate}") from None
             break
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect {label} {candidate}: {exc}") from exc
         if stat.S_ISLNK(mode):
-            raise ValidationError(f"symlink output path is forbidden: {current}")
+            raise ValidationError(f"symlink path is forbidden for {label}: {current}")
         if not stat.S_ISDIR(mode):
-            raise ValidationError(f"output path component is not a directory: {current}")
-    candidate.mkdir(parents=True, exist_ok=True)
+            raise ValidationError(f"{label} path component is not a directory: {current}")
     return candidate
+
+
+def _producer_identity(
+    identity: viola_handoff.RuntimeIdentity,
+) -> viola_handoff.RuntimeIdentity:
+    """Validate injected identities before any producer evidence is written."""
+
+    if not isinstance(identity, viola_handoff.RuntimeIdentity):
+        raise ValidationError("producer identity must be a RuntimeIdentity")
+    if identity.role != "pc_a":
+        raise ValidationError("session inputs must be produced with a pc_a identity")
+    if identity.repository_clean is not True:
+        raise ValidationError("session-input production requires a clean Repo-A identity")
+    if _FULL_GIT_SHA.fullmatch(identity.repository_commit) is None:
+        raise ValidationError("producer repository commit must be a full lowercase Git SHA")
+    if not identity.hostname:
+        raise ValidationError("producer hostname must be nonempty")
+    if _PYTHON_312.fullmatch(identity.python_version) is None:
+        raise ValidationError("session-input production requires Python 3.12")
+    if identity.lerobot_version != "0.6.1":
+        raise ValidationError("session-input production requires LeRobot 0.6.1")
+    if identity.conda_environment != "lerobot":
+        raise ValidationError("session-input production requires the lerobot Conda environment")
+    return identity
+
+
+def _require_same_runtime(
+    original: viola_handoff.RuntimeIdentity,
+    *,
+    repo_root: Path,
+) -> None:
+    current = _producer_identity(
+        viola_handoff.RuntimeIdentity.capture(role="pc_a", repo_root=repo_root)
+    )
+    if current != original:
+        raise ValidationError(
+            "Repo-A commit or runtime identity changed before session-input sealing"
+        )
 
 
 def _utc_now(value: datetime | None) -> datetime:

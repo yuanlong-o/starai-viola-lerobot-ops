@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import viola_handoff
+import viola_ops.dataset as dataset_ops
 from viola_ops.dataset import (
     ACCEPTED_SOURCE_EPISODES,
     CURRENT_DATASET,
@@ -84,6 +85,12 @@ def _identity() -> viola_handoff.RuntimeIdentity:
         lerobot_version="0.6.1",
         conda_environment="lerobot",
     )
+
+
+def _repo_root(tmp_path: Path) -> Path:
+    repository = tmp_path / "repo-a"
+    repository.mkdir()
+    return repository
 
 
 def _dataset_fixture(tmp_path: Path) -> tuple[Path, DatasetSpec, FakeDataset]:
@@ -256,7 +263,7 @@ def test_release_seals_repo_b_v1_payload_without_nas_or_wandb(tmp_path: Path) ->
         handoff_root=tmp_path / "handoffs",
         material_root=tmp_path / "materials",
         wandb_project="viola-test",
-        repo_root=tmp_path,
+        repo_root=_repo_root(tmp_path),
         producer_identity=_identity(),
         evidence_logger=evidence,
         validation=validation,
@@ -291,7 +298,7 @@ def test_release_refuses_numeric_only_validation(tmp_path: Path) -> None:
             experiment="test",
             handoff_root=tmp_path / "handoffs",
             material_root=tmp_path / "materials",
-            repo_root=tmp_path,
+            repo_root=_repo_root(tmp_path),
             producer_identity=_identity(),
             evidence_logger=FakeEvidence(),
             validation=validation,
@@ -315,7 +322,7 @@ def test_wandb_failure_never_publishes_a_ready_dataset_release(tmp_path: Path) -
             experiment="test",
             handoff_root=handoffs,
             material_root=tmp_path / "materials",
-            repo_root=tmp_path,
+            repo_root=_repo_root(tmp_path),
             producer_identity=_identity(),
             evidence_logger=FakeEvidence(fail=True),
             validation=validation,
@@ -323,3 +330,223 @@ def test_wandb_failure_never_publishes_a_ready_dataset_release(tmp_path: Path) -
         )
 
     assert not list(handoffs.rglob("READY.json"))
+
+
+@pytest.mark.parametrize("protected_root", ["material", "handoff"])
+def test_release_requires_external_producer_roots(
+    tmp_path: Path,
+    protected_root: str,
+) -> None:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    repository = _repo_root(tmp_path)
+    material_root = tmp_path / "materials"
+    handoff_root = tmp_path / "handoffs"
+    if protected_root == "material":
+        material_root = repository / "materials"
+    else:
+        handoff_root = repository / "handoffs"
+
+    with pytest.raises(ValidationError, match="outside the Repo-A worktree"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=handoff_root,
+            material_root=material_root,
+            repo_root=repository,
+            producer_identity=_identity(),
+            evidence_logger=FakeEvidence(),
+            validation=validation,
+            spec=spec,
+        )
+
+    assert not material_root.exists()
+    assert not handoff_root.exists()
+
+
+@pytest.mark.parametrize("protected_root", ["material", "handoff"])
+def test_release_rejects_symlinked_producer_roots(
+    tmp_path: Path,
+    protected_root: str,
+) -> None:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    repository = _repo_root(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    linked = tmp_path / "linked-external"
+    linked.symlink_to(external, target_is_directory=True)
+    material_root = tmp_path / "materials"
+    handoff_root = tmp_path / "handoffs"
+    if protected_root == "material":
+        material_root = linked / "materials"
+    else:
+        handoff_root = linked / "handoffs"
+
+    with pytest.raises(ValidationError, match="symlink path is forbidden"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=handoff_root,
+            material_root=material_root,
+            repo_root=repository,
+            producer_identity=_identity(),
+            evidence_logger=FakeEvidence(),
+            validation=validation,
+            spec=spec,
+        )
+
+
+def test_release_rejects_a_symlink_inside_the_material_path(tmp_path: Path) -> None:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    material_root = tmp_path / "materials"
+    material_root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (material_root / spec.release_id).symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(ValidationError, match="symlink path is forbidden"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=tmp_path / "handoffs",
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            evidence_logger=FakeEvidence(),
+            validation=validation,
+            spec=spec,
+        )
+
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"role": "pc_b"}, "pc_a"),
+        ({"repository_clean": False}, "clean Repo-A"),
+        ({"repository_commit": "A" * 40}, "full lowercase Git SHA"),
+        ({"python_version": "3.11.9"}, "Python 3.12"),
+        ({"lerobot_version": "0.5.0"}, "LeRobot 0.6.1"),
+        ({"conda_environment": "base"}, "lerobot Conda"),
+    ],
+)
+def test_release_validates_injected_identity_before_writing(
+    tmp_path: Path,
+    changes: dict[str, Any],
+    message: str,
+) -> None:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    material_root = tmp_path / "materials"
+
+    with pytest.raises(ValidationError, match=message):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=tmp_path / "handoffs",
+            material_root=material_root,
+            repo_root=_repo_root(tmp_path),
+            producer_identity=replace(_identity(), **changes),
+            evidence_logger=FakeEvidence(),
+            validation=validation,
+            spec=spec,
+        )
+
+    assert not material_root.exists()
+
+
+def test_release_recaptures_the_clean_runtime_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    identities = iter([_identity(), replace(_identity(), repository_commit="b" * 40)])
+    monkeypatch.setattr(
+        viola_handoff.RuntimeIdentity,
+        "capture",
+        classmethod(lambda cls, **kwargs: next(identities)),
+    )
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="changed before release sealing"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=tmp_path / "handoffs",
+            material_root=tmp_path / "materials",
+            repo_root=_repo_root(tmp_path),
+            evidence_logger=evidence,
+            validation=validation,
+            spec=spec,
+        )
+
+    assert evidence.events == []
+    assert not (tmp_path / "handoffs").exists()
+
+
+def test_release_rechecks_dataset_inventory_immediately_before_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec, dataset = _dataset_fixture(tmp_path)
+    validation = validate_dataset(
+        root,
+        dataset_loader=lambda _repo, _root: dataset,
+        video_decoder=lambda _root, expected: expected.frames,
+        spec=spec,
+    )
+    real_write = dataset_ops.write_canonical_json
+
+    def write_then_change_source(path: str | Path, value: Any) -> Path:
+        written = real_write(path, value)
+        if Path(path).name == "dataset_release.json":
+            (root / "meta" / "stats.json").write_bytes(b"changed-before-seal")
+        return written
+
+    monkeypatch.setattr(dataset_ops, "write_canonical_json", write_then_change_source)
+    evidence = FakeEvidence()
+
+    with pytest.raises(ValidationError, match="immediately before release sealing"):
+        release_dataset(
+            root,
+            experiment="test",
+            handoff_root=tmp_path / "handoffs",
+            material_root=tmp_path / "materials",
+            repo_root=_repo_root(tmp_path),
+            producer_identity=_identity(),
+            evidence_logger=evidence,
+            validation=validation,
+            spec=spec,
+        )
+
+    assert evidence.events == []
+    assert not (tmp_path / "handoffs").exists()

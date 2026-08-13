@@ -71,6 +71,8 @@ blocks a readiness claim; it is not relaxed at runtime.
 Repo B also currently derives its benchmark-report configuration identity from
 resolved absolute checkout paths. Identical Repo-B source trees therefore
 produce different report IDs when checked out in different directories. Repo A
-continues to fail closed on that mismatch; Repo B must publish one
-path-independent configuration identity before a production report can pass
-`viola-ops report inspect`.
+requires exact internal agreement among the accepted handoff lineage, report
+core, content-derived W&B run, and rendered evidence, and visibly labels the
+digest as nonportable. That inspection cannot independently establish the
+approved benchmark configuration or readiness until Repo B publishes one
+path-independent configuration identity.

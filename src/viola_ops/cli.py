@@ -115,7 +115,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument("--setup", type=Path, required=True, help="reviewed setup document")
     capture.add_argument(
-        "--output-root", type=Path, required=True, help="new immutable evidence directory"
+        "--output-root",
+        type=Path,
+        required=True,
+        help=(
+            "new immutable evidence directory, or the existing capture directory "
+            "with --upload-only"
+        ),
     )
     capture.add_argument(
         "--operator", required=True, help="operator named by the reviewed setup evidence"
@@ -123,6 +129,14 @@ def _build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--repo-root", type=Path, default=Path.cwd())
     capture.add_argument("--wandb-entity", required=True)
     capture.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
+    capture.add_argument(
+        "--upload-only",
+        action="store_true",
+        help=(
+            "validate and publish an existing immutable capture after an upload failure; "
+            "never confirm or open serial hardware"
+        ),
+    )
 
     policy = commands.add_parser(
         "policy", help="verify, shadow, or explicitly authorize one accepted policy"
@@ -283,9 +297,11 @@ def _run_setup(args: argparse.Namespace) -> int:
     if args.setup_command != "capture-frozen-state":
         raise AssertionError(f"unhandled setup command: {args.setup_command}")
     backend = _backend("setup")
-    confirmation = getattr(backend, "interactive_confirmation", None)
-    if not callable(confirmation):
-        raise ValidationError("setup backend has no interactive confirmation gate")
+    confirmation = None
+    if not args.upload_only:
+        confirmation = getattr(backend, "interactive_confirmation", None)
+        if not callable(confirmation):
+            raise ValidationError("setup backend has no interactive confirmation gate")
     result = backend.capture_frozen_state(
         args.setup,
         output_root=args.output_root,
@@ -294,6 +310,7 @@ def _run_setup(args: argparse.Namespace) -> int:
         wandb_entity=args.wandb_entity,
         wandb_project=args.wandb_project,
         confirm=confirmation,
+        upload_only=args.upload_only,
     )
     print(_backend_text("Frozen state captured", result))
     return 0

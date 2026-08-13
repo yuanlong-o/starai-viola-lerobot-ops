@@ -99,6 +99,7 @@ _REQUIRED_CHECKPOINT_FILES = (
     "policy_preprocessor.json",
     "policy_postprocessor.json",
 )
+_TRAINING_QUALIFICATIONS = frozenset({"current_release_bound", "legacy_hash_bound"})
 
 
 class PolicyRuntime(Protocol):
@@ -227,7 +228,11 @@ def inspect_candidate(path: str | Path) -> AcceptedPolicyCandidate:
     _exact_keys(training, _TRAINING_KEYS, "training_lineage")
     if training["persisted_queue_actions"] != QUEUE_ACTIONS:
         raise ValidationError("training lineage did not persist the ten-action queue")
-    _text(training["qualification"], "training qualification")
+    qualification = _text(training["qualification"], "training qualification")
+    if qualification not in _TRAINING_QUALIFICATIONS:
+        raise ValidationError(
+            "training qualification must be current_release_bound or legacy_hash_bound"
+        )
     training_run_id = _text(training["run_id"], "training run_id")
     training_commit = _text(training["repository_commit"], "training repository commit")
     if len(training_commit) not in {40, 64} or any(
@@ -287,6 +292,11 @@ def inspect_candidate(path: str | Path) -> AcceptedPolicyCandidate:
         "checkpoint_evaluation_sha256",
     ):
         _sha256(lineage[field], f"policy candidate lineage {field}")
+    checkpoint_evaluation_sha256 = _checkpoint_evaluation_sha256(checkpoint_entry)
+    if lineage["checkpoint_evaluation_sha256"] != checkpoint_evaluation_sha256:
+        raise ValidationError(
+            "policy candidate checkpoint evaluation hash differs from accepted checkpoint"
+        )
     dependency_inventories = {
         name: payload["dependency_artifacts"][name]["inventory_sha256"]
         for name in spec.dependency_ids
@@ -904,6 +914,24 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _checkpoint_evaluation_sha256(checkpoint_artifact: Mapping[str, Any]) -> str:
+    """Recreate Repo B's portable checkpoint snapshot digest.
+
+    Repo B evaluates a map from each relative file path to its byte count and
+    SHA-256.  The accepted handoff inventory contains exactly those signed
+    values under different field names, so no producer-local path is needed.
+    """
+
+    files = {
+        entry["path"]: {
+            "bytes": entry["size_bytes"],
+            "sha256": entry["sha256"],
+        }
+        for entry in checkpoint_artifact["files"]
+    }
+    return hashlib.sha256(canonical_json_bytes(files)).hexdigest()
 
 
 def _load_canonical_object(path: Path, label: str) -> dict[str, Any]:

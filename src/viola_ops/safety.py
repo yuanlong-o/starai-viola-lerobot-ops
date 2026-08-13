@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Final, TextIO
 
 from viola_handoff import (
+    RuntimeIdentity,
     VerifiedBundle,
     canonical_json_bytes,
     inspect_bundle,
@@ -130,6 +131,22 @@ class ResolvedSetup:
     setup_hashes: Mapping[str, str]
     absolute_limits: Mapping[str, tuple[float, float]]
     max_step_deltas: Mapping[str, float]
+    executor_identity: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedGate:
+    """Immutable result of the non-interactive motion checks."""
+
+    phase: str
+    checked_at: datetime
+    session: VerifiedBundle
+    candidate: VerifiedBundle
+    session_payload: Mapping[str, Any]
+    setup: ResolvedSetup
+    operator: str
+    policy: str
+    speed_scale: float
 
 
 def authorize_motion(
@@ -143,6 +160,91 @@ def authorize_motion(
     This is the only production constructor for :class:`MotionPermit`.  It does
     not import a robot, motor bus, camera, policy, or serial implementation.
     """
+
+    checked = _validate_gate(request)
+    phase = checked.phase
+    current_time = checked.checked_at
+    session = checked.session
+    candidate = checked.candidate
+    session_payload = checked.session_payload
+    setup = checked.setup
+
+    operator = checked.operator
+    owns_stream = input_stream is None
+    stream = input_stream if input_stream is not None else _open_operator_terminal()
+    checker = terminal_check or _is_terminal
+    try:
+        if not checker(stream):
+            raise SafetyGateError("operator confirmation requires an interactive terminal")
+        challenge = operator_challenge(session_payload["session_id"], phase, request.trial)
+        stream.write(f"Type exactly: {challenge}\n> ")
+        stream.flush()
+        response = stream.readline()
+    except (OSError, ValueError) as exc:
+        raise SafetyGateError(f"could not read operator confirmation: {exc}") from exc
+    finally:
+        if owns_stream:
+            stream.close()
+    if response.rstrip("\r\n") != challenge:
+        raise SafetyGateError("operator confirmation did not match the session challenge")
+
+    nonce_material = (
+        f"{session.bundle_id}:{phase}:{request.trial}:{operator}:"
+        f"{current_time.isoformat()}:{os.getpid()}:{socket.gethostname()}"
+    )
+    return MotionPermit(
+        session_id=session_payload["session_id"],
+        session_bundle_id=session.bundle_id,
+        candidate_bundle_id=candidate.bundle_id,
+        policy=checked.policy,
+        phase=phase,
+        trial=request.trial,
+        operator=operator,
+        setup_hashes=dict(setup.setup_hashes),
+        absolute_limits=dict(setup.absolute_limits),
+        max_step_deltas=dict(setup.max_step_deltas),
+        speed_scale=checked.speed_scale,
+        issued_at=current_time,
+        estop_tested_at=_timestamp(
+            session_payload["estop"]["tested_at_utc"], "E-stop tested_at_utc"
+        ),
+        _nonce=hashlib.sha256(nonce_material.encode()).hexdigest(),
+        _authority=_PERMIT_AUTHORITY,
+        setup_id=setup.setup_id,
+        robot_port=setup.robot_port,
+        calibration_path=setup.calibration_path,
+        reset_protocol_path=setup.reset_protocol_path,
+        executor_entrypoint=setup.executor_entrypoint,
+        camera_configs=dict(setup.camera_configs),
+    )
+
+
+def revalidate_motion(
+    request: GateRequest,
+    permit: MotionPermit,
+    *,
+    identity: RuntimeIdentity,
+) -> tuple[VerifiedBundle, VerifiedBundle]:
+    """Recheck live authority without asking the operator to arm a second time.
+
+    Callers use this immediately before importing hardware-capable modules.  It
+    reopens every accepted and canonical bundle, rechecks predecessors and
+    E-stop age, and proves that the current clean runtime is the exact executor
+    signed into the reviewed setup.
+    """
+
+    assert_permit_current(permit)
+    checked = _validate_gate(request)
+    _check_permit_binding(permit, request, checked)
+    _check_runtime_identity(identity, checked.setup)
+    # The validation above can take time while hashing setup artifacts and
+    # reopening canonical sources.  Make E-stop/permit freshness the last gate.
+    assert_permit_current(permit)
+    return checked.session, checked.candidate
+
+
+def _validate_gate(request: GateRequest) -> _ValidatedGate:
+    """Run every non-interactive authorization check against current bytes."""
 
     phase = _require_phase(request.phase)
     current_time = _utc_now(request.now)
@@ -177,8 +279,6 @@ def authorize_motion(
     check_session_manifest_lineage(session_payload, session)
     _check_act_clearance_attachment(session_payload, session)
     check_candidate_binding(session_payload, session, candidate_payload, candidate)
-    check_current_checkout(session_payload, request.repository_root)
-    check_estop_freshness(session_payload, current_time)
     setup = resolve_reviewed_setup(
         session_payload,
         handoff_root=request.handoff_root,
@@ -207,59 +307,81 @@ def authorize_motion(
         expected_kind="policy_candidate",
         required_permission="disconnected_only",
     )
-
+    # These time- and checkout-sensitive checks intentionally come last.
+    check_estop_freshness(session_payload, current_time)
+    check_current_checkout(session_payload, request.repository_root)
     operator = _nonempty(session_payload["operator"], "session operator")
-    owns_stream = input_stream is None
-    stream = input_stream if input_stream is not None else _open_operator_terminal()
-    checker = terminal_check or _is_terminal
-    try:
-        if not checker(stream):
-            raise SafetyGateError("operator confirmation requires an interactive terminal")
-        challenge = operator_challenge(session_payload["session_id"], phase, request.trial)
-        stream.write(f"Type exactly: {challenge}\n> ")
-        stream.flush()
-        response = stream.readline()
-    except (OSError, ValueError) as exc:
-        raise SafetyGateError(f"could not read operator confirmation: {exc}") from exc
-    finally:
-        if owns_stream:
-            stream.close()
-    if response.rstrip("\r\n") != challenge:
-        raise SafetyGateError("operator confirmation did not match the session challenge")
-
     policy = _nonempty(session.manifest["lineage"]["policy"], "session policy")
     if policy not in POLICIES:
         raise SafetyGateError(f"unsupported rollout policy: {policy!r}")
     speed_scale = 0.25 if phase == "shakedown" else 1.0
-    nonce_material = (
-        f"{session.bundle_id}:{phase}:{request.trial}:{operator}:"
-        f"{current_time.isoformat()}:{os.getpid()}:{socket.gethostname()}"
-    )
-    return MotionPermit(
-        session_id=session_payload["session_id"],
-        session_bundle_id=session.bundle_id,
-        candidate_bundle_id=candidate.bundle_id,
-        policy=policy,
+    return _ValidatedGate(
         phase=phase,
-        trial=request.trial,
+        checked_at=current_time,
+        session=session,
+        candidate=candidate,
+        session_payload=session_payload,
+        setup=setup,
         operator=operator,
-        setup_hashes=dict(setup.setup_hashes),
-        absolute_limits=dict(setup.absolute_limits),
-        max_step_deltas=dict(setup.max_step_deltas),
+        policy=policy,
         speed_scale=speed_scale,
-        issued_at=current_time,
-        estop_tested_at=_timestamp(
-            session_payload["estop"]["tested_at_utc"], "E-stop tested_at_utc"
-        ),
-        _nonce=hashlib.sha256(nonce_material.encode()).hexdigest(),
-        _authority=_PERMIT_AUTHORITY,
-        setup_id=setup.setup_id,
-        robot_port=setup.robot_port,
-        calibration_path=setup.calibration_path,
-        reset_protocol_path=setup.reset_protocol_path,
-        executor_entrypoint=setup.executor_entrypoint,
-        camera_configs=dict(setup.camera_configs),
     )
+
+
+def _check_permit_binding(
+    permit: MotionPermit,
+    request: GateRequest,
+    checked: _ValidatedGate,
+) -> None:
+    """Require the original operator permit to name the revalidated authority."""
+
+    setup = checked.setup
+    session = checked.session
+    candidate = checked.candidate
+    expected_estop = _timestamp(
+        checked.session_payload["estop"]["tested_at_utc"], "E-stop tested_at_utc"
+    )
+    if not permit.allows(
+        session_id=checked.session_payload["session_id"],
+        phase=checked.phase,
+        trial=request.trial,
+    ):
+        raise SafetyGateError("motion permit no longer matches the requested execution")
+    if (
+        permit.session_bundle_id != session.bundle_id
+        or permit.candidate_bundle_id != candidate.bundle_id
+        or permit.policy != checked.policy
+        or permit.operator != checked.operator
+        or permit.speed_scale != checked.speed_scale
+        or permit.estop_tested_at != expected_estop
+        or permit.setup_id != setup.setup_id
+        or permit.robot_port != setup.robot_port
+        or permit.calibration_path != setup.calibration_path
+        or permit.reset_protocol_path != setup.reset_protocol_path
+        or permit.executor_entrypoint != setup.executor_entrypoint
+        or dict(permit.setup_hashes) != dict(setup.setup_hashes)
+        or dict(permit.absolute_limits) != dict(setup.absolute_limits)
+        or dict(permit.max_step_deltas) != dict(setup.max_step_deltas)
+        or dict(permit.camera_configs) != dict(setup.camera_configs)
+    ):
+        raise SafetyGateError("motion permit differs from the revalidated signed inputs")
+
+
+def _check_runtime_identity(identity: RuntimeIdentity, setup: ResolvedSetup) -> None:
+    """Bind the fresh clean runtime to the exact reviewed executor environment."""
+
+    if not isinstance(identity, RuntimeIdentity):
+        raise SafetyGateError("final motion validation requires a captured runtime identity")
+    actual = {
+        "repository_commit": identity.repository_commit,
+        "python_version": identity.python_version,
+        "lerobot_version": identity.lerobot_version,
+        "conda_environment": identity.conda_environment,
+    }
+    if identity.role != "pc_a" or identity.repository_clean is not True:
+        raise SafetyGateError("final motion runtime must be a clean pc_a identity")
+    if actual != dict(setup.executor_identity):
+        raise SafetyGateError("current runtime differs from the signed reviewed executor")
 
 
 def operator_challenge(session_id: str, phase: str, trial: str) -> str:
@@ -986,6 +1108,12 @@ def resolve_reviewed_setup(
         setup_hashes=expected_hashes,
         absolute_limits=limits,
         max_step_deltas=deltas,
+        executor_identity={
+            "repository_commit": executor["repository_commit"],
+            "python_version": executor["python_version"],
+            "lerobot_version": executor["lerobot_version"],
+            "conda_environment": executor["conda_environment"],
+        },
     )
 
 

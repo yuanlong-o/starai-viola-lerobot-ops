@@ -21,6 +21,7 @@ from viola_ops.report import (
     REPORT_RUN_PREFIX,
     REPORT_SYNC_KIND,
     REPORT_SYNC_SCHEMA_VERSION,
+    REVIEWED_REPO_B_COMMITS,
     ReportInspectionError,
     inspect_report,
     wilson_interval,
@@ -33,9 +34,10 @@ class FakeHandoffEvidence:
 
 
 def _identity(role: str, commit: str) -> RuntimeIdentity:
+    repository_commit = commit if len(commit) == 40 else commit * 40
     return RuntimeIdentity(
         role=role,
-        repository_commit=commit * 40,
+        repository_commit=repository_commit,
         repository_clean=True,
         hostname=role,
         python_version="3.12.13",
@@ -117,11 +119,13 @@ def _valid_report() -> dict[str, Any]:
 def _build_bundle(
     tmp_path: Path,
     *,
+    benchmark_config_sha256: str = EXPECTED_BENCHMARK_CONFIG_SHA256,
     report_mutation=None,
     rendered_mutation: str | None = None,
     sync_mutation=None,
     extra_payload: bool = False,
     accept: bool = True,
+    producer_commit: str = next(iter(REVIEWED_REPO_B_COMMITS)),
 ) -> Path:
     payload = tmp_path / "payload"
     payload.mkdir()
@@ -155,7 +159,7 @@ def _build_bundle(
         "kind": REPORT_EXECUTION_KIND,
         "contract_sha256": report_module.AGGREGATE_REPORT_SCHEMA_SHA256,
         "experiment": EXPECTED_EXPERIMENT,
-        "benchmark_config_sha256": EXPECTED_BENCHMARK_CONFIG_SHA256,
+        "benchmark_config_sha256": benchmark_config_sha256,
         "dataset_release_id": EXPECTED_DATASET_RELEASE_ID,
         "dataset_sha256": EXPECTED_DATASET_SHA256,
         "terminal_outcome_sha256": terminal_hashes,
@@ -184,7 +188,7 @@ def _build_bundle(
 
     lineage_wandb = dict(sync["wandb"])
     lineage = {
-        "benchmark_config_sha256": EXPECTED_BENCHMARK_CONFIG_SHA256,
+        "benchmark_config_sha256": benchmark_config_sha256,
         "dataset_release_id": EXPECTED_DATASET_RELEASE_ID,
         "dataset_sha256": EXPECTED_DATASET_SHA256,
         "aggregate_report_contract_sha256": report_module.AGGREGATE_REPORT_SCHEMA_SHA256,
@@ -202,7 +206,7 @@ def _build_bundle(
             kind="report",
             experiment=EXPECTED_EXPERIMENT,
             subject="all-policies",
-            producer=_identity("pc_b", "b"),
+            producer=_identity("pc_b", producer_commit),
             consumer_role="pc_a",
             permission="report_only",
             lineage=lineage,
@@ -246,7 +250,38 @@ def test_inspection_returns_human_readable_verified_summary(tmp_path: Path) -> N
     assert "act: scored [rollout]" in text
     assert "#1 act: 8/10 (80.0%)" in text
     assert "accepted, complete, and blocker-free" in text
+    assert "checkout-path-dependent; not a portable readiness proof" in text
+    assert "does not authorize robot motion" in text
     assert "robot ready" not in text.lower()
+
+
+def test_report_accepts_repo_b_path_bound_config_hash_when_fully_bound(
+    tmp_path: Path,
+) -> None:
+    # Repo B currently hashes resolved local config paths, so the same committed
+    # config has a different digest when its checkout moves.  The accepted
+    # bundle, report core, content-derived W&B run, and lineage must all agree.
+    repo_b_main_hash = "11ffd25e262bc86ab8082857bec331ea9a84349b840703ced2be7cd0b32b42ba"
+    bundle = _build_bundle(tmp_path, benchmark_config_sha256=repo_b_main_hash)
+
+    summary = inspect_report(bundle, wandb_verifier=lambda *_args: None)
+
+    assert summary.bundle_id == bundle.name
+    assert summary.scored_policies == ("act", "vqbet")
+
+
+def test_report_rejects_an_unreviewed_path_bound_config_hash(tmp_path: Path) -> None:
+    bundle = _build_bundle(tmp_path, benchmark_config_sha256="a" * 64)
+
+    with pytest.raises(ReportInspectionError, match="reviewed path-bound set"):
+        inspect_report(bundle, wandb_verifier=lambda *_args: None)
+
+
+def test_report_rejects_an_unreviewed_repo_b_producer_revision(tmp_path: Path) -> None:
+    bundle = _build_bundle(tmp_path, producer_commit="b" * 40)
+
+    with pytest.raises(ReportInspectionError, match="reviewed Repo-B commit set"):
+        inspect_report(bundle, wandb_verifier=lambda *_args: None)
 
 
 def test_default_path_requires_remote_verification(

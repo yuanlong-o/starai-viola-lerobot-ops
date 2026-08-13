@@ -124,7 +124,11 @@ B can checksum-copy it during acceptance.
 After an exact TTY confirmation, reads seven positions through the public SDK,
 closes the serial connection, and only then publishes evidence to online W&B.
 It has no motor-write or torque API. The result is an input for a camera-only
-live soak.
+live soak. A fresh capture requires a path that does not exist; the command
+atomically creates that directory before constructing the serial port. If
+capture or serial cleanup fails before complete evidence exists, that new
+directory is cleaned up. If W&B publication fails, the two immutable local
+evidence files are retained for an upload-only retry.
 
 ```bash
 viola-ops setup capture-frozen-state \
@@ -133,6 +137,26 @@ viola-ops setup capture-frozen-state \
   --operator <estop-owner> \
   --wandb-entity <entity>
 ```
+
+Retry only the failed online publication, without another confirmation or any
+serial/device access, by repeating the same command and adding
+`--upload-only`:
+
+```bash
+viola-ops setup capture-frozen-state \
+  --setup /path/to/reviewed-setup.json \
+  --output-root /path/to/existing/frozen-state-evidence \
+  --operator <estop-owner> \
+  --wandb-entity <entity> \
+  --upload-only
+```
+
+Upload-only recovery accepts exactly canonical, read-only `frozen_state.json`
+and `frozen_state_capture.json`, plus an optional matching W&B receipt. It
+revalidates the reviewed setup, operator, current clean PC-A identity, hashes,
+timestamps, and deterministic W&B binding before reopening that same run. It
+rejects partial, modified, writable, symlinked, or extra material and never
+recaptures positions.
 
 ### `viola-ops policy verify|shadow|execute`
 
@@ -182,16 +206,19 @@ agreement, hashes, receipts, and the finished W&B report run. It prints terminal
 outcomes; it does not rank, rewrite, publish, or declare the robot ready.
 
 The merged Repo-B implementation still hashes resolved checkout paths into its
-report configuration identity. Repo A keeps one reviewed digest and rejects
-any mismatch; a report cannot support a readiness claim until Repo B replaces
-that path-dependent value with one digest shared by both repositories.
+report configuration identity. Repo A therefore accepts only explicitly
+reviewed Repo-B producer commits and path-bound digests, while also requiring
+that digest to match exactly across the handoff lineage, report core,
+content-derived W&B run, and rendered evidence. Inspection labels it as
+nonportable and never treats it as readiness proof; Repo B should eventually
+replace it with one shared path-independent identity.
 
 ```bash
 viola-ops report inspect \
   --bundle ~/.local/share/viola/handoffs/v1/report/<id>
 ```
 
-## Inference command after the evidence chain exists
+## Live rollout commands after the evidence chain exists
 
 First activate the environment so the interactive TTY is preserved:
 
@@ -208,11 +235,24 @@ viola-ops policy execute \
   --wandb-entity <entity>
 ```
 
-That is intentionally an observation-only hold commissioning command. Startup
-reads and validates the current pose and connects both cameras without a motor
+That first command is intentionally an observation-only hold commissioning
+step, not policy inference. Startup reads and validates the current pose and
+connects both cameras without a motor
 write; its evidence therefore records `motion: false`. It does not accept a
 checkpoint path, duration, task, or speed override. After Repo B accepts the
-hold evidence, run `--phase shakedown --prior-hold <accepted-hold-bundle>`.
+hold evidence, the first command that actually runs policy inference is:
+
+```bash
+viola-ops policy execute \
+  --session ~/.local/share/viola/handoffs/v1/rollout_session/<session-id> \
+  --candidate ~/.local/share/viola/handoffs/v1/policy_candidate/<candidate-id> \
+  --phase shakedown --trial supervised-shakedown \
+  --prior-hold ~/.local/share/viola/handoffs/v1/rollout_evidence/<hold-id> \
+  --evidence-root /mnt/nas02/yz/starai/evidence/v1/rollout \
+  --handoff-root /mnt/nas02/yz/starai/handoffs/v1 \
+  --wandb-entity <entity>
+```
+
 After Repo B accepts the two shakedowns, run `--phase scored` with both
 `--prior-hold` and `--prior-shakedown`. Each phase requires a fresh operator
 challenge, and each physical trial requires an explicit `START ...` action.
