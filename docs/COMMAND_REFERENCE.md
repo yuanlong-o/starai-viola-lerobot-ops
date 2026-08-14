@@ -104,12 +104,14 @@ does not require a Repo-B candidate, receipt, or rollout session:
 
 ```bash
 conda activate lerobot
-sg dialout -c 'CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run'
+sg dialout -c 'CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online /home/yz/anaconda3/envs/lerobot/bin/viola-ops act run'
 ```
 
 The current PC-A login needs the `sg dialout` wrapper for the reviewed serial
 device. A new login whose `id` already includes `dialout` can run the inner
 `CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run` command directly.
+The editable installation resolves Repo A independently of the terminal's
+current directory.
 Serial and both camera paths are checked before ARM and before any online
 intent is written.
 

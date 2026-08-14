@@ -232,7 +232,7 @@ clearing the workspace:
 
 ```bash
 conda activate lerobot
-sg dialout -c 'CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run'
+sg dialout -c 'CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online /home/yz/anaconda3/envs/lerobot/bin/viola-ops act run'
 ```
 
 PC A's current login has not inherited its configured `dialout` membership;
@@ -240,6 +240,8 @@ the wrapper above preserves the `lerobot` environment and real terminal while
 granting access to the reviewed serial device. After a fresh login that already
 shows `dialout` in `id`, the inner command is equivalent:
 `CUDA_VISIBLE_DEVICES=0 WANDB_MODE=online viola-ops act run`.
+The command resolves the editable Repo-A checkout itself, so it works from any
+terminal directory.
 The command checks serial and camera access before asking for ARM or writing a
 W&B intent.
 

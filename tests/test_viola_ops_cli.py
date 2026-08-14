@@ -532,6 +532,18 @@ def test_local_act_run_is_repo_a_owned_and_has_human_defaults(
     assert "Status: completed" in capsys.readouterr().out
 
 
+def test_local_act_defaults_to_the_installed_repo_not_the_terminal_directory(
+    backends: Backends, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir("/")
+
+    assert cli.main(["act", "run"]) == 0
+
+    _, _, keywords = backends.calls[0]
+    assert keywords["repo_root"] == cli.DEFAULT_REPO_ROOT
+    assert cli.DEFAULT_REPO_ROOT == Path(__file__).resolve().parents[1]
+
+
 def test_local_act_failure_recovery_delegates_without_run_arguments(
     backends: Backends, capsys
 ) -> None:

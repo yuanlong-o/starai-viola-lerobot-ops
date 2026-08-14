@@ -28,6 +28,9 @@ DEFAULT_MATERIAL_ROOT = Path("/mnt/nas02/yz/starai/producer-materials/v1")
 DEFAULT_OUTPUT_ROOT = Path("/mnt/nas02/yz/starai/evidence/v1")
 DEFAULT_EXPERIMENT = "viola-cubes-v1"
 DEFAULT_WANDB_PROJECT = "starai-viola-policy-benchmark"
+# Repo A is installed editable by the supported bootstrap. Resolve its checkout
+# from this module so the local ACT command works from any terminal directory.
+DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -283,7 +286,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trial",
         help="immutable attempt label (default: current UTC timestamp)",
     )
-    act_run.add_argument("--repo-root", type=Path, default=Path.cwd())
+    act_run.add_argument(
+        "--repo-root",
+        type=Path,
+        default=DEFAULT_REPO_ROOT,
+        help="authoritative Repo-A checkout (default: %(default)s)",
+    )
     act_run.add_argument("--wandb-entity", default="yuanlongzhang94")
     act_run.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
     act_recover = act_commands.add_parser(
@@ -300,7 +308,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="failed attempt directory printed by act run",
     )
-    act_recover.add_argument("--repo-root", type=Path, default=Path.cwd())
+    act_recover.add_argument(
+        "--repo-root",
+        type=Path,
+        default=DEFAULT_REPO_ROOT,
+        help="authoritative Repo-A checkout (default: %(default)s)",
+    )
     act_recover.add_argument("--wandb-entity", default="yuanlongzhang94")
     act_recover.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
 
