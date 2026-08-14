@@ -10,6 +10,7 @@ robot:
   port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10:1.0-port0
   disable_torque_on_disconnect: true
   use_degrees: false
+  # Both C270s were verified together at 640x480 and 29+ Hz with V4L2/YUYV.
   cameras:
     front:
       type: opencv
@@ -17,7 +18,8 @@ robot:
       width: 640
       height: 480
       fps: 30
-      fourcc: MJPG
+      fourcc: YUYV
+      backend: 200  # OpenCV CAP_V4L2 on Linux.
       warmup_s: 8
     up:
       type: opencv
@@ -26,6 +28,7 @@ robot:
       height: 480
       fps: 30
       fourcc: YUYV
+      backend: 200  # OpenCV CAP_V4L2 on Linux.
       warmup_s: 8
 
 # Base + sync is LeRobot's ordinary autonomous policy-play mode. It does not

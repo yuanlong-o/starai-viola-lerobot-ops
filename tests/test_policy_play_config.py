@@ -43,6 +43,7 @@ def inspect_config(cfg: RolloutConfig) -> None:
         "front": {
             "path": str(cfg.robot.cameras["front"].index_or_path),
             "fourcc": cfg.robot.cameras["front"].fourcc,
+            "backend": cfg.robot.cameras["front"].backend.value,
             "warmup_s": cfg.robot.cameras["front"].warmup_s,
             "width": cfg.robot.cameras["front"].width,
             "height": cfg.robot.cameras["front"].height,
@@ -51,6 +52,7 @@ def inspect_config(cfg: RolloutConfig) -> None:
         "up": {
             "path": str(cfg.robot.cameras["up"].index_or_path),
             "fourcc": cfg.robot.cameras["up"].fourcc,
+            "backend": cfg.robot.cameras["up"].backend.value,
             "warmup_s": cfg.robot.cameras["up"].warmup_s,
             "width": cfg.robot.cameras["up"].width,
             "height": cfg.robot.cameras["up"].height,
@@ -94,8 +96,9 @@ inspect_config()
         "duration": 10.0,
         "fps": 30.0,
         "front": {
+            "backend": 200,
             "fps": 30,
-            "fourcc": "MJPG",
+            "fourcc": "YUYV",
             "height": 480,
             "path": "/dev/v4l/by-id/usb-046d_0825_543F8BC0-video-index0",
             "warmup_s": 8,
@@ -116,6 +119,7 @@ inspect_config()
             "to the gray platform on the left."
         ),
         "up": {
+            "backend": 200,
             "fps": 30,
             "fourcc": "YUYV",
             "height": 480,
