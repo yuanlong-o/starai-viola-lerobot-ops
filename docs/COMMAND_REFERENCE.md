@@ -97,6 +97,34 @@ remain incomplete; use only the exact successful path printed by the command.
 
 ## Supervised rollout and inference
 
+### Direct standard LeRobot policy play
+
+Select a compatible local checkpoint by editing `policy.path` in
+[`config/policy_play.yaml`](../config/policy_play.yaml). The same file contains
+the Viola robot, both cameras, task, GPU, and run duration. A compatible
+checkpoint must use the same seven-axis Viola and `front`/`up` features; other
+policy families can require feature mappings or policy-specific settings. Then
+run:
+
+```bash
+conda activate lerobot
+lerobot-rollout --config_path /home/yz/lerobot/starai-viola-lerobot-ops/config/policy_play.yaml
+```
+
+For this PC-A login, which has not yet inherited `dialout`, run instead:
+
+```bash
+sg dialout -c '/home/yz/anaconda3/envs/lerobot/bin/lerobot-rollout --config_path /home/yz/lerobot/starai-viola-lerobot-ops/config/policy_play.yaml'
+```
+
+This standard LeRobot `base`/`sync` mode starts directly. It does not use W&B,
+Repo A/B handoffs, clean-revision checks, or typed confirmations. `duration: 10`
+means a ten-second rollout; use `0` for an indefinite run stopped by Ctrl-C.
+The supplied ACT checkpoint uses its saved 100-action queue in this mode.
+The installed Viola plugin moves to its built-in initial pose on connection and
+does not apply Repo A's managed absolute/per-step limits. This direct workflow
+therefore produces no benchmark evidence or readiness claim.
+
 ### Independent Repo-A ACT inference
 
 The previously deployed ACT checkpoint has a separate Repo-A-owned path and

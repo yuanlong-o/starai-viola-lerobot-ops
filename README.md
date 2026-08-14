@@ -6,16 +6,17 @@ verification, replay and camera-only shadow runs, supervised robot execution,
 evidence capture, and read-only report inspection. Training and canonical
 ranking belong to Repo B.
 
-The supported runtime is the `lerobot` Conda environment with Python 3.12,
-LeRobot 0.6.1, and W&B 0.27.2 in online mode. Nothing in this README is a
+The supported runtime is the `lerobot` Conda environment with Python 3.12 and
+LeRobot 0.6.1. Evidence-producing Viola commands use W&B 0.27.2 in online mode;
+standard direct policy play does not use W&B. Nothing in this README is a
 readiness claim. A clean revision, accepted evidence, and the live gate must
-pass at the time of use.
+pass at the time of a managed benchmark run.
 
 ## Safety boundary
 
-A policy candidate permits disconnected work only. It cannot move the robot.
-Benchmark motion is possible only through `viola-ops policy execute`, after all
-of these conditions pass:
+For benchmark and evidence-producing work, a policy candidate permits
+disconnected work only. It cannot move the robot. Benchmark motion is possible
+only through `viola-ops policy execute`, after all of these conditions pass:
 
 - Repo A has locally accepted the exact policy candidate and Repo-B-produced
   `rollout_session`.
@@ -42,10 +43,16 @@ is clearly marked `local_only`, never a Repo-B `READY` handoff or benchmark
 result.
 
 There is no `--yes`, environment-variable bypass, task override, or piped-input
-arming path. The local ACT command accepts a path only so it can prove the bytes
-equal the one reviewed deployment; arbitrary checkpoints are rejected. The old inference, calibration,
-teleoperation, recording, and ROS hardware launchers are retired and exit before
-opening a device. Software is not an E-stop.
+arming path in those managed commands. The local ACT command accepts a path only
+so it can prove the bytes equal the one reviewed deployment; arbitrary
+checkpoints are rejected. The old inference, calibration, teleoperation,
+recording, and ROS hardware launchers are retired and exit before opening a
+device. Software is not an E-stop.
+
+Operators who explicitly want ordinary, unmanaged LeRobot policy play can use
+the separate [`config/policy_play.yaml`](config/policy_play.yaml) workflow
+below. It intentionally does not create benchmark evidence or apply the managed
+command gates described above.
 
 ## Install the Repo-A commands
 
@@ -215,6 +222,36 @@ portable handoff.
 Every verification or shadow invocation creates a fresh immutable attempt
 directory. Failed attempts remain incomplete and are never overwritten; pass
 forward only the exact successful evidence path printed by the command.
+
+### Direct standard LeRobot policy play
+
+[`config/policy_play.yaml`](config/policy_play.yaml) contains the policy,
+robot, cameras, task, GPU, and duration. To select a policy, edit only
+`policy.path`, then run the standard LeRobot command. The replacement must be
+compatible with the same seven-axis Viola and `front`/`up` observation features;
+other policy families can require their own feature mapping and settings.
+
+```bash
+conda activate lerobot
+lerobot-rollout --config_path /home/yz/lerobot/starai-viola-lerobot-ops/config/policy_play.yaml
+```
+
+If the current login has not inherited `dialout` membership, use the same
+configuration through the group wrapper:
+
+```bash
+sg dialout -c '/home/yz/anaconda3/envs/lerobot/bin/lerobot-rollout --config_path /home/yz/lerobot/starai-viola-lerobot-ops/config/policy_play.yaml'
+```
+
+This is LeRobot's direct `base`/`sync` rollout. It has no Repo-A/Repo-B handoff,
+W&B, clean-revision gate, or typed `ARM`/`START` confirmation. Set `duration: 0`
+to continue until Ctrl-C; the supplied configuration runs for 10 seconds. ACT
+uses the checkpoint's saved 100-action queue in this standard mode.
+
+This direct path also has standard plugin behavior: connecting the installed
+Viola plugin moves to its built-in initial pose, and its current implementation
+does not enforce Repo A's reviewed absolute/per-step limits. It is unmanaged
+policy play, not benchmark evidence or a readiness result.
 
 ### `viola-ops act run`
 
