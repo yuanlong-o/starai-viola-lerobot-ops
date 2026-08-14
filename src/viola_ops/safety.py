@@ -1921,9 +1921,42 @@ def _canonical_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _open_operator_terminal() -> TextIO:
+class _OperatorPromptTerminal:
+    """Readable and writable text handles for one physical operator TTY."""
+
+    def __init__(self, path: str = "/dev/tty") -> None:
+        # A single TextIO opened as ``r+`` requires a seekable stream on this
+        # Python build. Terminals are not seekable, so keep one handle in each
+        # direction instead.
+        self._reader = open(path, "r", encoding="utf-8", buffering=1)
+        try:
+            self._writer = open(path, "w", encoding="utf-8", buffering=1)
+        except BaseException:
+            self._reader.close()
+            raise
+
+    def isatty(self) -> bool:
+        return self._reader.isatty() and self._writer.isatty()
+
+    def readline(self) -> str:
+        return self._reader.readline()
+
+    def write(self, value: str) -> int:
+        return self._writer.write(value)
+
+    def flush(self) -> None:
+        self._writer.flush()
+
+    def close(self) -> None:
+        try:
+            self._reader.close()
+        finally:
+            self._writer.close()
+
+
+def _open_operator_terminal() -> _OperatorPromptTerminal:
     try:
-        return open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+        return _OperatorPromptTerminal()
     except OSError as exc:
         raise SafetyGateError("operator confirmation requires an available /dev/tty") from exc
 

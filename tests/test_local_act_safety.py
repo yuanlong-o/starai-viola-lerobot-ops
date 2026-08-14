@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,26 @@ class _ChallengeStream:
             return self.response
         challenge = self.output.split("Type exactly: ", 1)[1].split("\n", 1)[0]
         return f"{challenge}\n"
+
+
+def test_operator_prompt_terminal_supports_a_real_nonseekable_pty() -> None:
+    master_fd, slave_fd = os.openpty()
+    terminal = None
+    try:
+        terminal = safety._OperatorPromptTerminal(os.ttyname(slave_fd))
+        assert terminal.isatty()
+
+        assert terminal.write("prompt") == len("prompt")
+        terminal.flush()
+        assert os.read(master_fd, len("prompt")) == b"prompt"
+
+        os.write(master_fd, b"response\n")
+        assert terminal.readline() == "response\n"
+    finally:
+        if terminal is not None:
+            terminal.close()
+        os.close(slave_fd)
+        os.close(master_fd)
 
 
 def _identity(*, commit: str = "a" * 40, clean: bool = True) -> RuntimeIdentity:
